@@ -3,6 +3,8 @@
 #include <math.h>
 #include "raylib.h"
 
+#define min(a, b) ((a) < (b) ? (a) : (b))
+
 typedef enum { ORIGINAL, ADD } BufferType;
 
 typedef struct {
@@ -75,7 +77,7 @@ void regenerate_text() {
         }
     }
     text_length += 1;
-    text_buffer = calloc(text_length, sizeof(char));
+    text_buffer = calloc(text_length + 1, sizeof(char));
     lines = calloc(line_count, sizeof(char*));
     lines[0] = text_buffer;
 
@@ -94,6 +96,7 @@ void regenerate_text() {
             lines[line_index++] = text_buffer + i + 1;
         }
     }
+    text_buffer[text_length] = '\0';
 
     dirtyPieces = false;
 }
@@ -122,9 +125,11 @@ int main(void) {
         }
         if (IsKeyPressed(KEY_UP) && pointerY > 0) {
             pointerY--;
+            pointerX = min(pointerX, strlen(lines[pointerY]));
         } 
         if (IsKeyPressed(KEY_DOWN) && pointerY < line_count - 1) {
             pointerY++;
+            pointerX = min(pointerX, strlen(lines[pointerY]));
         } 
 
 
@@ -197,7 +202,7 @@ int main(void) {
                 int current_pos = 0;
                 size_t pointer_pos = 0;
                 for (size_t i = 0; i < pointerY; ++i) {
-                    pointer_pos += strlen(lines[i]);
+                    pointer_pos += strlen(lines[i]) + 1;
                 }
                 pointer_pos += pointerX;
 
@@ -235,10 +240,11 @@ int main(void) {
                 piece_count = new_count;
                 pointerX++;
                 dirtyPieces = true;
+                //LogPieces();
             }
 
             key = GetCharPressed();
-        }
+        }       
 
         if (dirtyPieces) {
             regenerate_text();
@@ -256,7 +262,7 @@ int main(void) {
                         free(temp);
                     }
                     line_length = strlen(lines[i]);
-                    temp = calloc(line_length, sizeof(char));
+                    temp = calloc(line_length + 1, sizeof(char));
                     strncpy(temp, lines[i], pointerX);
                     int draw_length = MeasureText(temp, fontSize);
                     DrawText(temp, 0, i * fontSize, fontSize, WHITE);
