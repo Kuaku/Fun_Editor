@@ -119,6 +119,48 @@ size_t GetPointerPosition() {
     return pointer_pos;
 }
 
+void RemoveCharacter(size_t position) {
+    if (position > 0) {
+        Piece new_pieces[MAX_PIECES];
+        int new_count = 0;
+        size_t current_pos = 0;
+
+        position--;
+
+        for (size_t i = 0; i < piece_count; ++i) {
+            Piece p = pieces[i];
+
+            if (current_pos + p.length <= position) {
+                new_pieces[new_count++] = p;
+                current_pos += p.length;
+            } else if (position >= current_pos && position < current_pos + p.length) {
+                size_t local_offset = position - current_pos;
+
+                if (local_offset > 0) {
+                    Piece left = p;
+                    left.length = local_offset;
+                    new_pieces[new_count++] = left;
+                }
+
+                if (local_offset + 1 < p.length) {
+                    Piece right = p;
+                    right.start += local_offset + 1;
+                    right.length -= local_offset + 1;
+                    new_pieces[new_count++] = right;
+                }
+
+                current_pos += p.length;
+            } else {
+                new_pieces[new_count++] = p;
+                current_pos += p.length;
+            }
+        }
+        memcpy(pieces, new_pieces, sizeof(Piece) * new_count);
+        piece_count = new_count;
+        dirtyPieces = true; 
+    }
+}
+
 void InsertCharacter(size_t position, char value) {
     size_t new_start = AppendAddBuffer(value);
     Piece new_piece = {ADD, new_start, 1};
@@ -196,58 +238,14 @@ int main(void) {
 
 
         if (IsKeyPressed(KEY_BACKSPACE)) {
-            size_t pointer_pos = 0;
-            for (size_t i = 0; i < pointerY; ++i) {
-                pointer_pos += strlen(lines[i]) + 1;
-            }
-            pointer_pos += pointerX;
-
-            if (pointer_pos > 0) {
-                Piece new_pieces[MAX_PIECES];
-                int new_count = 0;
-                size_t current_pos = 0;
-
-                pointer_pos--;
-
-                for (size_t i = 0; i < piece_count; ++i) {
-                    Piece p = pieces[i];
-
-                    if (current_pos + p.length <= pointer_pos) {
-                        new_pieces[new_count++] = p;
-                        current_pos += p.length;
-                    } else if (pointer_pos >= current_pos && pointer_pos < current_pos + p.length) {
-                        size_t local_offset = pointer_pos - current_pos;
-
-                        if (local_offset > 0) {
-                            Piece left = p;
-                            left.length = local_offset;
-                            new_pieces[new_count++] = left;
-                        }
-
-                        if (local_offset + 1 < p.length) {
-                            Piece right = p;
-                            right.start += local_offset + 1;
-                            right.length -= local_offset + 1;
-                            new_pieces[new_count++] = right;
-                        }
-
-                        current_pos += p.length;
-                    } else {
-                        new_pieces[new_count++] = p;
-                        current_pos += p.length;
-                    }
+            RemoveCharacter(GetPointerPosition());
+            if (pointerX == 0) {
+                if (pointerY > 0) {
+                    pointerY--;
+                    pointerX = strlen(lines[pointerY]);
                 }
-                memcpy(pieces, new_pieces, sizeof(Piece) * new_count);
-                piece_count = new_count;
-                if (pointerX == 0) {
-                    if (pointerY > 0) {
-                        pointerY--;
-                        pointerX = strlen(lines[pointerY]);
-                    }
-                } else {
-                    pointerX--;
-                }
-                dirtyPieces = true; 
+            } else {
+                pointerX--;
             }
         }
 
