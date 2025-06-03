@@ -250,11 +250,57 @@ void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height)
     EndScissorMode();
 }
 
-size_t GetScreenCoord(size_t coord, float target, float offset, float zoom) {
-    return (coord - target) * zoom + offset;
+char* load_file(const char* filename, size_t* out_len) {
+    FILE* f = fopen(filename, "rb");
+    if (!f) {
+        fprintf(stderr, "Could not open file: %s\n", filename);
+        return NULL;
+    }
+    fseek(f, 0, SEEK_END);
+    size_t len = ftell(f);
+    rewind(f);
+
+    char* buf = malloc(len + 1);
+    if (!buf) {
+        fclose(f);
+        fprintf(stderr, "Out of memory!\n");
+        return NULL;
+    }
+    fread(buf, 1, len, f);
+    buf[len] = '\0'; // Null-terminate for safety
+    fclose(f);
+    if (out_len) *out_len = len;
+    return buf;
 }
 
-int main(void) {
+void normalize_line_endings(char* buf) {
+    char* src = buf;
+    char* dst = buf;
+    while (*src) {
+        if (*src != '\r') {
+            *dst++ = *src;
+        }
+        src++;
+    }
+    *dst = '\0';
+}
+
+int main(int argc, char** argv) {
+
+    size_t org_buffer_length = 0;
+
+    if (argc >= 2) {
+        org_buffer = load_file(argv[1], &org_buffer_length);
+        if (!org_buffer) {
+            fprintf(stderr, "Failed to load file, using default text.\n");
+            org_buffer = strdup("");
+        }
+        org_buffer_length = strlen(org_buffer);
+        normalize_line_endings(org_buffer);
+    } else {
+        org_buffer = strdup("");
+        org_buffer_length = strlen(org_buffer);
+    }
 
     pieces[0].source = ORIGINAL;
     pieces[0].start = 0;
@@ -351,6 +397,6 @@ int main(void) {
     }
 
     CloseWindow();
-
+    free(org_buffer);
     return 0;
 }
