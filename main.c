@@ -205,6 +205,32 @@ void InsertCharacter(size_t position, char value) {
     dirtyPieces = true;
 }
 
+void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height) {
+    BeginScissorMode(startX, startY, width, height);
+    char* temp = NULL;
+    size_t line_length;
+    for (size_t i = 0; i < line_count; ++i) {
+        if (pointerY != i) {
+            DrawText(lines[i], startX, startY + i * fontSize, fontSize, WHITE); 
+        } else {       
+            if (temp != NULL) {
+                free(temp);
+            } 
+            line_length = strlen(lines[i]);
+            temp = calloc(line_length + 1, sizeof(char));
+            strncpy(temp, lines[i], pointerX);
+            int draw_length = MeasureText(temp, fontSize);
+            DrawText(temp, startX, startY + i * fontSize, fontSize, WHITE);
+            DrawText(lines[i] + pointerX, startX + draw_length + pointerPaddingX * 2 + pointerWidth, startY + fontSize * i, fontSize, WHITE);   
+            DrawRectangle(startX + draw_length + pointerPaddingX, startY + i * fontSize + pointerPaddingY, pointerWidth, fontSize - 2 * pointerPaddingY, WHITE);
+        }
+    }
+    EndScissorMode();
+    if (temp != NULL) {
+        free(temp);
+    }
+}
+
 int main(void) {
     const int screenWidth = 1200;
     const int screenHeight = 700;
@@ -218,8 +244,6 @@ int main(void) {
     InitWindow(screenWidth, screenHeight, "Fun Editor");
     SetTargetFPS(60);
 
-    char* temp = NULL;
-    size_t line_length;
     while (!WindowShouldClose()) {
         if (IsKeyPressed(KEY_LEFT) && pointerX > 0) {
             pointerX--;
@@ -269,23 +293,7 @@ int main(void) {
         BeginDrawing();
         {
             ClearBackground(BLACK);
-            
-            for (size_t i = 0; i < line_count; ++i) {
-                if (pointerY != i) {
-                    DrawText(lines[i], 0, i * fontSize, fontSize, WHITE); 
-                } else {
-                    if (temp != NULL) {
-                        free(temp);
-                    }
-                    line_length = strlen(lines[i]);
-                    temp = calloc(line_length + 1, sizeof(char));
-                    strncpy(temp, lines[i], pointerX);
-                    int draw_length = MeasureText(temp, fontSize);
-                    DrawText(temp, 0, i * fontSize, fontSize, WHITE);
-                    DrawText(lines[i] + pointerX, draw_length + pointerPaddingX * 2 + pointerWidth, fontSize * i, fontSize, WHITE);   
-                    DrawRectangle(draw_length + pointerPaddingX, i * fontSize + pointerPaddingY, pointerWidth, fontSize - 2 * pointerPaddingY, WHITE);
-                }
-            }
+            RenderTextBuffer(screenWidth/4.0, screenHeight/4.0, screenWidth/2.0, screenHeight/2.0); 
         }
         EndDrawing();
     }
