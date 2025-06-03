@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -35,6 +36,19 @@ size_t pointerX = 0;
 size_t pointerY = 0;
 size_t pointerPaddingX = 3, pointerPaddingY = 3, pointerWidth = 2;
 
+void LogAddBuffer() {
+    printf("AddBuffer: ");
+    for (size_t i = 0; i < add_buffer_length; ++i) {
+        if (add_buffer[i] == ' ') {
+            printf("Space ");
+        } else if (add_buffer[i] == '\n') {
+            printf("Enter ");
+        } else {
+            printf("%c ", add_buffer[i]);
+        }
+    }
+    printf("\n");
+}
 
 void LogPieces() {
     TraceLog(LOG_INFO, "===== PIECES =====");
@@ -101,11 +115,11 @@ void regenerate_text() {
     dirtyPieces = false;
 }
 
-int AppendAddBuffer(char value) {
+int AppendAddBuffer(char* value, size_t len) {
     // TODO: Possible Buffer overflow!
     int result = add_buffer_length;
-    add_buffer[add_buffer_length] = value;
-    add_buffer_length++;
+    memcpy(&add_buffer[add_buffer_length], value, len);
+    add_buffer_length += len;
     return result;
 }
 
@@ -160,10 +174,9 @@ void RemoveCharacter(size_t position) {
         dirtyPieces = true; 
     }
 }
-
-void InsertCharacter(size_t position, char value) {
-    size_t new_start = AppendAddBuffer(value);
-    Piece new_piece = {ADD, new_start, 1};
+void InsertString(size_t position, char* value, size_t len) {
+    size_t new_start = AppendAddBuffer(value, len);
+    Piece new_piece = {ADD, new_start, len};
     Piece new_pieces[MAX_PIECES];
     size_t new_count = 0;
     size_t current_pos = 0;
@@ -205,8 +218,13 @@ void InsertCharacter(size_t position, char value) {
     dirtyPieces = true;
 }
 
+void InsertCharacter(size_t position, char value) {
+    InsertString(position, &value, 1);
+}
+
 void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height) {
     BeginScissorMode(startX, startY, width, height);
+    
     char* temp = NULL;
     size_t line_length;
     for (size_t i = 0; i < line_count; ++i) {
@@ -225,15 +243,18 @@ void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height)
             DrawRectangle(startX + draw_length + pointerPaddingX, startY + i * fontSize + pointerPaddingY, pointerWidth, fontSize - 2 * pointerPaddingY, WHITE);
         }
     }
-    EndScissorMode();
     if (temp != NULL) {
         free(temp);
     }
+    
+    EndScissorMode();
+}
+
+size_t GetScreenCoord(size_t coord, float target, float offset, float zoom) {
+    return (coord - target) * zoom + offset;
 }
 
 int main(void) {
-    const int screenWidth = 1200;
-    const int screenHeight = 700;
 
     pieces[0].source = ORIGINAL;
     pieces[0].start = 0;
@@ -241,10 +262,14 @@ int main(void) {
     piece_count = 1;
     regenerate_text();
 
-    InitWindow(screenWidth, screenHeight, "Fun Editor");
-    SetTargetFPS(60);
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+    InitWindow(1200, 700, "Fun Editor");
+    SetTargetFPS(60); 
 
     while (!WindowShouldClose()) {
+        size_t screenWidth = GetScreenWidth();
+        size_t screenHeight = GetScreenHeight();
+
         if (IsKeyPressed(KEY_LEFT) && pointerX > 0) {
             pointerX--;
         }
@@ -280,21 +305,48 @@ int main(void) {
                 pointerX++;
             }
             key = GetCharPressed();
+        }
+        if (IsKeyPressed(KEY_TAB) && IsKeyDown(KEY_LEFT_CONTROL)) {
+            if (pointerX == 1 && lines[pointerY][pointerX - 1] == ' ') {
+                RemoveCharacter(GetPointerPosition());
+                pointerX -= 1;
+            } else if (pointerX >= 2 && lines[pointerY][pointerX - 1] == ' ' && lines[pointerY][pointerX - 2] == ' ') {
+                RemoveCharacter(GetPointerPosition());
+                RemoveCharacter(GetPointerPosition() - 1);
+                pointerX -= 2;
+            }
+        } else if (IsKeyPressed(KEY_TAB)) {
+            InsertCharacter(GetPointerPosition(), ' ');
+            InsertCharacter(GetPointerPosition(), ' ');
+            pointerX += 2;
         }       
         if (IsKeyPressed(KEY_ENTER)) {    
-            InsertCharacter(GetPointerPosition(), '\n');
-            pointerX=0;
+            size_t spaces = 0;
+            for (size_t i = 0; i < strlen(lines[pointerY]); ++i) {
+                if (lines[pointerY][i] != ' ') {
+                    break;
+                }
+                spaces++;
+            }
+            char* newLine = calloc(1 + spaces, sizeof(char));
+            newLine[0] = '\n';
+            for (size_t i = 0; i < spaces; ++i) {
+                newLine[1 + i] = ' ';
+            }
+            InsertString(GetPointerPosition(), newLine, 1 + spaces);
+            free(newLine);
+
+            pointerX=spaces;
             pointerY++;
         }
+
         if (dirtyPieces) {
             regenerate_text();
         }
 
         BeginDrawing();
-        {
-            ClearBackground(BLACK);
-            RenderTextBuffer(screenWidth/4.0, screenHeight/4.0, screenWidth/2.0, screenHeight/2.0); 
-        }
+        ClearBackground(BLACK);
+        RenderTextBuffer(40, 40, screenWidth - 40, screenHeight - 40);
         EndDrawing();
     }
 
