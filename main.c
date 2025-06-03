@@ -16,7 +16,7 @@ typedef struct {
 #define MAX_PIECES 1024
 #define MAX_ADD_BUFFER 4096
 
-char* org_buffer = "Das ist mein Editor!\nIst das nicht cool.";
+char* org_buffer = "D";
 char add_buffer[MAX_ADD_BUFFER];
 
 size_t add_buffer_length = 0;
@@ -31,7 +31,7 @@ size_t line_count = 0;
 
 size_t fontSize = 40;
 
-size_t pointerX = 2;
+size_t pointerX = 0;
 size_t pointerY = 0;
 size_t pointerPaddingX = 3, pointerPaddingY = 3, pointerWidth = 2;
 
@@ -101,6 +101,68 @@ void regenerate_text() {
     dirtyPieces = false;
 }
 
+int AppendAddBuffer(char value) {
+    // TODO: Possible Buffer overflow!
+    int result = add_buffer_length;
+    add_buffer[add_buffer_length] = value;
+    add_buffer_length++;
+    return result;
+}
+
+size_t GetPointerPosition() {
+    // TODO: Possible pointer to null (lines intial)
+    size_t pointer_pos = 0;
+    for (size_t i = 0; i < pointerY; ++i) {
+        pointer_pos += strlen(lines[i]) + 1;
+    }
+    pointer_pos += pointerX;
+    return pointer_pos;
+}
+
+void InsertCharacter(size_t position, char value) {
+    size_t new_start = AppendAddBuffer(value);
+    Piece new_piece = {ADD, new_start, 1};
+    Piece new_pieces[MAX_PIECES];
+    size_t new_count = 0;
+    size_t current_pos = 0;
+    if (piece_count == 0) {
+        new_pieces[new_count++] = new_piece;
+    }
+    for (size_t i = 0; i < piece_count; ++i) {
+        Piece p = pieces[i];
+        if (current_pos + p.length < position) {
+            new_pieces[new_count++] = p;
+            current_pos += p.length;
+        } else {
+            size_t offset = position - current_pos;
+            if (offset > 0) {
+                Piece left = p;
+                left.source = p.source;
+                left.length = offset;
+                new_pieces[new_count++] = left;
+            }
+
+            new_pieces[new_count++] = new_piece;
+
+            if (offset < p.length) {
+                Piece right = p;
+                right.source = p.source;
+                right.start += offset;
+                right.length -= offset;
+                new_pieces[new_count++] = right;
+            }
+
+            for (size_t j = i + 1; j < piece_count; ++j) {
+                new_pieces[new_count++] = pieces[j];
+            }
+            break;
+        }
+    }
+    memcpy(pieces, new_pieces, sizeof(Piece) * new_count);
+    piece_count = new_count;
+    dirtyPieces = true;
+}
+
 int main(void) {
     const int screenWidth = 1200;
     const int screenHeight = 700;
@@ -109,7 +171,7 @@ int main(void) {
     pieces[0].start = 0;
     pieces[0].length = strlen(org_buffer);
     piece_count = 1;
-    dirtyPieces = true;
+    regenerate_text();
 
     InitWindow(screenWidth, screenHeight, "Fun Editor");
     SetTargetFPS(60);
@@ -192,109 +254,15 @@ int main(void) {
         int key = GetCharPressed();
         while (key > 0) {
             if (key >= 32 && key <= 126) {
-                add_buffer[add_buffer_length] = key;
-                size_t new_start = add_buffer_length;
-                add_buffer_length++;
-
-                Piece new_piece = {ADD, new_start, 1};
-                Piece new_pieces[MAX_PIECES];
-                int new_count = 0;
-                int current_pos = 0;
-                size_t pointer_pos = 0;
-                for (size_t i = 0; i < pointerY; ++i) {
-                    pointer_pos += strlen(lines[i]) + 1;
-                }
-                pointer_pos += pointerX;
-
-                for (size_t i = 0; i < piece_count; ++i) {
-                    Piece p = pieces[i];
-                    if (current_pos + p.length < pointer_pos) {
-                        new_pieces[new_count++] = p;
-                        current_pos += p.length;
-                    } else {
-                        size_t offset = pointer_pos - current_pos;
-                        if (offset > 0) {
-                            Piece left = p;
-                            left.source = p.source;
-                            left.length = offset;
-                            new_pieces[new_count++] = left;
-                        }
-
-                        new_pieces[new_count++] = new_piece;
-
-                        if (offset < p.length) {
-                            Piece right = p;
-                            right.source = p.source;
-                            right.start += offset;
-                            right.length -= offset;
-                            new_pieces[new_count++] = right;
-                        }
-
-                        for (size_t j = i + 1; j < piece_count; ++j) {
-                            new_pieces[new_count++] = pieces[j];
-                        }
-                        break;
-                    }
-                }
-                memcpy(pieces, new_pieces, sizeof(Piece) * new_count);
-                piece_count = new_count;
+                InsertCharacter(GetPointerPosition(), key);
                 pointerX++;
-                dirtyPieces = true;
-                //LogPieces();
             }
-
             key = GetCharPressed();
         }       
-        if (IsKeyPressed(KEY_ENTER)) {         
-            add_buffer[add_buffer_length] = '\n';
-            size_t new_start = add_buffer_length;
-            add_buffer_length++;
-
-            Piece new_piece = {ADD, new_start, 1};
-            Piece new_pieces[MAX_PIECES];
-            int new_count = 0;
-            int current_pos = 0;
-            size_t pointer_pos = 0;
-            for (size_t i = 0; i < pointerY; ++i) {
-                pointer_pos += strlen(lines[i]) + 1;
-            }
-            pointer_pos += pointerX;
-
-            for (size_t i = 0; i < piece_count; ++i) {
-                Piece p = pieces[i];
-                if (current_pos + p.length < pointer_pos) {
-                    new_pieces[new_count++] = p;
-                    current_pos += p.length;
-                } else {
-                    size_t offset = pointer_pos - current_pos;
-                    if (offset > 0) {
-                        Piece left = p;
-                        left.source = p.source;
-                        left.length = offset;
-                        new_pieces[new_count++] = left;
-                    }
-
-                    new_pieces[new_count++] = new_piece;
-
-                    if (offset < p.length) {
-                        Piece right = p;
-                        right.source = p.source;
-                        right.start += offset;
-                        right.length -= offset;
-                        new_pieces[new_count++] = right;
-                    }
-
-                    for (size_t j = i + 1; j < piece_count; ++j) {
-                        new_pieces[new_count++] = pieces[j];
-                    }
-                    break;
-                }
-            }
-            memcpy(pieces, new_pieces, sizeof(Piece) * new_count);
-            piece_count = new_count;
+        if (IsKeyPressed(KEY_ENTER)) {    
+            InsertCharacter(GetPointerPosition(), '\n');
             pointerX=0;
             pointerY++;
-            dirtyPieces = true;
         }
         if (dirtyPieces) {
             regenerate_text();
