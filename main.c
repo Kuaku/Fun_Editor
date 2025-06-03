@@ -245,7 +245,57 @@ int main(void) {
 
             key = GetCharPressed();
         }       
+        if (IsKeyPressed(KEY_ENTER)) {         
+            add_buffer[add_buffer_length] = '\n';
+            size_t new_start = add_buffer_length;
+            add_buffer_length++;
 
+            Piece new_piece = {ADD, new_start, 1};
+            Piece new_pieces[MAX_PIECES];
+            int new_count = 0;
+            int current_pos = 0;
+            size_t pointer_pos = 0;
+            for (size_t i = 0; i < pointerY; ++i) {
+                pointer_pos += strlen(lines[i]) + 1;
+            }
+            pointer_pos += pointerX;
+
+            for (size_t i = 0; i < piece_count; ++i) {
+                Piece p = pieces[i];
+                if (current_pos + p.length < pointer_pos) {
+                    new_pieces[new_count++] = p;
+                    current_pos += p.length;
+                } else {
+                    size_t offset = pointer_pos - current_pos;
+                    if (offset > 0) {
+                        Piece left = p;
+                        left.source = p.source;
+                        left.length = offset;
+                        new_pieces[new_count++] = left;
+                    }
+
+                    new_pieces[new_count++] = new_piece;
+
+                    if (offset < p.length) {
+                        Piece right = p;
+                        right.source = p.source;
+                        right.start += offset;
+                        right.length -= offset;
+                        new_pieces[new_count++] = right;
+                    }
+
+                    for (size_t j = i + 1; j < piece_count; ++j) {
+                        new_pieces[new_count++] = pieces[j];
+                    }
+                    break;
+                }
+            }
+            memcpy(pieces, new_pieces, sizeof(Piece) * new_count);
+            piece_count = new_count;
+            pointerX=0;
+            pointerY++;
+            dirtyPieces = true;
+        }
         if (dirtyPieces) {
             regenerate_text();
         }

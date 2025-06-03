@@ -1,5 +1,8 @@
 .vscode/
+*.swp
 
+main
 main.exe
 main.o
 libraylib.a
+
