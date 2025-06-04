@@ -14,6 +14,11 @@ typedef struct {
     size_t length;
 } Piece;
 
+typedef struct {
+    size_t x;
+    size_t y;
+} Position;
+
 #define MAX_PIECES 1024
 #define MAX_ADD_BUFFER 4096
 
@@ -32,8 +37,7 @@ size_t line_count = 0;
 
 size_t fontSize = 40;
 
-size_t pointerX = 0;
-size_t pointerY = 0;
+size_t pointerPosition = 0;
 size_t pointerPaddingX = 3, pointerPaddingY = 3, pointerWidth = 2;
 
 void LogAddBuffer() {
@@ -123,17 +127,37 @@ int AppendAddBuffer(char* value, size_t len) {
     return result;
 }
 
-size_t GetPointerPosition() {
-    // TODO: Possible pointer to null (lines intial)
-    size_t pointer_pos = 0;
-    for (size_t i = 0; i < pointerY; ++i) {
-        pointer_pos += strlen(lines[i]) + 1;
+size_t GetTextSize() {
+    size_t out = 0;
+    for (size_t i = 0; i < piece_count; ++i) {
+        out += pieces[i].length;
     }
-    pointer_pos += pointerX;
-    return pointer_pos;
+    return out;
 }
 
-void RemoveCharacter(size_t position) {
+Position GetPointerPosition() {
+    Position out = {0, 0};
+    size_t traversed = 0;
+    char* work_buffer;
+    for (size_t i = 0; i < piece_count && traversed < pointerPosition; ++i) {
+        work_buffer = pieces[i].source == ORIGINAL ? org_buffer : add_buffer;
+        
+        size_t to_read = pointerPosition - traversed;
+        if (to_read > pieces[i].length) to_read = pieces[i].length;
+        for (size_t j = 0; j < to_read; ++j) {
+            if (work_buffer[pieces[i].start + j] == '\n') {
+                out.y++;
+                out.x = 0;
+            } else {
+                out.x++;
+            }
+        }
+        traversed += to_read;
+    }    
+    return out;
+}
+
+bool RemoveCharacter(size_t position) {
     if (position > 0) {
         Piece new_pieces[MAX_PIECES];
         int new_count = 0;
@@ -172,8 +196,17 @@ void RemoveCharacter(size_t position) {
         memcpy(pieces, new_pieces, sizeof(Piece) * new_count);
         piece_count = new_count;
         dirtyPieces = true; 
+        return true;
+    }
+    return false;
+}
+
+void RemoveCharacterAtPointer() {
+    if (RemoveCharacter(pointerPosition)) {
+        pointerPosition--;
     }
 }
+
 void InsertString(size_t position, char* value, size_t len) {
     size_t new_start = AppendAddBuffer(value, len);
     Piece new_piece = {ADD, new_start, len};
@@ -218,17 +251,28 @@ void InsertString(size_t position, char* value, size_t len) {
     dirtyPieces = true;
 }
 
+void InsertStringAtPointer(char* value, size_t len) {
+    InsertString(pointerPosition, value, len);
+    pointerPosition += len;
+}
+
 void InsertCharacter(size_t position, char value) {
     InsertString(position, &value, 1);
 }
 
+void InsertCharacterAtPointer(char value) {
+    InsertCharacter(pointerPosition, value);
+    pointerPosition += 1;
+}
+
 void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height) {
+    Position pointer = GetPointerPosition();
     BeginScissorMode(startX, startY, width, height);
     
     char* temp = NULL;
     size_t line_length;
     for (size_t i = 0; i < line_count; ++i) {
-        if (pointerY != i) {
+        if (pointer.y != i) {
             DrawText(lines[i], startX, startY + i * fontSize, fontSize, WHITE); 
         } else {       
             if (temp != NULL) {
@@ -236,10 +280,10 @@ void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height)
             } 
             line_length = strlen(lines[i]);
             temp = calloc(line_length + 1, sizeof(char));
-            strncpy(temp, lines[i], pointerX);
+            strncpy(temp, lines[i], pointer.x);
             int draw_length = MeasureText(temp, fontSize);
             DrawText(temp, startX, startY + i * fontSize, fontSize, WHITE);
-            DrawText(lines[i] + pointerX, startX + draw_length + pointerPaddingX * 2 + pointerWidth, startY + fontSize * i, fontSize, WHITE);   
+            DrawText(lines[i] + pointer.x, startX + draw_length + pointerPaddingX * 2 + pointerWidth, startY + fontSize * i, fontSize, WHITE);   
             DrawRectangle(startX + draw_length + pointerPaddingX, startY + i * fontSize + pointerPaddingY, pointerWidth, fontSize - 2 * pointerPaddingY, WHITE);
         }
     }
@@ -285,6 +329,69 @@ void normalize_line_endings(char* buf) {
     *dst = '\0';
 }
 
+
+Position GetLineByIndex(size_t index) {
+    Position out = {0, -1};
+    char* work_buffer;
+    size_t current_line = 0;
+    size_t traversed = 0;
+    for (size_t i = 0; i < piece_count && out.y == -1; ++i) {
+        work_buffer = pieces[i].source == ORIGINAL ? org_buffer : add_buffer;
+        for (size_t j = 0; j < pieces[i].length; ++j) {
+            if (work_buffer[pieces[i].start + j] == '\n') {
+                current_line++;
+                if (current_line == index) {
+                    out.x = traversed + j + 1;
+                } else if (current_line == index + 1) {
+                    out.y = traversed + j - out.x;
+                    break;
+                }
+            }
+        }
+        traversed += pieces[i].length;
+        if (out.y != -1) {
+            break;
+        }
+    }
+    if (out.y == -1) {
+        out.y = traversed - out.x;
+    }
+    return out;
+}
+
+size_t GetLineCount()  {
+    size_t out = 1;
+    char* work_buffer;
+    for (size_t i = 0; i < piece_count; ++i) {
+        work_buffer = pieces[i].source == ORIGINAL ? org_buffer : add_buffer;
+        for (size_t j = 0; j < pieces[i].length; ++j) {
+            if (work_buffer[pieces[i].start + j] == '\n') {
+                out++;
+            }
+        }
+    }
+    return out;
+}
+
+void jumpLineUp() {
+    Position pointer = GetPointerPosition();
+    if (pointer.y == 0) {
+        return;
+    }
+    Position nextLine = GetLineByIndex(pointer.y - 1);
+    pointerPosition = nextLine.x + min(nextLine.y, pointer.x);
+}
+
+void jumpLineDown() {
+    Position pointer = GetPointerPosition();
+    size_t max_lines = GetLineCount();
+    if (pointer.y >= max_lines - 1) {
+        return;
+    }
+    Position nextLine = GetLineByIndex(pointer.y + 1);
+    pointerPosition = nextLine.x + min(nextLine.y, pointer.x);
+}
+
 int main(int argc, char** argv) {
 
     size_t org_buffer_length = 0;
@@ -316,74 +423,36 @@ int main(int argc, char** argv) {
         size_t screenWidth = GetScreenWidth();
         size_t screenHeight = GetScreenHeight();
 
-        if (IsKeyPressed(KEY_LEFT) && pointerX > 0) {
-            pointerX--;
+        if (IsKeyPressed(KEY_LEFT) && pointerPosition > 0) {
+            pointerPosition--;
         }
-        if (IsKeyPressed(KEY_RIGHT) && pointerX < strlen(lines[pointerY])) {
-            pointerX++;
+        if (IsKeyPressed(KEY_RIGHT) && pointerPosition <= GetTextSize()) {
+            pointerPosition++;
         }
-        if (IsKeyPressed(KEY_UP) && pointerY > 0) {
-            pointerY--;
-            pointerX = min(pointerX, strlen(lines[pointerY]));
+        if (IsKeyPressed(KEY_UP)) {
+            jumpLineUp();
         } 
-        if (IsKeyPressed(KEY_DOWN) && pointerY < line_count - 1) {
-            pointerY++;
-            pointerX = min(pointerX, strlen(lines[pointerY]));
+        if (IsKeyPressed(KEY_DOWN)) {
+            jumpLineDown();
         } 
 
 
         if (IsKeyPressed(KEY_BACKSPACE)) {
-            RemoveCharacter(GetPointerPosition());
-            if (pointerX == 0) {
-                if (pointerY > 0) {
-                    pointerY--;
-                    pointerX = strlen(lines[pointerY]);
-                }
-            } else {
-                pointerX--;
-            }
+            RemoveCharacterAtPointer();
         }
 
         int key = GetCharPressed();
         while (key > 0) {
             if (key >= 32 && key <= 126) {
-                InsertCharacter(GetPointerPosition(), key);
-                pointerX++;
+                InsertCharacterAtPointer(key);
             }
             key = GetCharPressed();
         }
-        if (IsKeyPressed(KEY_TAB) && IsKeyDown(KEY_LEFT_CONTROL)) {
-            if (pointerX == 1 && lines[pointerY][pointerX - 1] == ' ') {
-                RemoveCharacter(GetPointerPosition());
-                pointerX -= 1;
-            } else if (pointerX >= 2 && lines[pointerY][pointerX - 1] == ' ' && lines[pointerY][pointerX - 2] == ' ') {
-                RemoveCharacter(GetPointerPosition());
-                RemoveCharacter(GetPointerPosition() - 1);
-                pointerX -= 2;
-            }
-        } else if (IsKeyPressed(KEY_TAB)) {
-            InsertCharacter(GetPointerPosition(), ' ');
-            InsertCharacter(GetPointerPosition(), ' ');
-            pointerX += 2;
+        if (IsKeyPressed(KEY_TAB)) {
+            InsertStringAtPointer("  ", 2);
         }       
         if (IsKeyPressed(KEY_ENTER)) {    
-            size_t spaces = 0;
-            for (size_t i = 0; i < strlen(lines[pointerY]); ++i) {
-                if (lines[pointerY][i] != ' ') {
-                    break;
-                }
-                spaces++;
-            }
-            char* newLine = calloc(1 + spaces, sizeof(char));
-            newLine[0] = '\n';
-            for (size_t i = 0; i < spaces; ++i) {
-                newLine[1 + i] = ' ';
-            }
-            InsertString(GetPointerPosition(), newLine, 1 + spaces);
-            free(newLine);
-
-            pointerX=spaces;
-            pointerY++;
+            InsertCharacterAtPointer('\n');
         }
 
         if (dirtyPieces) {
