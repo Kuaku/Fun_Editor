@@ -7,6 +7,7 @@
 #define min(a, b) ((a) < (b) ? (a) : (b))
 
 typedef enum { ORIGINAL, ADD } BufferType;
+typedef enum { TOP, BOTTOM } AnchorType;
 
 typedef struct {
     BufferType source;
@@ -22,7 +23,7 @@ typedef struct {
 #define MAX_PIECES 1024
 #define MAX_ADD_BUFFER 4096
 
-char* org_buffer = "D";
+char* org_buffer = "";
 char add_buffer[MAX_ADD_BUFFER];
 
 size_t add_buffer_length = 0;
@@ -34,8 +35,10 @@ char* text_buffer = NULL;
 size_t text_length = 0;
 char** lines = NULL;
 size_t line_count = 0;
+size_t line_anchor = 0;
+AnchorType anchor_type = TOP;
 
-size_t fontSize = 40;
+size_t fontSize = 30;
 
 size_t pointerPosition = 0;
 size_t pointerPaddingX = 3, pointerPaddingY = 3, pointerWidth = 2;
@@ -265,30 +268,65 @@ void InsertCharacterAtPointer(char value) {
     pointerPosition += 1;
 }
 
-void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height) {
-    Position pointer = GetPointerPosition();
-    BeginScissorMode(startX, startY, width, height);
-    
+void RenderLine(size_t xX, size_t yY, size_t index, Position pointer) {
     char* temp = NULL;
     size_t line_length;
-    for (size_t i = 0; i < line_count; ++i) {
-        if (pointer.y != i) {
-            DrawText(lines[i], startX, startY + i * fontSize, fontSize, WHITE); 
-        } else {       
-            if (temp != NULL) {
-                free(temp);
-            } 
-            line_length = strlen(lines[i]);
-            temp = calloc(line_length + 1, sizeof(char));
-            strncpy(temp, lines[i], pointer.x);
-            int draw_length = MeasureText(temp, fontSize);
-            DrawText(temp, startX, startY + i * fontSize, fontSize, WHITE);
-            DrawText(lines[i] + pointer.x, startX + draw_length + pointerPaddingX * 2 + pointerWidth, startY + fontSize * i, fontSize, WHITE);   
-            DrawRectangle(startX + draw_length + pointerPaddingX, startY + i * fontSize + pointerPaddingY, pointerWidth, fontSize - 2 * pointerPaddingY, WHITE);
-        }
+    if (pointer.y != index) {
+            DrawText(lines[index], xX, yY, fontSize, WHITE); 
+    } else {       
+        if (temp != NULL) {
+            free(temp);
+        } 
+        line_length = strlen(lines[index]);
+        temp = calloc(line_length + 1, sizeof(char));
+        strncpy(temp, lines[index], pointer.x);
+        int draw_length = MeasureText(temp, fontSize);
+        DrawText(temp, xX, yY, fontSize, WHITE);
+        DrawText(lines[index] + pointer.x, xX + draw_length + pointerPaddingX * 2 + pointerWidth, yY, fontSize, WHITE);   
+        DrawRectangle(xX + draw_length + pointerPaddingX, yY, pointerWidth, fontSize - 2 * pointerPaddingY, WHITE);
     }
     if (temp != NULL) {
         free(temp);
+    }
+}
+
+void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height) {
+    Position pointer = GetPointerPosition();
+
+    size_t lines_completly_rendered = height / fontSize;
+    BeginScissorMode(startX, startY, width, height);
+
+    if (anchor_type == TOP) {
+        if (pointer.y >= line_anchor + lines_completly_rendered) {
+            anchor_type = BOTTOM;
+            line_anchor = pointer.y;
+        }
+        if (pointer.y <= line_anchor) {
+            line_anchor = pointer.y;
+        }
+    } else if (anchor_type == BOTTOM) {
+        if (pointer.y >= line_anchor) {
+            line_anchor = pointer.y;
+        }
+        if (pointer.y <= line_anchor - lines_completly_rendered) {
+            anchor_type = TOP;
+            line_anchor = pointer.y;
+        }
+    }
+
+    size_t line_y = 0;
+    if (anchor_type == TOP) {
+        for (size_t i = line_anchor; i < min(line_anchor + lines_completly_rendered + 1, line_count); ++i) {    
+            RenderLine(startX, startY + line_y * fontSize, i, pointer);
+            line_y++;
+        }
+    } else {
+        for (int i = line_anchor; i >= 0 && i >= (int)(line_anchor - lines_completly_rendered - 1); --i) {
+            if (i < line_count) {
+                RenderLine(startX, startY + height - (line_y + 1) * fontSize, i, pointer);
+            }
+            line_y++;
+        }
     }
     
     EndScissorMode();
