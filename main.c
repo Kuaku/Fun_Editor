@@ -36,7 +36,7 @@ size_t text_length = 0;
 char** lines = NULL;
 size_t line_count = 0;
 size_t line_anchor = 0;
-AnchorType anchor_type = TOP;
+size_t offsetX = 0;
 
 size_t fontSize = 30;
 
@@ -268,6 +268,19 @@ void InsertCharacterAtPointer(char value) {
     pointerPosition += 1;
 }
 
+size_t GetPointerOffsetFromLeft(Position pointer) {
+    char* temp = NULL;
+
+    size_t line_length = strlen(lines[pointer.y]);
+    temp = calloc(line_length+1, sizeof(char));
+
+    strncpy(temp, lines[pointer.y], pointer.x);
+    size_t draw_length = MeasureText(temp, fontSize);
+    
+    free(temp);
+    return draw_length;
+}
+
 void RenderLine(size_t xX, size_t yY, size_t index, Position pointer) {
     char* temp = NULL;
     size_t line_length;
@@ -292,41 +305,29 @@ void RenderLine(size_t xX, size_t yY, size_t index, Position pointer) {
 
 void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height) {
     Position pointer = GetPointerPosition();
-
+    size_t pointer_offset = GetPointerOffsetFromLeft(pointer);
     size_t lines_completly_rendered = height / fontSize;
     BeginScissorMode(startX, startY, width, height);
 
-    if (anchor_type == TOP) {
-        if (pointer.y >= line_anchor + lines_completly_rendered) {
-            anchor_type = BOTTOM;
-            line_anchor = pointer.y;
-        }
-        if (pointer.y <= line_anchor) {
-            line_anchor = pointer.y;
-        }
-    } else if (anchor_type == BOTTOM) {
-        if (pointer.y >= line_anchor) {
-            line_anchor = pointer.y;
-        }
-        if (pointer.y <= line_anchor - lines_completly_rendered) {
-            anchor_type = TOP;
-            line_anchor = pointer.y;
-        }
+    if (pointer.y >= line_anchor + lines_completly_rendered) {
+        line_anchor = pointer.y - lines_completly_rendered + 1;
+    }
+    if (pointer.y <= line_anchor) {
+        line_anchor = pointer.y;
     }
 
+    if (offsetX + width <= pointer_offset) {
+        offsetX = pointer_offset - width + pointerPaddingX * 2 + pointerWidth;
+    }
+    if (offsetX >= pointer_offset) {
+        offsetX = pointer_offset;
+    }
+
+
     size_t line_y = 0;
-    if (anchor_type == TOP) {
-        for (size_t i = line_anchor; i < min(line_anchor + lines_completly_rendered + 1, line_count); ++i) {    
-            RenderLine(startX, startY + line_y * fontSize, i, pointer);
-            line_y++;
-        }
-    } else {
-        for (int i = line_anchor; i >= 0 && i >= (int)(line_anchor - lines_completly_rendered - 1); --i) {
-            if (i < line_count) {
-                RenderLine(startX, startY + height - (line_y + 1) * fontSize, i, pointer);
-            }
-            line_y++;
-        }
+    for (size_t i = line_anchor; i < min(line_anchor + lines_completly_rendered + 1, line_count); ++i) {    
+        RenderLine(startX-offsetX, startY + line_y * fontSize, i, pointer);
+        line_y++;
     }
     
     EndScissorMode();
