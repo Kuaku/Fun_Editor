@@ -76,6 +76,26 @@ void LogPieces() {
     TraceLog(LOG_INFO, "==================");
 }
 
+char* GenerateText(size_t* out_length) {
+    size_t buffer_length = 0;
+    for (size_t i = 0; i < piece_count; ++i) {
+        buffer_length += pieces[i].length;
+    }
+
+    char* out = calloc(buffer_length + 1, sizeof(char));
+    char* work_buffer;
+    char* marker = out;
+    for (size_t i = 0; i < piece_count; ++i) {
+        work_buffer = pieces[i].source == ORIGINAL ? org_buffer : add_buffer;
+        work_buffer = work_buffer + pieces[i].start;
+        memcpy(marker, work_buffer, pieces[i].length);
+        marker = marker + pieces[i].length;
+    }
+
+    *out_length = buffer_length;
+    return out;
+}
+
 void regenerate_text() {
     if (text_buffer != NULL) {
         free(text_buffer);
@@ -356,6 +376,20 @@ char* load_file(const char* filename, size_t* out_len) {
     return buf;
 }
 
+void save_file(const char* filename, char* content, size_t length) {
+    FILE* file = fopen(filename, "wb");
+   if (file == NULL) {
+        fprintf(stderr, "Could not open file: %s\n", filename); 
+        return;
+   }
+
+   size_t bytes_written = fwrite(content, 1, length, file);
+   if (bytes_written != length) {
+       fprintf(stderr, "Error: Could not write all data to file '%s'\n", filename);
+   }
+   fclose(file);
+}
+
 void normalize_line_endings(char* buf) {
     char* src = buf;
     char* dst = buf;
@@ -480,19 +514,34 @@ int main(int argc, char** argv) {
             RemoveCharacterAtPointer();
         }
 
-        int key = GetCharPressed();
-        while (key > 0) {
-            if (key >= 32 && key <= 126) {
-                InsertCharacterAtPointer(key);
+        if (IsKeyDown(KEY_LEFT_CONTROL)) {
+            if (IsKeyPressed(KEY_S)) {
+                if (dirtyPieces) {
+                    regenerate_text();
+                }
+                size_t length;
+                char* text = GenerateText(&length);
+                if (argc >= 2) {
+                    save_file(argv[1], text, length);
+                }
+                // TODO: Clean up org and add puffer and compress piece table
             }
-            key = GetCharPressed();
+        } else {
+            int key = GetCharPressed();
+            while (key > 0) {
+                if (key >= 32 && key <= 126) {
+                    InsertCharacterAtPointer(key);
+                }
+                key = GetCharPressed();
+            }
+            if (IsKeyPressed(KEY_TAB)) {
+                InsertStringAtPointer("  ", 2);
+            }       
+            if (IsKeyPressed(KEY_ENTER)) {    
+                InsertCharacterAtPointer('\n');
+            }
         }
-        if (IsKeyPressed(KEY_TAB)) {
-            InsertStringAtPointer("  ", 2);
-        }       
-        if (IsKeyPressed(KEY_ENTER)) {    
-            InsertCharacterAtPointer('\n');
-        }
+        
 
         if (dirtyPieces) {
             regenerate_text();
