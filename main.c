@@ -23,6 +23,10 @@ typedef struct {
 #define MAX_PIECES 1024
 #define MAX_ADD_BUFFER 4096
 
+#define BackgroundColor BLACK
+#define TextColor       WHITE
+#define LineNumberColor YELLOW
+
 char* org_buffer = "";
 char add_buffer[MAX_ADD_BUFFER];
 
@@ -42,6 +46,10 @@ size_t fontSize = 30;
 
 size_t pointerPosition = 0;
 size_t pointerPaddingX = 3, pointerPaddingY = 3, pointerWidth = 2;
+
+size_t numberPadding = 10;
+
+Font editor_font;
 
 void LogAddBuffer() {
     printf("AddBuffer: ");
@@ -305,7 +313,7 @@ void RenderLine(size_t xX, size_t yY, size_t index, Position pointer) {
     char* temp = NULL;
     size_t line_length;
     if (pointer.y != index) {
-            DrawText(lines[index], xX, yY, fontSize, WHITE); 
+            DrawTextEx(editor_font, lines[index], (Vector2){xX, yY}, fontSize, 1, TextColor); 
     } else {       
         if (temp != NULL) {
             free(temp);
@@ -313,10 +321,10 @@ void RenderLine(size_t xX, size_t yY, size_t index, Position pointer) {
         line_length = strlen(lines[index]);
         temp = calloc(line_length + 1, sizeof(char));
         strncpy(temp, lines[index], pointer.x);
-        int draw_length = MeasureText(temp, fontSize);
-        DrawText(temp, xX, yY, fontSize, WHITE);
-        DrawText(lines[index] + pointer.x, xX + draw_length + pointerPaddingX * 2 + pointerWidth, yY, fontSize, WHITE);   
-        DrawRectangle(xX + draw_length + pointerPaddingX, yY, pointerWidth, fontSize - 2 * pointerPaddingY, WHITE);
+        Vector2 draw_length = MeasureTextEx(editor_font, temp, fontSize, 1);
+        DrawTextEx(editor_font, temp, (Vector2){xX, yY}, fontSize, 1, TextColor);
+        DrawTextEx(editor_font, lines[index] + pointer.x, (Vector2){xX + draw_length.x + pointerPaddingX * 2 + pointerWidth, yY}, fontSize, 1, TextColor);   
+        DrawRectangle(xX + draw_length.x + pointerPaddingX, yY, pointerWidth, fontSize - 2 * pointerPaddingY, TextColor);
     }
     if (temp != NULL) {
         free(temp);
@@ -326,9 +334,24 @@ void RenderLine(size_t xX, size_t yY, size_t index, Position pointer) {
 void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height) {
     Position pointer = GetPointerPosition();
     size_t pointer_offset = GetPointerOffsetFromLeft(pointer);
-    size_t lines_completly_rendered = height / fontSize;
-    BeginScissorMode(startX, startY, width, height);
+    size_t lines_completly_rendered = height / fontSize;size_t line_number = line_anchor;
+    
+    size_t max_offset = 0;
+    size_t digits = snprintf(NULL, 0, "%zu", min(line_anchor + lines_completly_rendered + 1, line_count) + 1);
+    size_t local_offset = 0;
+    Vector2 measured_text;
+    char* number_str  = malloc(digits + 1);
+    for (size_t i = line_anchor; i < min(line_anchor + lines_completly_rendered + 1, line_count); ++i) {
+        snprintf(number_str, digits + 1, "%zu", i + 1);
+        measured_text = MeasureTextEx(editor_font, number_str, fontSize, 1);
+        local_offset = measured_text.x;
+        if (local_offset > max_offset) {
+            max_offset = local_offset;
+        }
+    }
+    max_offset += numberPadding * 2;
 
+    BeginScissorMode(startX + max_offset, startY, width, height);
     if (pointer.y >= line_anchor + lines_completly_rendered) {
         line_anchor = pointer.y - lines_completly_rendered + 1;
     }
@@ -343,14 +366,23 @@ void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height)
         offsetX = pointer_offset;
     }
 
-
     size_t line_y = 0;
     for (size_t i = line_anchor; i < min(line_anchor + lines_completly_rendered + 1, line_count); ++i) {    
-        RenderLine(startX-offsetX, startY + line_y * fontSize, i, pointer);
+        RenderLine(startX-offsetX+max_offset, startY + line_y * fontSize, i, pointer);
         line_y++;
     }
-    
     EndScissorMode();
+
+    line_y = 0;
+    for (size_t i = line_anchor; i < min(line_anchor + lines_completly_rendered + 1, line_count); ++i) {
+        snprintf(number_str, digits + 1, "%zu", i + 1);
+        measured_text = MeasureTextEx(editor_font, number_str, fontSize, 1);
+        local_offset = measured_text.x;
+        DrawTextEx(editor_font, number_str, (Vector2){startX + max_offset - numberPadding - local_offset, startY + line_y * fontSize}, fontSize, 1, LineNumberColor);
+        line_y++;
+    }
+    free(number_str);
+    
 }
 
 char* load_file(const char* filename, size_t* out_len) {
@@ -492,6 +524,8 @@ int main(int argc, char** argv) {
     InitWindow(1200, 700, "Fun Editor");
     SetTargetFPS(60); 
 
+    editor_font = LoadFontEx("Input.ttf", fontSize, 0, 250);
+
     while (!WindowShouldClose()) {
         size_t screenWidth = GetScreenWidth();
         size_t screenHeight = GetScreenHeight();
@@ -548,8 +582,8 @@ int main(int argc, char** argv) {
         }
 
         BeginDrawing();
-        ClearBackground(BLACK);
-        RenderTextBuffer(40, 40, screenWidth - 40, screenHeight - 40);
+        ClearBackground(BackgroundColor);
+        RenderTextBuffer(0, 20, screenWidth - 40, screenHeight - 40);
         EndDrawing();
     }
 
