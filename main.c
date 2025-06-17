@@ -22,9 +22,12 @@ typedef struct {
 
 #define MAX_PIECES 1024
 #define MAX_ADD_BUFFER 4096
+#define MAX_COMMAND_BUFFER 4096
 
 #define BackgroundColor BLACK
 #define TextColor       WHITE
+#define ModeColor       WHITE
+#define CommandColor    WHITE
 #define LineNumberColor YELLOW
 
 char* org_buffer = "";
@@ -50,6 +53,17 @@ size_t pointerPaddingX = 3, pointerPaddingY = 3, pointerWidth = 2;
 size_t numberPadding = 10;
 
 Font editor_font;
+
+
+size_t commando_pointer_position = 0;
+char commando_content[MAX_COMMAND_BUFFER] = "";
+size_t command_length = 0;
+bool is_command_mode = false;
+
+size_t mode_padding = 10;
+size_t command_padding = 10;
+char** command_args;
+size_t command_args_count = 0;
 
 void LogAddBuffer() {
     printf("AddBuffer: ");
@@ -351,7 +365,7 @@ void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height)
     }
     max_offset += numberPadding * 2;
 
-    BeginScissorMode(startX + max_offset, startY, width, height);
+    BeginScissorMode(startX + max_offset, startY, width - max_offset, height);
     if (pointer.y >= line_anchor + lines_completly_rendered) {
         line_anchor = pointer.y - lines_completly_rendered + 1;
     }
@@ -373,6 +387,7 @@ void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height)
     }
     EndScissorMode();
 
+    BeginScissorMode(startX, startY, width, height);
     line_y = 0;
     for (size_t i = line_anchor; i < min(line_anchor + lines_completly_rendered + 1, line_count); ++i) {
         snprintf(number_str, digits + 1, "%zu", i + 1);
@@ -381,8 +396,37 @@ void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height)
         DrawTextEx(editor_font, number_str, (Vector2){startX + max_offset - numberPadding - local_offset, startY + line_y * fontSize}, fontSize, 1, LineNumberColor);
         line_y++;
     }
+    EndScissorMode();
     free(number_str);
     
+}
+
+void RenderMode() {
+    char* mode;
+    if (is_command_mode) {
+        mode = "Command Mode";
+    } else {
+        mode = "Text Mode";
+    }
+    DrawTextEx(editor_font, mode, (Vector2){mode_padding, mode_padding}, fontSize, 1, ModeColor);
+}
+
+void RenderCommand(size_t offsetX, size_t offsetY) {
+    DrawTextEx(editor_font, ":", (Vector2){offsetX, offsetY}, fontSize, 1, CommandColor); 
+    Vector2 offset_prefix = MeasureTextEx(editor_font, ":", fontSize, 1); 
+    if (!is_command_mode) {
+        DrawTextEx(editor_font, commando_content, (Vector2){offsetX + offset_prefix.x, offsetY}, fontSize, 1, CommandColor);    
+    } else {
+        char* temp;
+        temp = calloc(commando_pointer_position + 1, sizeof(char));
+        strncpy(temp, commando_content, commando_pointer_position);
+        DrawTextEx(editor_font, temp, (Vector2){offsetX + offset_prefix.x, offsetY}, fontSize, 1, CommandColor);
+        Vector2 offset_first_part = MeasureTextEx(editor_font, temp, fontSize, 1);
+        DrawRectangle(offsetX + offset_prefix.x + offset_first_part.x + pointerPaddingX, offsetY + pointerPaddingY, pointerWidth, fontSize - pointerPaddingY * 2, WHITE);
+        char* last_part = commando_content + commando_pointer_position;
+        DrawTextEx(editor_font, last_part, (Vector2){offsetX + offset_prefix.x + offset_first_part.x + pointerPaddingX * 2 + pointerWidth, offsetY}, fontSize, 1, CommandColor);
+        free(temp);
+    }
 }
 
 char* load_file(const char* filename, size_t* out_len) {
@@ -530,52 +574,181 @@ int main(int argc, char** argv) {
         size_t screenWidth = GetScreenWidth();
         size_t screenHeight = GetScreenHeight();
 
-        if (IsKeyPressed(KEY_LEFT) && pointerPosition > 0) {
-            pointerPosition--;
-        }
-        if (IsKeyPressed(KEY_RIGHT) && pointerPosition <= GetTextSize()) {
-            pointerPosition++;
-        }
-        if (IsKeyPressed(KEY_UP)) {
-            jumpLineUp();
-        } 
-        if (IsKeyPressed(KEY_DOWN)) {
-            jumpLineDown();
-        } 
+        if (!is_command_mode) {
+            if (IsKeyPressed(KEY_LEFT) && pointerPosition > 0) {
+                pointerPosition--;
+            }
+            if (IsKeyPressed(KEY_RIGHT) && pointerPosition <= GetTextSize()) {
+                pointerPosition++;
+            }
+            if (IsKeyPressed(KEY_UP)) {
+                jumpLineUp();
+            } 
+            if (IsKeyPressed(KEY_DOWN)) {
+                jumpLineDown();
+            } 
 
 
-        if (IsKeyPressed(KEY_BACKSPACE)) {
-            RemoveCharacterAtPointer();
-        }
+            if (IsKeyPressed(KEY_BACKSPACE)) {
+                RemoveCharacterAtPointer();
+            }
 
-        if (IsKeyDown(KEY_LEFT_CONTROL)) {
-            if (IsKeyPressed(KEY_S)) {
-                if (dirtyPieces) {
-                    regenerate_text();
+            if (IsKeyDown(KEY_LEFT_CONTROL)) {
+                if (IsKeyPressed(KEY_S)) {
+                    if (dirtyPieces) {
+                        regenerate_text();
+                    }
+                    size_t length;
+                    char* text = GenerateText(&length);
+                    if (argc >= 2) {
+                        save_file(argv[1], text, length);
+                    }
+                    // TODO: Clean up org and add puffer and compress piece table
                 }
-                size_t length;
-                char* text = GenerateText(&length);
-                if (argc >= 2) {
-                    save_file(argv[1], text, length);
+
+                if (IsKeyPressed(KEY_P)) {
+                    is_command_mode = true;
                 }
-                // TODO: Clean up org and add puffer and compress piece table
+                
+                if (IsKeyPressed(KEY_F)) {
+                    is_command_mode = true;
+                    memset(commando_content, 0, MAX_COMMAND_BUFFER);
+                    strcpy(commando_content, "find \"\"");
+                    command_length = strlen("find \"\"");
+                    commando_pointer_position = command_length - 1;
+                }
+            } else {
+                int key = GetCharPressed();
+                while (key > 0) {
+                    if (key >= 32 && key <= 126) {
+                        InsertCharacterAtPointer(key);
+                    }
+                    key = GetCharPressed();
+                }
+                if (IsKeyPressed(KEY_TAB)) {
+                    InsertStringAtPointer("  ", 2);
+                }       
+                if (IsKeyPressed(KEY_ENTER)) {    
+                    InsertCharacterAtPointer('\n');
+                }
             }
         } else {
-            int key = GetCharPressed();
-            while (key > 0) {
-                if (key >= 32 && key <= 126) {
-                    InsertCharacterAtPointer(key);
+            if (IsKeyDown(KEY_LEFT_CONTROL)) {
+                if (IsKeyPressed(KEY_P)) {
+                    is_command_mode = false;
                 }
-                key = GetCharPressed();
-            }
-            if (IsKeyPressed(KEY_TAB)) {
-                InsertStringAtPointer("  ", 2);
-            }       
-            if (IsKeyPressed(KEY_ENTER)) {    
-                InsertCharacterAtPointer('\n');
+            } else {
+                int key = GetCharPressed();
+                while (key > 0) {
+                    if (key >= 32 && key <= 126) {
+                        memmove(commando_content + commando_pointer_position + 1, commando_content + commando_pointer_position, MAX_COMMAND_BUFFER - commando_pointer_position - 1);
+                        commando_content[commando_pointer_position] = key;
+                        command_length++;
+                        commando_pointer_position++;
+                    }
+                    key = GetCharPressed();
+                }
+
+                if (IsKeyPressed(KEY_BACKSPACE) && commando_pointer_position > 0) {
+                    memmove(commando_content + commando_pointer_position - 1, 
+                        commando_content + commando_pointer_position, 
+                        MAX_COMMAND_BUFFER - commando_pointer_position);
+                    command_length--;
+                    commando_pointer_position--;
+                }
+
+                if (IsKeyPressed(KEY_LEFT) && commando_pointer_position > 0) {
+                    commando_pointer_position--;
+                }
+                if (IsKeyPressed(KEY_RIGHT) && commando_pointer_position < command_length) {
+                    commando_pointer_position++;
+                }
+
+                if (IsKeyPressed(KEY_ENTER)) {
+                    if (command_args) {
+                        for (size_t i = 0; i < command_args_count; ++i) {
+                            free(command_args[i]);
+                        }
+                        free(command_args);
+                        command_args = NULL;
+                        command_args_count = 0;
+                    }
+                    char* input = commando_content;
+                    while (*input == ' ' || *input == '\t') input++;
+                    if (*input != '\0') {
+                        char* temp = input;
+                        size_t count = 0;
+                        bool in_quotes = false;
+                        bool in_word = false;
+
+                        while (*temp) {
+                            if (*temp == '"') {
+                                in_quotes = !in_quotes;
+                                if (!in_word) {
+                                    count++;
+                                    in_word = true;
+                                }
+                            } else if ((*temp == ' ' || *temp == '\t') && !in_quotes) {
+                                in_word = false;
+                            } else if (!in_word) {
+                                count++;
+                                in_word = true;
+                            }
+                            temp++;
+                        }
+
+                        if (count != 0) {
+                            char* start = input;
+                            command_args = malloc(count * sizeof(char*));
+                            in_quotes = false;
+                            in_word = false;
+                            while (*input && command_args_count < count) {
+                                if (*input == '"') {
+                                    if (!in_word) {
+                                        start = input + 1;
+                                        in_word = true;
+                                    }
+                                    in_quotes = !in_quotes;
+                                    if (!in_quotes) {
+                                        size_t len = input - start;
+                                        command_args[command_args_count] = malloc(len + 1);
+                                        strncpy(command_args[command_args_count], start, len);
+                                        command_args[command_args_count][len] = '\0';
+                                        command_args_count++;
+                                        in_word = false;
+                                    }
+                                } else if ((*input == ' ' || *input == '\t') && !in_quotes) {
+                                    if (in_word && !in_quotes) {
+                                        size_t len = input - start;
+                                        command_args[command_args_count] = malloc(len + 1);
+                                        strncpy(command_args[command_args_count], start, len);
+                                        command_args[command_args_count][len] = '\0';
+                                        command_args_count++;
+                                        in_word = false;
+                                    }
+                                } else if (!in_word) {
+                                    start = input;
+                                    in_word = true;
+                                }
+                                input++;
+                            }
+
+                            if (in_word && !in_quotes) {
+                                size_t len = input - start;
+                                command_args[command_args_count] = malloc(len + 1);
+                                strncpy(command_args[command_args_count], start, len);
+                                command_args[command_args_count][len] = '\0';
+                                command_args_count++;
+                            }
+                        }
+                    }
+
+
+                    // Executing command:
+                    
+                } 
             }
         }
-        
 
         if (dirtyPieces) {
             regenerate_text();
@@ -583,7 +756,9 @@ int main(int argc, char** argv) {
 
         BeginDrawing();
         ClearBackground(BackgroundColor);
-        RenderTextBuffer(0, 20, screenWidth - 40, screenHeight - 40);
+        RenderMode();
+        RenderTextBuffer(0, mode_padding * 2 + fontSize, screenWidth - 40, screenHeight - (mode_padding * 2 + fontSize * 2 + command_padding * 2));
+        RenderCommand(command_padding, screenHeight - command_padding - fontSize);
         EndDrawing();
     }
 
