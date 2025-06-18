@@ -3,6 +3,7 @@
 #include <string.h>
 #include <math.h>
 #include "raylib.h"
+#include <time.h>
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
 
@@ -43,10 +44,6 @@ Piece pieces[MAX_PIECES];
 size_t piece_count = 0;
 bool dirtyPieces = false;
 
-char* text_buffer = NULL;
-size_t text_length = 0;
-char** lines = NULL;
-size_t line_count = 0;
 size_t line_anchor = 0;
 size_t offsetX = 0;
 
@@ -122,50 +119,66 @@ char* GenerateText(size_t* out_length) {
     return out;
 }
 
-void regenerate_text() {
-    if (text_buffer != NULL) {
-        free(text_buffer);
-    }
-    if (lines != NULL) {
-        free(lines);
-    }
-    
-    text_length = 0;
-    line_count = 1;
+Position GetLineByIndex(size_t index) {
+    Position out = {0, -1};
     char* work_buffer;
-    char* marker;
-    for (size_t i = 0; i < piece_count; ++i) {
-        text_length += pieces[i].length;
+    size_t current_line = 0;
+    size_t traversed = 0;
+    for (size_t i = 0; i < piece_count && out.y == -1; ++i) {
         work_buffer = pieces[i].source == ORIGINAL ? org_buffer : add_buffer;
         for (size_t j = 0; j < pieces[i].length; ++j) {
             if (work_buffer[pieces[i].start + j] == '\n') {
-                line_count++;
+                current_line++;
+                if (current_line == index) {
+                    out.x = traversed + j + 1;
+                } else if (current_line == index + 1) {
+                    out.y = traversed + j - out.x;
+                    break;
+                }
             }
         }
-    }
-    text_length += 1;
-    text_buffer = calloc(text_length + 1, sizeof(char));
-    lines = calloc(line_count, sizeof(char*));
-    lines[0] = text_buffer;
-
-    marker = text_buffer;
-    for (size_t i = 0; i < piece_count; ++i) {
-        work_buffer = pieces[i].source == ORIGINAL ? org_buffer : add_buffer;
-        work_buffer = work_buffer + pieces[i].start;
-        memcpy(marker, work_buffer, pieces[i].length);
-        marker = marker + pieces[i].length;
-    }
-
-    size_t line_index = 1;
-    for (size_t i = 0; i < text_length - 1; ++i) {
-        if (text_buffer[i] == '\n') {
-            text_buffer[i] = 0;
-            lines[line_index++] = text_buffer + i + 1;
+        traversed += pieces[i].length;
+        if (out.y != -1) {
+            break;
         }
     }
-    text_buffer[text_length] = '\0';
+    if (out.y == -1) {
+        out.y = traversed - out.x;
+    }
+    return out;
+}
 
-    dirtyPieces = false;
+char* GenerateLine(size_t index) {
+    char* line;
+    Position line_position = GetLineByIndex(index);
+    line = calloc(line_position.y + 1, sizeof(char));
+
+    size_t start_pos = line_position.x;
+    size_t end_pos = start_pos + line_position.y;
+
+    size_t traversed = 0;
+    char* temp = line;
+    Piece piece;
+    char* work_buffer;
+    size_t copied = 0;
+    for (size_t i = 0; i < piece_count && copied < line_position.y; ++i) {
+        piece = pieces[i];
+        work_buffer = piece.source == ORIGINAL ? org_buffer : add_buffer;
+        
+        size_t piece_start = traversed;
+        size_t piece_end = traversed + piece.length;
+
+        if (piece_end > start_pos && piece_start < end_pos) {
+            size_t copy_start = (piece_start >= start_pos) ? 0 : start_pos - piece_start;
+            size_t copy_end = (piece_end <= end_pos) ? piece.length : end_pos - piece_start;
+
+            memcpy(line + copied, work_buffer + piece.start + copy_start, copy_end - copy_start);
+            copied += copy_end - copy_start;
+        }
+        traversed += piece.length;
+    }
+    line[line_position.y] = '\0';
+    return line;
 }
 
 int AppendAddBuffer(char* value, size_t len) {
@@ -316,44 +329,92 @@ void InsertCharacterAtPointer(char value) {
 
 size_t GetPointerOffsetFromLeft(Position pointer) {
     char* temp = NULL;
-
-    size_t line_length = strlen(lines[pointer.y]);
+    char* line = GenerateLine(pointer.y);
+    size_t line_length = strlen(line);
     temp = calloc(line_length+1, sizeof(char));
 
-    strncpy(temp, lines[pointer.y], pointer.x);
-    size_t draw_length = MeasureText(temp, fontSize);
+    strncpy(temp, line, pointer.x);
+    Vector2 draw_length = MeasureTextEx(editor_font, temp, fontSize, 1);
     
     free(temp);
-    return draw_length;
+    free(line);
+    return draw_length.x;
 }
 
-void RenderLine(size_t xX, size_t yY, size_t index, Position pointer) {
+void RenderLine(int xX, int yY, size_t index, Position pointer) {
     char* temp = NULL;
+    size_t line_buffer_length;
+    char* line = GenerateLine(index);
     size_t line_length;
     if (pointer.y != index) {
-            DrawTextEx(editor_font, lines[index], (Vector2){xX, yY}, fontSize, 1, TextColor); 
+            DrawTextEx(editor_font, line, (Vector2){xX, yY}, fontSize, 1, TextColor); 
     } else {       
         if (temp != NULL) {
             free(temp);
         } 
-        line_length = strlen(lines[index]);
+        line_length = strlen(line);
         temp = calloc(line_length + 1, sizeof(char));
-        strncpy(temp, lines[index], pointer.x);
+        strncpy(temp, line, pointer.x);
         Vector2 draw_length = MeasureTextEx(editor_font, temp, fontSize, 1);
         DrawTextEx(editor_font, temp, (Vector2){xX, yY}, fontSize, 1, TextColor);
-        DrawTextEx(editor_font, lines[index] + pointer.x, (Vector2){xX + draw_length.x + pointerPaddingX * 2 + pointerWidth, yY}, fontSize, 1, TextColor);   
+        DrawTextEx(editor_font, line + pointer.x, (Vector2){xX + draw_length.x + pointerPaddingX * 2 + pointerWidth, yY}, fontSize, 1, TextColor);   
         DrawRectangle(xX + draw_length.x + pointerPaddingX, yY, pointerWidth, fontSize - 2 * pointerPaddingY, TextColor);
     }
+    free(line);
     if (temp != NULL) {
         free(temp);
     }
+}
+
+size_t GetLineCount()  {
+    size_t out = 1;
+    char* work_buffer;
+    for (size_t i = 0; i < piece_count; ++i) {
+        work_buffer = pieces[i].source == ORIGINAL ? org_buffer : add_buffer;
+        for (size_t j = 0; j < pieces[i].length; ++j) {
+            if (work_buffer[pieces[i].start + j] == '\n') {
+                out++;
+            }
+        }
+    }
+    return out;
 }
 
 void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height) {
     Position pointer = GetPointerPosition();
     size_t pointer_offset = GetPointerOffsetFromLeft(pointer);
     size_t lines_completly_rendered = height / fontSize;size_t line_number = line_anchor;
-    
+    size_t line_count = GetLineCount();
+
+    BeginScissorMode(startX, startY, width, height);
+    if (pointer.y >= line_anchor + lines_completly_rendered) {
+        line_anchor = pointer.y - lines_completly_rendered + 1;
+    }
+    if (pointer.y <= line_anchor) {
+        line_anchor = pointer.y;
+    }
+
+    if (offsetX + width <= pointer_offset) {
+        offsetX = pointer_offset - width + pointerPaddingX * 2 + pointerWidth;
+    }
+    if (offsetX > pointer_offset) {
+        offsetX = pointer_offset;
+    }
+
+    size_t line_y = 0;
+    for (size_t i = line_anchor; i < min(line_anchor + lines_completly_rendered + 1, line_count); ++i) {    
+        RenderLine(startX-offsetX, startY + line_y * fontSize, i, pointer);
+        line_y++;
+    }
+    EndScissorMode();
+}
+
+void RenderTextField(size_t startX, size_t startY, size_t width, size_t height) {
+    Position pointer = GetPointerPosition();
+    size_t pointer_offset = GetPointerOffsetFromLeft(pointer);
+    size_t lines_completly_rendered = height / fontSize;size_t line_number = line_anchor;
+    size_t line_count = GetLineCount();
+
     size_t max_offset = 0;
     size_t digits = snprintf(NULL, 0, "%zu", min(line_anchor + lines_completly_rendered + 1, line_count) + 1);
     size_t local_offset = 0;
@@ -369,30 +430,10 @@ void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height)
     }
     max_offset += numberPadding * 2;
 
-    BeginScissorMode(startX + max_offset, startY, width - max_offset, height);
-    if (pointer.y >= line_anchor + lines_completly_rendered) {
-        line_anchor = pointer.y - lines_completly_rendered + 1;
-    }
-    if (pointer.y <= line_anchor) {
-        line_anchor = pointer.y;
-    }
-
-    if (offsetX + width <= pointer_offset) {
-        offsetX = pointer_offset - width + pointerPaddingX * 2 + pointerWidth;
-    }
-    if (offsetX >= pointer_offset) {
-        offsetX = pointer_offset;
-    }
-
-    size_t line_y = 0;
-    for (size_t i = line_anchor; i < min(line_anchor + lines_completly_rendered + 1, line_count); ++i) {    
-        RenderLine(startX-offsetX+max_offset, startY + line_y * fontSize, i, pointer);
-        line_y++;
-    }
-    EndScissorMode();
+    RenderTextBuffer(startX + max_offset, startY, width - max_offset, height);
 
     BeginScissorMode(startX, startY, width, height);
-    line_y = 0;
+    size_t line_y = 0;
     for (size_t i = line_anchor; i < min(line_anchor + lines_completly_rendered + 1, line_count); ++i) {
         snprintf(number_str, digits + 1, "%zu", i + 1);
         measured_text = MeasureTextEx(editor_font, number_str, fontSize, 1);
@@ -402,7 +443,6 @@ void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height)
     }
     EndScissorMode();
     free(number_str);
-    
 }
 
 void RenderMode() {
@@ -480,49 +520,6 @@ void normalize_line_endings(char* buf) {
         src++;
     }
     *dst = '\0';
-}
-
-Position GetLineByIndex(size_t index) {
-    Position out = {0, -1};
-    char* work_buffer;
-    size_t current_line = 0;
-    size_t traversed = 0;
-    for (size_t i = 0; i < piece_count && out.y == -1; ++i) {
-        work_buffer = pieces[i].source == ORIGINAL ? org_buffer : add_buffer;
-        for (size_t j = 0; j < pieces[i].length; ++j) {
-            if (work_buffer[pieces[i].start + j] == '\n') {
-                current_line++;
-                if (current_line == index) {
-                    out.x = traversed + j + 1;
-                } else if (current_line == index + 1) {
-                    out.y = traversed + j - out.x;
-                    break;
-                }
-            }
-        }
-        traversed += pieces[i].length;
-        if (out.y != -1) {
-            break;
-        }
-    }
-    if (out.y == -1) {
-        out.y = traversed - out.x;
-    }
-    return out;
-}
-
-size_t GetLineCount()  {
-    size_t out = 1;
-    char* work_buffer;
-    for (size_t i = 0; i < piece_count; ++i) {
-        work_buffer = pieces[i].source == ORIGINAL ? org_buffer : add_buffer;
-        for (size_t j = 0; j < pieces[i].length; ++j) {
-            if (work_buffer[pieces[i].start + j] == '\n') {
-                out++;
-            }
-        }
-    }
-    return out;
 }
 
 void jumpLineUp() {
@@ -677,7 +674,6 @@ int main(int argc, char** argv) {
     pieces[0].start = 0;
     pieces[0].length = strlen(org_buffer);
     piece_count = 1;
-    regenerate_text();
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     InitWindow(1200, 700, "Fun Editor");
@@ -710,9 +706,6 @@ int main(int argc, char** argv) {
 
             if (IsKeyDown(KEY_LEFT_CONTROL)) {
                 if (IsKeyPressed(KEY_S)) {
-                    if (dirtyPieces) {
-                        regenerate_text();
-                    }
                     size_t length;
                     char* text = GenerateText(&length);
                     if (argc >= 2) {
@@ -796,14 +789,14 @@ int main(int argc, char** argv) {
             }
         }
 
-        if (dirtyPieces) {
-            regenerate_text();
-        }
-
-        BeginDrawing();
+        BeginDrawing(); 
         ClearBackground(BackgroundColor);
         RenderMode();
-        RenderTextBuffer(0, mode_padding * 2 + fontSize, screenWidth - 40, screenHeight - (mode_padding * 2 + fontSize * 2 + command_padding * 2));
+        clock_t start = clock();
+        RenderTextField(0, mode_padding * 2 + fontSize, screenWidth - 40, screenHeight - (mode_padding * 2 + fontSize * 2 + command_padding * 2));
+        clock_t end = clock();
+        double time = ((double)(end-start)) / CLOCKS_PER_SEC * 1000.0;
+        printf("[TIMING] RenderTextField: %.3fms\n", time); 
         RenderCommand(command_padding, screenHeight - command_padding - fontSize);
         EndDrawing();
     }
