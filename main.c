@@ -20,6 +20,11 @@ typedef struct {
     size_t y;
 } Position;
 
+typedef struct {
+    char** args;
+    size_t count;
+} CommandArgs;
+
 #define MAX_PIECES 1024
 #define MAX_ADD_BUFFER 4096
 #define MAX_COMMAND_BUFFER 4096
@@ -62,8 +67,7 @@ bool is_command_mode = false;
 
 size_t mode_padding = 10;
 size_t command_padding = 10;
-char** command_args;
-size_t command_args_count = 0;
+CommandArgs command_args;
 
 void LogAddBuffer() {
     printf("AddBuffer: ");
@@ -478,7 +482,6 @@ void normalize_line_endings(char* buf) {
     *dst = '\0';
 }
 
-
 Position GetLineByIndex(size_t index) {
     Position out = {0, -1};
     char* work_buffer;
@@ -539,6 +542,118 @@ void jumpLineDown() {
     }
     Position nextLine = GetLineByIndex(pointer.y + 1);
     pointerPosition = nextLine.x + min(nextLine.y, pointer.x);
+}
+
+void ResetCommandArgs(CommandArgs* args) {
+    if ((*args).args) {
+        for (size_t i = 0; i < (*args).count; ++i) {
+            free((*args).args[i]);
+        }
+        free((*args).args);
+    }
+    (*args).args = NULL;
+    (*args).count = 0;
+}
+
+char* SkipWhiteSpace(char* input) {
+    char* out = input;
+    while (*out == ' ' || *out == '\t') out++;
+    return out;
+}
+
+size_t CountArgs(char* command, size_t lenght) {
+    char* input = SkipWhiteSpace(command);
+    if (*input == '\0') return 0;
+    
+    char* temp = input;
+    size_t count = 0;
+    bool in_quotes = false;
+    bool in_word = false;
+
+    while (*temp) {
+        if (*temp == '"') {
+            in_quotes = !in_quotes;
+            if (!in_word) {
+                count++;
+                in_word = true;
+            }
+        } else if ((*temp == ' ' || *temp == '\t') && !in_quotes) {
+            in_word = false;
+        } else if (!in_word) {
+            count++;
+            in_word = true;
+        }
+        temp++;
+    }
+
+    return count;
+}
+
+void ParseCommandArgs() {
+    ResetCommandArgs(&command_args);
+    size_t count = CountArgs(commando_content, command_length);
+    char* input = SkipWhiteSpace(commando_content);
+    char* start = input;
+    command_args.args = malloc(count * sizeof(char*));
+    bool in_quotes = false;
+    bool in_word = false;
+    while (*input && command_args.count < count) {
+        if (*input == '"') {
+            if (!in_word) {
+                start = input + 1;
+                in_word = true;
+            }
+            in_quotes = !in_quotes;
+            if (!in_quotes) {
+                size_t len = input - start;
+                command_args.args[command_args.count] = malloc(len + 1);
+                strncpy(command_args.args[command_args.count], start, len);
+                command_args.args[command_args.count][len] = '\0';
+                command_args.count++;
+                in_word = false;
+            }
+        } else if ((*input == ' ' || *input == '\t') && !in_quotes) {
+            if (in_word && !in_quotes) {
+                size_t len = input - start;
+                command_args.args[command_args.count] = malloc(len + 1);
+                strncpy(command_args.args[command_args.count], start, len);
+                command_args.args[command_args.count][len] = '\0';
+                command_args.count++;
+                in_word = false;
+            }
+        } else if (!in_word) {
+            start = input;
+            in_word = true;
+        }
+        input++;
+    }
+
+    if (in_word && !in_quotes) {
+        size_t len = input - start;
+        command_args.args[command_args.count] = malloc(len + 1);
+        strncpy(command_args.args[command_args.count], start, len);
+        command_args.args[command_args.count][len] = '\0';
+        command_args.count++;
+    }
+}
+
+void ExecuteCommand() {
+    if (command_args.count < 1) return;
+    if (strcmp(command_args.args[0], "find") == 0) {
+        if (command_args.count != 2) return;
+
+    } else if (strcmp(command_args.args[0], "goto") == 0) {
+        if (command_args.count != 2) return;
+
+        size_t line = atoi(command_args.args[1]) - 1;
+        if (line >= 0 && line < GetLineCount()) {
+            pointerPosition = GetLineByIndex(line).x;
+            is_command_mode = false;
+            command_length = 0;
+            memset(commando_content, 0, MAX_COMMAND_BUFFER);
+            commando_pointer_position = 0;
+        }
+    }
 }
 
 int main(int argc, char** argv) {
@@ -617,6 +732,14 @@ int main(int argc, char** argv) {
                     command_length = strlen("find \"\"");
                     commando_pointer_position = command_length - 1;
                 }
+                
+                if (IsKeyPressed(KEY_G)) {
+                    is_command_mode = true;
+                    memset(commando_content, 0, MAX_COMMAND_BUFFER);
+                    strcpy(commando_content, "goto ");
+                    command_length = strlen("goto ");
+                    commando_pointer_position = command_length;
+                }
             } else {
                 int key = GetCharPressed();
                 while (key > 0) {
@@ -665,88 +788,11 @@ int main(int argc, char** argv) {
                 }
 
                 if (IsKeyPressed(KEY_ENTER)) {
-                    if (command_args) {
-                        for (size_t i = 0; i < command_args_count; ++i) {
-                            free(command_args[i]);
-                        }
-                        free(command_args);
-                        command_args = NULL;
-                        command_args_count = 0;
-                    }
-                    char* input = commando_content;
-                    while (*input == ' ' || *input == '\t') input++;
-                    if (*input != '\0') {
-                        char* temp = input;
-                        size_t count = 0;
-                        bool in_quotes = false;
-                        bool in_word = false;
-
-                        while (*temp) {
-                            if (*temp == '"') {
-                                in_quotes = !in_quotes;
-                                if (!in_word) {
-                                    count++;
-                                    in_word = true;
-                                }
-                            } else if ((*temp == ' ' || *temp == '\t') && !in_quotes) {
-                                in_word = false;
-                            } else if (!in_word) {
-                                count++;
-                                in_word = true;
-                            }
-                            temp++;
-                        }
-
-                        if (count != 0) {
-                            char* start = input;
-                            command_args = malloc(count * sizeof(char*));
-                            in_quotes = false;
-                            in_word = false;
-                            while (*input && command_args_count < count) {
-                                if (*input == '"') {
-                                    if (!in_word) {
-                                        start = input + 1;
-                                        in_word = true;
-                                    }
-                                    in_quotes = !in_quotes;
-                                    if (!in_quotes) {
-                                        size_t len = input - start;
-                                        command_args[command_args_count] = malloc(len + 1);
-                                        strncpy(command_args[command_args_count], start, len);
-                                        command_args[command_args_count][len] = '\0';
-                                        command_args_count++;
-                                        in_word = false;
-                                    }
-                                } else if ((*input == ' ' || *input == '\t') && !in_quotes) {
-                                    if (in_word && !in_quotes) {
-                                        size_t len = input - start;
-                                        command_args[command_args_count] = malloc(len + 1);
-                                        strncpy(command_args[command_args_count], start, len);
-                                        command_args[command_args_count][len] = '\0';
-                                        command_args_count++;
-                                        in_word = false;
-                                    }
-                                } else if (!in_word) {
-                                    start = input;
-                                    in_word = true;
-                                }
-                                input++;
-                            }
-
-                            if (in_word && !in_quotes) {
-                                size_t len = input - start;
-                                command_args[command_args_count] = malloc(len + 1);
-                                strncpy(command_args[command_args_count], start, len);
-                                command_args[command_args_count][len] = '\0';
-                                command_args_count++;
-                            }
-                        }
-                    }
+                    ParseCommandArgs();
+                    ExecuteCommand();
+                }
 
 
-                    // Executing command:
-                    
-                } 
             }
         }
 
