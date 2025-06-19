@@ -26,6 +26,13 @@ typedef struct {
     size_t count;
 } CommandArgs;
 
+typedef struct {
+    Position* line_positions;
+    size_t line_count;
+    size_t capacity;
+    bool is_valid;
+} LineCache;
+
 #define MAX_PIECES 1024
 #define MAX_ADD_BUFFER 4096
 #define MAX_COMMAND_BUFFER 4096
@@ -42,7 +49,7 @@ char add_buffer[MAX_ADD_BUFFER];
 size_t add_buffer_length = 0;
 Piece pieces[MAX_PIECES];
 size_t piece_count = 0;
-bool dirtyPieces = false;
+LineCache line_cache = {0};
 
 size_t line_anchor = 0;
 size_t offsetX = 0;
@@ -119,33 +126,71 @@ char* GenerateText(size_t* out_length) {
     return out;
 }
 
-Position GetLineByIndex(size_t index) {
-    Position out = {0, -1};
+void InitLineCache() {
+    line_cache.capacity = 1024;
+    line_cache.line_positions = calloc(line_cache.capacity, sizeof(Position));
+    line_cache.line_count = 0;
+    line_cache.is_valid = false;
+}
+
+void FreeLineCache() {
+    if (line_cache.line_positions) {
+        free(line_cache.line_positions);
+        line_cache.line_positions = NULL;
+    }
+
+    line_cache.line_count = 0;
+    line_cache.capacity = 0;
+    line_cache.is_valid = false;
+}
+
+void InvalidateLineCache() {
+    line_cache.is_valid = false;
+}
+
+void RebuildLineCache() {
+    line_cache.line_count = 0;
+    line_cache.line_positions[0].x = 0;
+    line_cache.line_positions[0].y = 0;
+    printf("Start rebuilding line cache\n");
+    size_t current_pos = 0;
     char* work_buffer;
-    size_t current_line = 0;
-    size_t traversed = 0;
-    for (size_t i = 0; i < piece_count && out.y == -1; ++i) {
+
+    for (size_t i = 0; i < piece_count; ++i) {
         work_buffer = pieces[i].source == ORIGINAL ? org_buffer : add_buffer;
+
         for (size_t j = 0; j < pieces[i].length; ++j) {
             if (work_buffer[pieces[i].start + j] == '\n') {
-                current_line++;
-                if (current_line == index) {
-                    out.x = traversed + j + 1;
-                } else if (current_line == index + 1) {
-                    out.y = traversed + j - out.x;
-                    break;
+                
+                if (line_cache.line_count + 1 >= line_cache.capacity) {
+                    line_cache.capacity *= 2;
+                    line_cache.line_positions = realloc(line_cache.line_positions, line_cache.capacity * sizeof(Position));
                 }
+
+                line_cache.line_positions[line_cache.line_count].y = current_pos - line_cache.line_positions[line_cache.line_count].x;
+                line_cache.line_count++;
+                line_cache.line_positions[line_cache.line_count].x = current_pos + 1;
+                line_cache.line_positions[line_cache.line_count].y = 0;
             }
-        }
-        traversed += pieces[i].length;
-        if (out.y != -1) {
-            break;
+            current_pos++;
         }
     }
-    if (out.y == -1) {
-        out.y = traversed - out.x;
+    line_cache.line_positions[line_cache.line_count].y = current_pos - line_cache.line_positions[line_cache.line_count].x;
+    line_cache.line_count++;
+    line_cache.is_valid = true;
+}
+
+Position GetLinePosition(size_t index) {
+    if (!line_cache.is_valid) {
+        RebuildLineCache();
     }
-    return out;
+
+    return line_cache.line_positions[index];
+}
+
+
+Position GetLineByIndex(size_t index) {
+    return GetLinePosition(index);
 }
 
 char* GenerateLine(size_t index) {
@@ -257,7 +302,7 @@ bool RemoveCharacter(size_t position) {
         }
         memcpy(pieces, new_pieces, sizeof(Piece) * new_count);
         piece_count = new_count;
-        dirtyPieces = true; 
+        InvalidateLineCache();
         return true;
     }
     return false;
@@ -310,7 +355,7 @@ void InsertString(size_t position, char* value, size_t len) {
     }
     memcpy(pieces, new_pieces, sizeof(Piece) * new_count);
     piece_count = new_count;
-    dirtyPieces = true;
+    InvalidateLineCache();
 }
 
 void InsertStringAtPointer(char* value, size_t len) {
@@ -367,6 +412,11 @@ void RenderLine(int xX, int yY, size_t index, Position pointer) {
 }
 
 size_t GetLineCount()  {
+    if (!line_cache.is_valid) {
+        RebuildLineCache();
+    }
+    return line_cache.line_count;
+
     size_t out = 1;
     char* work_buffer;
     for (size_t i = 0; i < piece_count; ++i) {
@@ -669,11 +719,13 @@ int main(int argc, char** argv) {
         org_buffer = strdup("");
         org_buffer_length = strlen(org_buffer);
     }
+    InitLineCache();
 
     pieces[0].source = ORIGINAL;
     pieces[0].start = 0;
     pieces[0].length = strlen(org_buffer);
     piece_count = 1;
+
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     InitWindow(1200, 700, "Fun Editor");
@@ -792,11 +844,7 @@ int main(int argc, char** argv) {
         BeginDrawing(); 
         ClearBackground(BackgroundColor);
         RenderMode();
-        clock_t start = clock();
         RenderTextField(0, mode_padding * 2 + fontSize, screenWidth - 40, screenHeight - (mode_padding * 2 + fontSize * 2 + command_padding * 2));
-        clock_t end = clock();
-        double time = ((double)(end-start)) / CLOCKS_PER_SEC * 1000.0;
-        printf("[TIMING] RenderTextField: %.3fms\n", time); 
         RenderCommand(command_padding, screenHeight - command_padding - fontSize);
         EndDrawing();
     }
