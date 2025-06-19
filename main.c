@@ -68,6 +68,7 @@ size_t commando_pointer_position = 0;
 char commando_content[MAX_COMMAND_BUFFER] = "";
 size_t command_length = 0;
 bool is_command_mode = false;
+bool exit_requested = false;
 
 size_t mode_padding = 10;
 size_t command_padding = 10;
@@ -152,7 +153,6 @@ void RebuildLineCache() {
     line_cache.line_count = 0;
     line_cache.line_positions[0].x = 0;
     line_cache.line_positions[0].y = 0;
-    printf("Start rebuilding line cache\n");
     size_t current_pos = 0;
     char* work_buffer;
 
@@ -416,18 +416,6 @@ size_t GetLineCount()  {
         RebuildLineCache();
     }
     return line_cache.line_count;
-
-    size_t out = 1;
-    char* work_buffer;
-    for (size_t i = 0; i < piece_count; ++i) {
-        work_buffer = pieces[i].source == ORIGINAL ? org_buffer : add_buffer;
-        for (size_t j = 0; j < pieces[i].length; ++j) {
-            if (work_buffer[pieces[i].start + j] == '\n') {
-                out++;
-            }
-        }
-    }
-    return out;
 }
 
 void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height) {
@@ -684,11 +672,55 @@ void ParseCommandArgs() {
     }
 }
 
+size_t PositionToPointer(Position in) {
+    if (!line_cache.is_valid) {
+        RebuildLineCache();
+    }
+    size_t out = 0;
+
+    for (size_t i = 0; i < in.y; ++i) {
+        Position line = GetLineByIndex(i);
+        out += line.y + 1;
+    }
+
+    out += in.x;
+
+    return out;
+}
+
 void ExecuteCommand() {
     if (command_args.count < 1) return;
     if (strcmp(command_args.args[0], "find") == 0) {
         if (command_args.count != 2) return;
+        size_t line_counter = GetPointerPosition().y + 1;
+        size_t line_count = GetLineCount();
+        size_t search_length = strlen(command_args.args[1]);
+        Position found = {-1, -1};
+        for (size_t i = 0; i < line_count; ++i) {
+            size_t working_line = (line_counter + i) % line_count;
+            char* line = GenerateLine(working_line);
+            size_t line_length = strlen(line);
+            
+            if (line_length < search_length) {
+                continue;
+            }
 
+            for (size_t j = 0; j < line_length - search_length; ++j) {
+                if (strncmp(line + j, command_args.args[1], search_length) == 0) {
+                    found.x = j;
+                    found.y = working_line;
+                    break;
+                }
+            }
+            free(line);
+            if (found.x != -1) {
+                break;
+            }
+        }
+        if (found.x != -1) {
+            pointerPosition = PositionToPointer(found);
+        }
+                    
     } else if (strcmp(command_args.args[0], "goto") == 0) {
         if (command_args.count != 2) return;
 
@@ -700,6 +732,8 @@ void ExecuteCommand() {
             memset(commando_content, 0, MAX_COMMAND_BUFFER);
             commando_pointer_position = 0;
         }
+    } else if (strcmp(command_args.args[0], "quit") == 0) {
+        exit_requested = true;
     }
 }
 
@@ -730,10 +764,11 @@ int main(int argc, char** argv) {
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     InitWindow(1200, 700, "Fun Editor");
     SetTargetFPS(60); 
-
+    SetExitKey(KEY_NULL);
+    
     editor_font = LoadFontEx("Input.ttf", fontSize, 0, 250);
 
-    while (!WindowShouldClose()) {
+    while (!WindowShouldClose() && !exit_requested) {
         size_t screenWidth = GetScreenWidth();
         size_t screenHeight = GetScreenHeight();
 
@@ -783,6 +818,14 @@ int main(int argc, char** argv) {
                     memset(commando_content, 0, MAX_COMMAND_BUFFER);
                     strcpy(commando_content, "goto ");
                     command_length = strlen("goto ");
+                    commando_pointer_position = command_length;
+                }
+                
+                if (IsKeyPressed(KEY_Q)) {
+                    is_command_mode = true;
+                    memset(commando_content, 0, MAX_COMMAND_BUFFER);
+                    strcpy(commando_content, "quit");
+                    command_length = strlen("quit");
                     commando_pointer_position = command_length;
                 }
             } else {
@@ -837,7 +880,9 @@ int main(int argc, char** argv) {
                     ExecuteCommand();
                 }
 
-
+                if (IsKeyPressed(KEY_ESCAPE)) {
+                    is_command_mode = false;
+                }
             }
         }
 
