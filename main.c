@@ -33,6 +33,27 @@ typedef struct {
     bool is_valid;
 } LineCache;
 
+typedef enum {
+    EDIT_INSERT,
+    EDIT_DELETE
+} EditType;
+
+typedef struct {
+    EditType type;
+    size_t position;
+    size_t length;
+    char* text;
+    size_t cursor_before;
+    size_t cursor_after;
+} EditEntry;
+
+typedef struct {
+    EditEntry* entries;
+    size_t count;
+    size_t capacity;
+    size_t current;
+} UndoStack;
+
 #define MAX_PIECES 1024
 #define MAX_ADD_BUFFER 4096
 #define MAX_COMMAND_BUFFER 4096
@@ -73,6 +94,64 @@ bool exit_requested = false;
 size_t mode_padding = 10;
 size_t command_padding = 10;
 CommandArgs command_args;
+
+
+UndoStack undoStack = {0};
+bool can_merge_with_previous = false;
+double time_since_last_edit = 0;
+
+void InitUndoStack()  {
+    undoStack.capacity = 10000;
+    undoStack.entries = calloc(undoStack.capacity, sizeof(EditEntry));
+    undoStack.count = 0;
+    undoStack.current = 0;
+}
+
+void FreeEditEntry(EditEntry* entry) {
+    if (entry->text) {
+        free(entry->text);
+        entry->text = NULL;
+    }
+}
+
+void PushCommand(EditType type, size_t position, const char* text, size_t length) {
+    for (size_t i = undoStack.current; i < undoStack.count; i++) {
+        FreeEditEntry(&undoStack.entries[i]);      
+    }
+    undoStack.count = undoStack.current;
+
+    if (undoStack.count >= undoStack.capacity) {
+        FreeEditEntry(&undoStack.entries[0]);
+        memmove(undoStack.entries, undoStack.entries + 1, (undoStack.capacity - 1) * sizeof(EditEntry));
+        undoStack.count--;
+    }
+    
+    EditEntry* entry = &undoStack.entries[undoStack.count];
+    entry->type = type;
+    entry->position = position;
+    entry->length = length;
+    entry->cursor_before = pointerPosition;
+    switch (entry->type)
+    {
+        case EDIT_INSERT:
+            entry->cursor_after = pointerPosition + entry->length;
+            break;
+        case EDIT_DELETE:
+            entry->cursor_after = pointerPosition - entry->length;
+            break;
+    }
+
+    if (text && length > 0) {
+        entry->text = malloc(length + 1);
+        memcpy(entry->text, text, length);
+        entry->text[length] = '\0';
+    } else {
+        entry->text = NULL;
+    }
+
+    undoStack.count++;
+    undoStack.current = undoStack.count;
+}
 
 void LogAddBuffer() {
     printf("AddBuffer: ");
@@ -308,10 +387,61 @@ bool RemoveCharacter(size_t position) {
     return false;
 }
 
+char GetCharAt(size_t position) {
+    size_t traversed = 0;
+    char* work_buffer;
+    
+    for (size_t i = 0; i < piece_count; i++) {
+        work_buffer = pieces[i].source == ORIGINAL ? org_buffer : add_buffer;
+        
+        if (traversed + pieces[i].length > position) {
+            size_t offset = position - traversed;
+            return work_buffer[pieces[i].start + offset];
+        }
+        
+        traversed += pieces[i].length;
+    }
+    
+    return '\0'; 
+}
+
+bool TryToMergeCharacterRemove(float current_time) {
+    if (undoStack.current > 0 && current_time - time_since_last_edit < 1.0) {
+        EditEntry* prev = &undoStack.entries[undoStack.current - 1];
+        if (prev->type == EDIT_DELETE && prev->position == pointerPosition) {
+            char deleted = GetCharAt(pointerPosition - 1);
+
+            char* new_text = malloc(prev->length + 2);
+            new_text[0] = deleted;
+            memcpy(new_text + 1, prev->text, prev->length);
+            new_text[prev->length + 1] = '\0';
+
+            free(prev->text);
+            prev->text = new_text;
+            prev->length++;
+            prev->position--;
+            prev->cursor_after = pointerPosition - 1;
+            
+            return true;
+        }
+    }
+    return false;
+}
+
 void RemoveCharacterAtPointer() {
+    if (pointerPosition == 0) return;
+    double current_time = GetTime();
+
+    if (!TryToMergeCharacterRemove(current_time)) {
+        char deleted_char = GetCharAt(pointerPosition - 1);
+        PushCommand(EDIT_DELETE, pointerPosition - 1, &deleted_char, 1);
+    }
+    
     if (RemoveCharacter(pointerPosition)) {
         pointerPosition--;
     }
+
+    time_since_last_edit = current_time;
 }
 
 void InsertString(size_t position, char* value, size_t len) {
@@ -359,6 +489,7 @@ void InsertString(size_t position, char* value, size_t len) {
 }
 
 void InsertStringAtPointer(char* value, size_t len) {
+    PushCommand(EDIT_INSERT, pointerPosition, value, len);
     InsertString(pointerPosition, value, len);
     pointerPosition += len;
 }
@@ -367,9 +498,34 @@ void InsertCharacter(size_t position, char value) {
     InsertString(position, &value, 1);
 }
 
+bool TryToMergeCharacterInsert(char value, float current_time) {
+    if (undoStack.current > 0 && current_time - time_since_last_edit < 1.0) {
+        EditEntry* prev = &undoStack.entries[undoStack.current - 1];
+
+        if (prev->type == EDIT_INSERT && prev->position + prev->length == pointerPosition && value != '\n') {
+            char* new_text = realloc(prev->text, prev->length + 2);
+            new_text[prev->length] = value;
+            new_text[prev->length + 1] = '\0';
+            prev->text = new_text;
+            prev->length++;
+            prev->cursor_after = pointerPosition + 1;
+            return true;
+        }
+    }
+    return false;
+}
+
 void InsertCharacterAtPointer(char value) {
+    double current_time = GetTime();
+    if (!TryToMergeCharacterInsert(value, current_time)) {
+        char text[2] = {value, '\0'};
+        PushCommand(EDIT_INSERT, pointerPosition, text, 1);
+    }
+
     InsertCharacter(pointerPosition, value);
     pointerPosition += 1;
+
+    time_since_last_edit = current_time;
 }
 
 size_t GetPointerOffsetFromLeft(Position pointer) {
@@ -737,6 +893,59 @@ void ExecuteCommand() {
     }
 }
 
+void ExecuteInsert(size_t position, const char* text, size_t length) {
+    InsertString(position, (char*)text, length);
+    pointerPosition = position + length;
+}
+
+void ExecuteDelete(size_t position, size_t length) {
+    for (size_t i = 0; i < length; ++i) {
+        RemoveCharacter(position + 1);
+    }
+    pointerPosition = position;
+}
+
+void Undo() {
+    if (undoStack.current == 0) return;
+
+    undoStack.current--;
+    EditEntry* entry = &undoStack.entries[undoStack.current];
+
+    switch (entry->type) 
+    {
+        case EDIT_INSERT:
+            ExecuteDelete(entry->position, entry->length);        
+            break;
+        case EDIT_DELETE:
+            ExecuteInsert(entry->position, entry->text, entry->length);
+            break;
+    }
+
+    pointerPosition = entry->cursor_before;
+    InvalidateLineCache();
+}
+
+void Redo() {
+    if (undoStack.current >= undoStack.count) return;
+    
+    EditEntry* entry = &undoStack.entries[undoStack.current];
+    
+    switch (entry->type) {
+        case EDIT_INSERT: {
+            ExecuteInsert(entry->position, entry->text, entry->length);
+            break;
+        }
+        case EDIT_DELETE: {
+            ExecuteDelete(entry->position, entry->length);
+            break;
+        }
+    }
+    
+    pointerPosition = entry->cursor_after;
+    undoStack.current++;
+    InvalidateLineCache();
+}
+
 int main(int argc, char** argv) {
 
     size_t org_buffer_length = 0;
@@ -754,6 +963,7 @@ int main(int argc, char** argv) {
         org_buffer_length = strlen(org_buffer);
     }
     InitLineCache();
+    InitUndoStack();
 
     pieces[0].source = ORIGINAL;
     pieces[0].start = 0;
@@ -785,6 +995,14 @@ int main(int argc, char** argv) {
             if (IsKeyPressed(KEY_DOWN)) {
                 jumpLineDown();
             } 
+
+            if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_Y)) {
+                if (IsKeyDown(KEY_LEFT_SHIFT)) {
+                    Redo();
+                } else {
+                    Undo();
+                }
+            }
 
 
             if (IsKeyPressed(KEY_BACKSPACE)) {
