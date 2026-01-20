@@ -1138,7 +1138,7 @@ int main(int argc, char** argv) {
             if (!shift && has_selection && pointer_position_before != pointerPosition) {
                 has_selection = false;
             }
-            if (shift && !has_selection) {
+            if (shift && !has_selection && pointer_position_before != pointerPosition) {
                 has_selection = true;
                 selection_start = pointer_position_before;
             }
