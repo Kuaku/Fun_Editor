@@ -6,6 +6,7 @@
 #include <time.h>
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
+#define max(a, b) ((a) > (b) ? (a) : (b))
 
 typedef enum { ORIGINAL, ADD } BufferType;
 typedef enum { TOP, BOTTOM } AnchorType;
@@ -99,6 +100,10 @@ CommandArgs command_args;
 UndoStack undoStack = {0};
 bool can_merge_with_previous = false;
 double time_since_last_edit = 0;
+
+size_t selection_start = 0;
+size_t selection_end = 0;
+bool has_selection = false;
 
 void InitUndoStack()  {
     undoStack.capacity = 10000;
@@ -542,23 +547,98 @@ size_t GetPointerOffsetFromLeft(Position pointer) {
     return draw_length.x;
 }
 
-void RenderLine(int xX, int yY, size_t index, Position pointer) {
+void RenderLineBufferWithSelection(char* text_buffer, Position position, size_t line_length, Vector2 drawPosition, Position selection_start_position, Position selection_end_position) {
+    Vector2 draw_length = MeasureTextEx(editor_font, text_buffer, fontSize, 1);
+    
+    
+    if (position.y < selection_start_position.y || position.y > selection_end_position.y) {
+        DrawTextEx(editor_font, text_buffer, drawPosition, fontSize, 1, TextColor);
+        return;
+    }
+
+    char* before_buffer = NULL;
+    char* line_buffer = NULL;
+    char* after_buffer = NULL;
+    Vector2 line_buffer_start = drawPosition;
+    int buffer_start = 0;  // Start of selected portion in text_buffer
+    int buffer_end = line_length;  
+    if (selection_start_position.y == position.y && selection_start_position.x > position.x) {
+        buffer_start = selection_start_position.x - position.x;
+    }
+    
+    if (selection_end_position.y == position.y && selection_end_position.x < position.x + line_length) {
+        buffer_end = selection_end_position.x - position.x;
+    }
+
+    if (buffer_start > 0) {
+        before_buffer = calloc(buffer_start + 1, sizeof(char));
+        strncpy(before_buffer, text_buffer, buffer_start);
+        Vector2 before_buffer_size = MeasureTextEx(editor_font, before_buffer, fontSize, 1);
+        line_buffer_start.x += before_buffer_size.x;
+    }
+
+    int selected_length = buffer_end - buffer_start;
+    if (selected_length > 0) {
+        line_buffer = calloc(selected_length + 1, sizeof(char));
+        strncpy(line_buffer, text_buffer + buffer_start, selected_length);
+    }
+
+     if (buffer_end < line_length) {
+        int after_length = line_length - buffer_end;
+        after_buffer = calloc(after_length + 1, sizeof(char));
+        strncpy(after_buffer, text_buffer + buffer_end, after_length);
+    }
+
+    if (before_buffer != NULL) {
+        DrawTextEx(editor_font, before_buffer, drawPosition, fontSize, 1, TextColor);
+    }
+    
+    if (line_buffer != NULL) {
+        Vector2 line_buffer_size = MeasureTextEx(editor_font, line_buffer, fontSize, 1);
+        DrawRectangle(line_buffer_start.x, line_buffer_start.y, line_buffer_size.x, line_buffer_size.y, TextColor);
+        DrawTextEx(editor_font, line_buffer, line_buffer_start, fontSize, 1, BackgroundColor);
+    }
+    
+    if (after_buffer != NULL) {
+        Vector2 line_buffer_size = MeasureTextEx(editor_font, line_buffer != NULL ? line_buffer : "", fontSize, 1);
+        Vector2 after_start = line_buffer_start;
+        after_start.x += line_buffer_size.x;
+        DrawTextEx(editor_font, after_buffer, after_start, fontSize, 1, TextColor);
+    }
+
+    free(before_buffer);
+    free(line_buffer);
+    free(after_buffer);
+}
+
+void RenderLineBuffer(char* text_buffer, Position position, size_t line_length, Vector2 drawPosition, Position selection_start_position, Position selection_end_position) {
+    if (has_selection && position.y >= selection_start_position.y && position.y <= selection_end_position.y) {
+        RenderLineBufferWithSelection(text_buffer, position, line_length, drawPosition, selection_start_position, selection_end_position);
+    } else {
+        DrawTextEx(editor_font, text_buffer, drawPosition, fontSize, 1, TextColor);
+    }
+}
+
+void RenderLine(int y_line, int xX, int yY, size_t index, Position pointer, Position selection_start_position, Position selection_end_position) {
+    Position position = {xX, yY};
     char* temp = NULL;
     size_t line_buffer_length;
     char* line = GenerateLine(index);
-    size_t line_length;
+    size_t line_length = strlen(line);
     if (pointer.y != index) {
-            DrawTextEx(editor_font, line, (Vector2){xX, yY}, fontSize, 1, TextColor); 
+        RenderLineBuffer(line, (Position){0, y_line}, line_length, (Vector2){xX, yY}, selection_start_position, selection_end_position);
+        //DrawTextEx(editor_font, line, (Vector2){xX, yY}, fontSize, 1, TextColor); 
     } else {       
         if (temp != NULL) {
             free(temp);
         } 
-        line_length = strlen(line);
         temp = calloc(line_length + 1, sizeof(char));
         strncpy(temp, line, pointer.x);
         Vector2 draw_length = MeasureTextEx(editor_font, temp, fontSize, 1);
-        DrawTextEx(editor_font, temp, (Vector2){xX, yY}, fontSize, 1, TextColor);
-        DrawTextEx(editor_font, line + pointer.x, (Vector2){xX + draw_length.x + pointerPaddingX * 2 + pointerWidth, yY}, fontSize, 1, TextColor);   
+        RenderLineBuffer(temp, (Position){0, y_line}, pointer.x, (Vector2){xX, yY}, selection_start_position, selection_end_position);
+        //DrawTextEx(editor_font, temp, (Vector2){xX, yY}, fontSize, 1, TextColor);
+        RenderLineBuffer(line + pointer.x, (Position){pointer.x, y_line}, line_length - pointer.x, (Vector2){xX + draw_length.x + pointerPaddingX * 2 + pointerWidth, yY}, selection_start_position, selection_end_position);
+        //DrawTextEx(editor_font, line + pointer.x, (Vector2){xX + draw_length.x + pointerPaddingX * 2 + pointerWidth, yY}, fontSize, 1, TextColor);   
         DrawRectangle(xX + draw_length.x + pointerPaddingX, yY, pointerWidth, fontSize - 2 * pointerPaddingY, TextColor);
     }
     free(line);
@@ -574,8 +654,36 @@ size_t GetLineCount()  {
     return line_cache.line_count;
 }
 
+Position IndexToPosition(size_t index) {  
+    Position out = {0, 0};
+    size_t traversed = 0;
+    char* work_buffer;
+    for (size_t i = 0; i < piece_count && traversed < index; ++i) {
+        work_buffer = pieces[i].source == ORIGINAL ? org_buffer : add_buffer;
+        
+        size_t to_read = index - traversed;
+        if (to_read > pieces[i].length) to_read = pieces[i].length;
+        for (size_t j = 0; j < to_read; ++j) {
+            if (work_buffer[pieces[i].start + j] == '\n') {
+                out.y++;
+                out.x = 0;
+            } else {
+                out.x++;
+            }
+        }
+        traversed += to_read;
+    }    
+    return out;
+}
+
 void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height) {
     Position pointer = GetPointerPosition();
+    Position selection_start_position = {0};
+    Position selection_end_position = {0};
+    if (has_selection) {
+        selection_start_position = IndexToPosition(min(selection_start, selection_end));
+        selection_end_position = IndexToPosition(max(selection_start, selection_end));
+    }
     size_t pointer_offset = GetPointerOffsetFromLeft(pointer);
     size_t lines_completly_rendered = height / fontSize;size_t line_number = line_anchor;
     size_t line_count = GetLineCount();
@@ -597,7 +705,7 @@ void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height)
 
     size_t line_y = 0;
     for (size_t i = line_anchor; i < min(line_anchor + lines_completly_rendered + 1, line_count); ++i) {    
-        RenderLine(startX-offsetX, startY + line_y * fontSize, i, pointer);
+        RenderLine(i, startX-offsetX, startY + line_y * fontSize, i, pointer, selection_start_position, selection_end_position);
         line_y++;
     }
     EndScissorMode();
@@ -983,6 +1091,8 @@ int main(int argc, char** argv) {
         size_t screenHeight = GetScreenHeight();
 
         if (!is_command_mode) {
+            bool shift = IsKeyDown(KEY_LEFT_SHIFT);
+            int pointer_position_before = pointerPosition;
             if (IsKeyPressed(KEY_LEFT) && pointerPosition > 0) {
                 pointerPosition--;
             }
@@ -995,6 +1105,14 @@ int main(int argc, char** argv) {
             if (IsKeyPressed(KEY_DOWN)) {
                 jumpLineDown();
             } 
+            if (!shift && has_selection && pointer_position_before != pointerPosition) {
+                has_selection = false;
+            }
+            if (shift && !has_selection) {
+                has_selection = true;
+                selection_start = pointer_position_before;
+            }
+            if (shift) {selection_end = pointerPosition;}
 
             if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_Y)) {
                 if (IsKeyDown(KEY_LEFT_SHIFT)) {
