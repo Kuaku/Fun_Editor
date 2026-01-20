@@ -59,7 +59,7 @@ typedef struct {
 #define MAX_ADD_BUFFER 4096
 #define MAX_COMMAND_BUFFER 4096
 
-#define BackgroundColor BLACK
+#define BackgroundColor (Color){32, 35, 41, 255}
 #define TextColor       WHITE
 #define ModeColor       WHITE
 #define CommandColor    WHITE
@@ -1006,12 +1006,29 @@ void ExecuteInsert(size_t position, const char* text, size_t length) {
     pointerPosition = position + length;
 }
 
+char* GetTextRange(size_t start, size_t end) {
+    size_t length = end - start;
+    char* result = malloc(length + 1);
+    for (size_t i = 0; i < length; i++) {
+        result[i] = GetCharAt(start + i);
+    }
+    result[length] = '\0';
+    return result;
+}
+
 void ExecuteDelete(size_t position, size_t length) {
     for (size_t i = 0; i < length; ++i) {
         RemoveCharacter(position + 1);
     }
     pointerPosition = position;
 }
+
+void RemoveArea(size_t position, size_t length) {
+    char* deleted_text = GetTextRange(position, position + length);
+    PushCommand(EDIT_DELETE, position, deleted_text, length);
+    ExecuteDelete(position, length);
+}
+
 
 void Undo() {
     if (undoStack.current == 0) return;
@@ -1092,6 +1109,7 @@ int main(int argc, char** argv) {
 
         if (!is_command_mode) {
             bool shift = IsKeyDown(KEY_LEFT_SHIFT);
+            bool control = IsKeyDown(KEY_LEFT_CONTROL);
             int pointer_position_before = pointerPosition;
             if (IsKeyPressed(KEY_LEFT) && pointerPosition > 0) {
                 pointerPosition--;
@@ -1100,10 +1118,22 @@ int main(int argc, char** argv) {
                 pointerPosition++;
             }
             if (IsKeyPressed(KEY_UP)) {
-                jumpLineUp();
+                if (control) {
+                    for (int i = 0; i < 5; i++) {
+                        jumpLineUp();
+                    }
+                } else {
+                    jumpLineUp();
+                }
             } 
             if (IsKeyPressed(KEY_DOWN)) {
-                jumpLineDown();
+                if (control) {
+                    for (int i = 0; i < 5; i++) {
+                        jumpLineDown();
+                    }
+                } else {
+                    jumpLineDown();
+                }
             } 
             if (!shift && has_selection && pointer_position_before != pointerPosition) {
                 has_selection = false;
@@ -1124,7 +1154,13 @@ int main(int argc, char** argv) {
 
 
             if (IsKeyPressed(KEY_BACKSPACE)) {
-                RemoveCharacterAtPointer();
+                if (has_selection) {
+                    size_t selection_length = abs((int)(selection_end) - (int)(selection_start));
+                    RemoveArea(min(selection_start, selection_end), selection_length);
+                    has_selection = false;
+                } else {
+                    RemoveCharacterAtPointer();
+                }
             }
 
             if (IsKeyDown(KEY_LEFT_CONTROL)) {

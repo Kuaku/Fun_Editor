@@ -1,6 +1,8 @@
 1. Undo/Redo System                     [x]
 2. Text Selection                       [x]
+*. Delete Selection                     [x]
 3. Copy/Paste/Cut                       [ ]
+*. Model (First debug modal)            [ ] 
 (4. Mouse Support                       [ ])
 5. Search and Replace                   [ ]
 6. Line Operations                      [ ]
