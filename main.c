@@ -982,7 +982,10 @@ void ExecuteCommand() {
             }
         }
         if (found.x != -1) {
-            pointerPosition = PositionToPointer(found);
+            pointerPosition = PositionToPointer(found) + search_length;
+            has_selection = true;
+            selection_start = pointerPosition;
+            selection_end = pointerPosition - search_length;
         }
                     
     } else if (strcmp(command_args.args[0], "goto") == 0) {
@@ -1071,6 +1074,44 @@ void Redo() {
     InvalidateLineCache();
 }
 
+void RemoveSelection() {
+    size_t selection_length = abs((int)(selection_end) - (int)(selection_start));
+    RemoveArea(min(selection_start, selection_end), selection_length);
+    has_selection = false;
+}
+
+void Paste() {
+    char* buffer = (char*)GetClipboardText();
+    if (buffer == NULL) {
+        return;
+    }
+
+    if (has_selection) {
+        RemoveSelection();
+    }
+    
+    size_t buffer_length = strlen(buffer);
+    char* normalized_buffer = (char*)malloc(buffer_length + 1);
+    strcpy(normalized_buffer, buffer);
+
+    normalize_line_endings(buffer);
+    InsertStringAtPointer(buffer, buffer_length);
+}
+
+void Copy() {
+    size_t selection_length = abs((int)selection_end - (int)selection_start);
+    char* selection_buffer = GetTextRange(min(selection_start, selection_end), min(selection_start, selection_end) + selection_length);
+
+    SetClipboardText(selection_buffer);
+
+    free(selection_buffer);
+}
+
+void Cut() {
+    Copy();
+    RemoveSelection();
+}
+
 int main(int argc, char** argv) {
 
     size_t org_buffer_length = 0;
@@ -1155,9 +1196,7 @@ int main(int argc, char** argv) {
 
             if (IsKeyPressed(KEY_BACKSPACE)) {
                 if (has_selection) {
-                    size_t selection_length = abs((int)(selection_end) - (int)(selection_start));
-                    RemoveArea(min(selection_start, selection_end), selection_length);
-                    has_selection = false;
+                    RemoveSelection();
                 } else {
                     RemoveCharacterAtPointer();
                 }
@@ -1200,18 +1239,39 @@ int main(int argc, char** argv) {
                     command_length = strlen("quit");
                     commando_pointer_position = command_length;
                 }
+
+                if (IsKeyPressed(KEY_V)) {
+                    Paste();
+                }
+
+                if (IsKeyPressed(KEY_C)) {
+                    Copy();
+                }
+
+                if (IsKeyPressed(KEY_X)) {
+                    Cut();
+                }
             } else {
                 int key = GetCharPressed();
                 while (key > 0) {
                     if (key >= 32 && key <= 126) {
+                        if (has_selection) {
+                            RemoveSelection();
+                        }
                         InsertCharacterAtPointer(key);
                     }
                     key = GetCharPressed();
                 }
                 if (IsKeyPressed(KEY_TAB)) {
+                    if (has_selection) {
+                        RemoveSelection();
+                    }
                     InsertStringAtPointer("  ", 2);
                 }       
                 if (IsKeyPressed(KEY_ENTER)) {    
+                    if (has_selection) {
+                        RemoveSelection();
+                    }
                     InsertCharacterAtPointer('\n');
                 }
             }
