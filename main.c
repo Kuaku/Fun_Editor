@@ -1112,6 +1112,56 @@ void Cut() {
     RemoveSelection();
 }
 
+bool IsWordChar(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+bool IsPunct(char c) {
+    return c && !IsWordChar(c) && c != ' ' && c != '\t' && c != '\n';
+}
+
+void MoveWordRight() {
+    size_t size = GetTextSize();
+    if (pointerPosition >= size) return;
+    char c = GetCharAt(pointerPosition);
+    
+    if (c == '\n') {
+        pointerPosition++;
+        return;
+    }
+    
+    if (IsWordChar(c)) {
+        while (pointerPosition < size && IsWordChar(GetCharAt(pointerPosition))) pointerPosition++;
+    } else if (IsPunct(c)) {
+        while (pointerPosition < size && IsPunct(GetCharAt(pointerPosition))) pointerPosition++;
+    } else {
+        while (pointerPosition < size && (c = GetCharAt(pointerPosition), c == ' ' || c == '\t')) pointerPosition++;
+        if (pointerPosition < size && GetCharAt(pointerPosition) == '\n') return;
+        while (pointerPosition < size && IsPunct(GetCharAt(pointerPosition))) pointerPosition++;
+    }
+}
+
+void MoveWordLeft() {
+    size_t size = GetTextSize();
+    if (pointerPosition == 0) return;
+    pointerPosition--;
+    
+    char c = GetCharAt(pointerPosition);
+    if (c == '\n') return;
+    
+    while (pointerPosition > 0 && (c = GetCharAt(pointerPosition), c == ' ' || c == '\t')) {
+        if (GetCharAt(pointerPosition - 1) == '\n') return;
+        pointerPosition--;
+    }
+    
+    c = GetCharAt(pointerPosition);
+    if (IsWordChar(c)) {
+        while (pointerPosition > 0 && IsWordChar(GetCharAt(pointerPosition - 1))) pointerPosition--;
+    } else if (IsPunct(c)) {
+        while (pointerPosition > 0 && IsPunct(GetCharAt(pointerPosition - 1))) pointerPosition--;
+    }
+}
+
 int main(int argc, char** argv) {
 
     size_t org_buffer_length = 0;
@@ -1153,10 +1203,18 @@ int main(int argc, char** argv) {
             bool control = IsKeyDown(KEY_LEFT_CONTROL);
             int pointer_position_before = pointerPosition;
             if (IsKeyPressed(KEY_LEFT) && pointerPosition > 0) {
-                pointerPosition--;
+                if (control) {
+                    MoveWordLeft();
+                } else {
+                    pointerPosition--;
+                }
             }
             if (IsKeyPressed(KEY_RIGHT) && pointerPosition <= GetTextSize()) {
-                pointerPosition++;
+                if (control) {
+                    MoveWordRight();
+                } else {
+                    pointerPosition++;
+                }
             }
             if (IsKeyPressed(KEY_UP)) {
                 if (control) {
