@@ -233,14 +233,12 @@ bool IsDirExpanded(FileBrowserState* state, size_t node_index) {
 void ToggleDirExpanded(FileBrowserState* state, size_t node_index) {
     for (size_t i = 0; i < state->expanded_count; i++) {
         if (state->expanded_dirs[i] == node_index) {
-            // Remove
             memmove(&state->expanded_dirs[i], &state->expanded_dirs[i + 1],
                     sizeof(size_t) * (state->expanded_count - i - 1));
             state->expanded_count--;
             return;
         }
     }
-    // Add
     if (state->expanded_count < 256) {
         state->expanded_dirs[state->expanded_count++] = node_index;
     }
@@ -346,14 +344,12 @@ void EnsureSelectionVisible(Modal* modal, FileBrowserState* state, FileTree* tre
     
     float item_height = fontSize + 4;
     float selection_y = visible_index * item_height;
-    float visible_height = modal->size.y - 20; // Account for padding
+    float visible_height = modal->size.y - 20;
     
-    // Scroll up if selection is above visible area
     if (selection_y < state->scroll_offset) {
         state->scroll_offset = (size_t)selection_y;
     }
     
-    // Scroll down if selection is below visible area
     if (selection_y + item_height > state->scroll_offset + visible_height) {
         state->scroll_offset = (size_t)(selection_y + item_height - visible_height);
     }
@@ -382,8 +378,7 @@ void InputFileBrowser(void* modal_ptr) {
             ToggleDirExpanded(state, state->selected_index);
             EnsureSelectionVisible(self, state, tree);
         } else {
-            // Open file
-            // load_file(node->path, ...);
+            // TODO: Open file
         }
     }
 
@@ -509,7 +504,7 @@ void AddPendingDir(const char* path, size_t node_index) {
 
 void AddChildToTreeNode(FileTree* tree, size_t parent_index, size_t child_index) {
     if (parent_index >= tree->count || child_index == SIZE_MAX) {
-        return;  // Invalid indices
+        return;
     }
 
     Node* parent = &tree->nodes[parent_index];
@@ -564,7 +559,6 @@ void ProcessSingleDirectory(const char* path, size_t dir_node_index) {
         if (strcmp(find_data.cFileName, ".") == 0 || 
             strcmp(find_data.cFileName, "..") == 0) continue;
         
-        // Skip hidden files/folders and common large directories
         if (find_data.cFileName[0] == '.') continue;
         if (strcmp(find_data.cFileName, "node_modules") == 0) continue;
         if (strcmp(find_data.cFileName, ".git") == 0) continue;
@@ -599,7 +593,6 @@ void ProcessSingleDirectory(const char* path, size_t dir_node_index) {
         if (strcmp(entry->d_name, ".") == 0 || 
             strcmp(entry->d_name, "..") == 0) continue;
         
-        // Skip hidden and common large directories
         if (entry->d_name[0] == '.') continue;
         if (strcmp(entry->d_name, "node_modules") == 0) continue;
         
@@ -625,7 +618,7 @@ void ProcessSingleDirectory(const char* path, size_t dir_node_index) {
 }
 
 void LogFileTreeNode(size_t node_index, int depth) {
-    if (node_index >= cache_manager.active->count) return;  // FIXED: was file_cache_size
+    if (node_index >= cache_manager.active->count) return;
     
     Node* node = &cache_manager.active->nodes[node_index];
     
@@ -654,7 +647,7 @@ void LogFileTree() {
     TraceLog(LOG_INFO, "========== FILE TREE ==========");
     LogFileTreeNode(cache_manager.active->root_index, 0);
     TraceLog(LOG_INFO, "===============================");
-    TraceLog(LOG_INFO, "Total nodes: %zu", cache_manager.active->count);  // FIXED: was file_cache_size
+    TraceLog(LOG_INFO, "Total nodes: %zu", cache_manager.active->count);
 }
 
 void UpdateFileCache() {
@@ -802,11 +795,10 @@ void LogPieces() {
         const char* sourceName = (p.source == ORIGINAL) ? "ORIGINAL" : "ADD";
         const char* buffer = (p.source == ORIGINAL) ? org_buffer : add_buffer;
 
-        // Sichere Kopie für null-terminierten Text
         char text[1025] = {0};
         size_t copyLen = (p.length < 1024) ? p.length : 1024;
         strncpy(text, buffer + p.start, copyLen);
-        text[copyLen] = '\0'; // sicherstellen, dass nullterminiert
+        text[copyLen] = '\0';
 
         TraceLog(LOG_INFO, "[%zu] Source: %s, Start: %zu, Length: %zu, Text: \"%s\"",
                  i, sourceName, p.start, p.length, text);
@@ -1183,7 +1175,7 @@ void RenderLineBufferWithSelection(char* text_buffer, Position position, size_t 
     char* line_buffer = NULL;
     char* after_buffer = NULL;
     Vector2 line_buffer_start = drawPosition;
-    int buffer_start = 0;  // Start of selected portion in text_buffer
+    int buffer_start = 0;
     int buffer_end = line_length;  
     if (selection_start_position.y == position.y && selection_start_position.x > position.x) {
         buffer_start = selection_start_position.x - position.x;
@@ -1250,7 +1242,6 @@ void RenderLine(int y_line, int xX, int yY, size_t index, Position pointer, Posi
     size_t line_length = strlen(line);
     if (pointer.y != index) {
         RenderLineBuffer(line, (Position){0, y_line}, line_length, (Vector2){xX, yY}, selection_start_position, selection_end_position);
-        //DrawTextEx(editor_font, line, (Vector2){xX, yY}, fontSize, 1, TextColor); 
     } else {       
         if (temp != NULL) {
             free(temp);
@@ -1259,9 +1250,7 @@ void RenderLine(int y_line, int xX, int yY, size_t index, Position pointer, Posi
         strncpy(temp, line, pointer.x);
         Vector2 draw_length = MeasureTextEx(editor_font, temp, fontSize, 1);
         RenderLineBuffer(temp, (Position){0, y_line}, pointer.x, (Vector2){xX, yY}, selection_start_position, selection_end_position);
-        //DrawTextEx(editor_font, temp, (Vector2){xX, yY}, fontSize, 1, TextColor);
-        RenderLineBuffer(line + pointer.x, (Position){pointer.x, y_line}, line_length - pointer.x, (Vector2){xX + draw_length.x + pointerPaddingX * 2 + pointerWidth, yY}, selection_start_position, selection_end_position);
-        //DrawTextEx(editor_font, line + pointer.x, (Vector2){xX + draw_length.x + pointerPaddingX * 2 + pointerWidth, yY}, fontSize, 1, TextColor);   
+        RenderLineBuffer(line + pointer.x, (Position){pointer.x, y_line}, line_length - pointer.x, (Vector2){xX + draw_length.x + pointerPaddingX * 2 + pointerWidth, yY}, selection_start_position, selection_end_position);   
         DrawRectangle(xX + draw_length.x + pointerPaddingX, yY, pointerWidth, fontSize - 2 * pointerPaddingY, TextColor);
     }
     free(line);
@@ -1415,7 +1404,7 @@ char* load_file(const char* filename, size_t* out_len) {
         return NULL;
     }
     fread(buf, 1, len, f);
-    buf[len] = '\0'; // Null-terminate for safety
+    buf[len] = '\0';
     fclose(f);
     if (out_len) *out_len = len;
     return buf;
@@ -1889,7 +1878,7 @@ int main(int argc, char** argv) {
 
     while (!WindowShouldClose() && !exit_requested) {
         if (root_path) {
-            UpdateFileCache();  // Process incremental rebuild
+            UpdateFileCache();
         }
 
         size_t screenWidth = GetScreenWidth();
