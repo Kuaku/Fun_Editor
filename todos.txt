@@ -2,7 +2,7 @@
 2. Text Selection                       [x]
 *. Delete Selection                     [x]
 3. Copy/Paste/Cut                       [x]
-*. Modal (First debug modal)            [ ] 
+*. Modal (First debug modal)            [x] 
 (4. Mouse Support                       [ ])
 5. Search and Replace                   [ ]
 6. Line Operations                      [ ]
@@ -14,7 +14,7 @@
 12. Comment Toggle                      [ ]
 13. Page Up/Down                        [ ]
 14. Multiple Buffer Management          [ ]
-15. File Explorer (Modal)               [ ]
+15. File Explorer (Modal)               [x]
 16. File Operations                     [ ]
 17. Buffer Overflow Protection          [ ]
 18. Piece Table Optimizations           [ ]

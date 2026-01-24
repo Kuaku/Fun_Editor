@@ -4,9 +4,32 @@
 #include <math.h>
 #include "raylib.h"
 #include <time.h>
+#include <sys/stat.h>
 
-#define min(a, b) ((a) < (b) ? (a) : (b))
-#define max(a, b) ((a) > (b) ? (a) : (b))
+#ifdef _WIN32
+    #define WIN32_LEAN_AND_MEAN 
+    #define NOGDI             
+    #define NOUSER               
+    #include <windows.h>
+    #undef WIN32_LEAN_AND_MEAN
+    #undef NOGDI
+    #undef NOUSER
+    
+    #ifndef S_ISDIR
+        #define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+    #endif
+    #ifndef S_ISREG
+        #define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+    #endif
+#else
+    #include <dirent.h>
+    #include <unistd.h>
+#endif
+
+#ifndef _WIN32
+    #define min(a, b) ((a) < (b) ? (a) : (b))
+    #define max(a, b) ((a) > (b) ? (a) : (b))
+#endif
 
 typedef enum { ORIGINAL, ADD } BufferType;
 typedef enum { TOP, BOTTOM } AnchorType;
@@ -54,6 +77,93 @@ typedef struct {
     size_t capacity;
     size_t current;
 } UndoStack;
+
+typedef void (*Layout)(void* self);
+
+typedef struct {
+    Vector2 position;
+    Vector2 size;
+    Vector2 wanted_size;
+    Vector2 padding;
+    Color background_color;
+    Layout* layouts;
+    int layout_count;
+    void (*render)(void* self);
+    void (*input)(void* self);
+    void* state;
+} Modal;
+
+typedef enum {
+    TYPE_FILE,
+    TYPE_DIR
+} NodeType;
+
+typedef struct {
+    NodeType type;
+
+    char* path;
+    size_t path_length;
+    char* name;
+    size_t name_length;
+    int* children;
+    size_t children_count;
+} Node;
+
+typedef struct {
+    char* path;
+    char* name;
+    size_t parent_index;
+} DirWorkItem;
+
+typedef struct {
+    char* path;
+    size_t index;
+} PendingDir;
+
+typedef struct {
+    Node* nodes;
+    size_t count;
+    size_t capacity;
+    size_t root_index;
+} FileTree;
+
+typedef struct {
+    FileTree* active;     
+    FileTree* building;   
+    
+    double last_scan_time;
+    double scan_interval;
+    
+    bool rebuild_requested;
+    bool rebuild_in_progress;
+    
+    PendingDir* pending_dirs;
+    size_t pending_count;
+    size_t pending_capacity;
+    size_t dirs_per_frame;  
+} FileCacheManager;
+
+typedef struct {
+    size_t selected_index;
+    size_t scroll_offset;
+    size_t expanded_dirs[256];
+    size_t expanded_count;
+} FileBrowserState;
+
+char* root_path;
+
+FileCacheManager cache_manager = {
+    .active = NULL,
+    .building = NULL,
+    .last_scan_time = 0,
+    .scan_interval = 3.0,
+    .rebuild_requested = false,
+    .rebuild_in_progress = false,
+    .pending_dirs = NULL,
+    .pending_count = 0,
+    .pending_capacity = 0,
+    .dirs_per_frame = 50
+};
 
 #define MAX_PIECES 1024
 #define MAX_ADD_BUFFER 4096
@@ -104,6 +214,519 @@ double time_since_last_edit = 0;
 size_t selection_start = 0;
 size_t selection_end = 0;
 bool has_selection = false;
+
+Modal* modal = NULL;
+
+
+FileTree* GetFileTree() {
+    return cache_manager.active;
+}
+
+bool IsDirExpanded(FileBrowserState* state, size_t node_index) {
+    for (size_t i = 0; i < state->expanded_count; i++) {
+        if (state->expanded_dirs[i] == node_index) return true;
+    }
+    return false;
+}
+
+// TODO: Rework to use Arena
+void ToggleDirExpanded(FileBrowserState* state, size_t node_index) {
+    for (size_t i = 0; i < state->expanded_count; i++) {
+        if (state->expanded_dirs[i] == node_index) {
+            // Remove
+            memmove(&state->expanded_dirs[i], &state->expanded_dirs[i + 1],
+                    sizeof(size_t) * (state->expanded_count - i - 1));
+            state->expanded_count--;
+            return;
+        }
+    }
+    // Add
+    if (state->expanded_count < 256) {
+        state->expanded_dirs[state->expanded_count++] = node_index;
+    }
+}
+
+void RenderFileNode(Modal* modal, FileTree* tree, size_t node_index, FileBrowserState* state, float x, float* y, float indent, float item_height, float visible_top, float visible_bottom) {
+    if (!tree || !tree->nodes || node_index >= tree->count) {
+        return;
+    }
+    Node* node = &tree->nodes[node_index];
+
+    if (*y + item_height < visible_top || *y > visible_bottom) {
+        *y += item_height;
+        if (node->type == TYPE_DIR && IsDirExpanded(state, node_index)) {
+            for (size_t i = 0; i < node->children_count; i++) {
+                RenderFileNode(modal, tree, node->children[i], state, x, y, indent + 20, item_height, visible_top, visible_bottom);
+            }
+        }
+        return;
+    }
+
+    bool is_selected = (state->selected_index == node_index);
+    if (is_selected) {
+        DrawRectangle(x, *y, modal->size.x, item_height, (Color){60, 60, 80, 255});
+    }
+
+    const char* icon = (node->type == TYPE_DIR) 
+        ? (IsDirExpanded(state, node_index) ? "v " : "> ")
+        : "  ";
+
+    char display[256];
+    snprintf(display, sizeof(display), "%s%s", icon, node->name);
+    DrawTextEx(editor_font, display, (Vector2){x + indent, *y}, fontSize, 1, TextColor);
+    *y += item_height;
+
+    if (node->type == TYPE_DIR && IsDirExpanded(state, node_index)) {
+        for (size_t i = 0; i < node->children_count; i++) {
+            RenderFileNode(modal, tree, node->children[i], state, x, y, indent+20, item_height, visible_top, visible_bottom);
+        }
+    }
+}
+
+size_t CollectVisibleNodes(FileTree* tree, FileBrowserState* state, size_t node_index, 
+                           size_t* visible, size_t count, size_t max_count) {
+
+    if (!tree || !visible || node_index >= tree->count) {
+        return count;
+    }
+    if (count >= max_count) return count;
+    
+    visible[count++] = node_index;
+    
+    Node* node = &tree->nodes[node_index];
+    if (node->type == TYPE_DIR && IsDirExpanded(state, node_index)) {
+        for (size_t i = 0; i < node->children_count; i++) {
+            count = CollectVisibleNodes(tree, state, node->children[i], 
+                                        visible, count, max_count);
+        }
+    }
+    
+    return count;
+}
+
+void MoveSelectionUp(FileBrowserState* state, FileTree* tree) {
+    size_t visible[4096];
+    size_t visible_count = CollectVisibleNodes(tree, state, tree->root_index, visible, 0, 4096);
+    
+    for (size_t i = 1; i < visible_count; i++) {
+        if (visible[i] == state->selected_index) {
+            state->selected_index = visible[i - 1];
+            return;
+        }
+    }
+}
+
+void MoveSelectionDown(FileBrowserState* state, FileTree* tree) {
+    size_t visible[4096];
+    size_t visible_count = CollectVisibleNodes(tree, state, tree->root_index, visible, 0, 4096);
+    
+    for (size_t i = 0; i < visible_count - 1; i++) {
+        if (visible[i] == state->selected_index) {
+            state->selected_index = visible[i + 1];
+            return;
+        }
+    }
+}
+
+int GetVisibleIndex(FileTree* tree, FileBrowserState* state, size_t target_index) {
+    size_t visible[4096];
+    size_t visible_count = CollectVisibleNodes(tree, state, tree->root_index, visible, 0, 4096);
+    
+    for (size_t i = 0; i < visible_count; i++) {
+        if (visible[i] == target_index) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+void EnsureSelectionVisible(Modal* modal, FileBrowserState* state, FileTree* tree) {
+    int visible_index = GetVisibleIndex(tree, state, state->selected_index);
+    if (visible_index < 0) return;
+    
+    float item_height = fontSize + 4;
+    float selection_y = visible_index * item_height;
+    float visible_height = modal->size.y - 20; // Account for padding
+    
+    // Scroll up if selection is above visible area
+    if (selection_y < state->scroll_offset) {
+        state->scroll_offset = (size_t)selection_y;
+    }
+    
+    // Scroll down if selection is below visible area
+    if (selection_y + item_height > state->scroll_offset + visible_height) {
+        state->scroll_offset = (size_t)(selection_y + item_height - visible_height);
+    }
+}
+
+void InputFileBrowser(void* modal_ptr) {
+    Modal* self = (Modal*)modal_ptr;
+    FileBrowserState* state = (FileBrowserState*)self->state;
+    FileTree* tree = GetFileTree();
+
+    if (!tree) return;
+    
+    if (IsKeyPressed(KEY_UP)) {
+        MoveSelectionUp(state, tree);
+        EnsureSelectionVisible(self, state, tree);
+    }
+    
+    if (IsKeyPressed(KEY_DOWN)) {
+        MoveSelectionDown(state, tree);
+        EnsureSelectionVisible(self, state, tree);
+    }
+
+    if (IsKeyPressed(KEY_ENTER)) {
+        Node* node = &tree->nodes[state->selected_index];
+        if (node->type == TYPE_DIR) {
+            ToggleDirExpanded(state, state->selected_index);
+            EnsureSelectionVisible(self, state, tree);
+        } else {
+            // Open file
+            // load_file(node->path, ...);
+        }
+    }
+
+    if (IsKeyPressed(KEY_ESCAPE) ) {
+        modal = NULL;
+    }
+    if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_SPACE)) {
+        modal = NULL;
+    }
+}
+
+void RenderFileBrowser(void* modal_ptr) {
+    Modal* self = (Modal*)modal_ptr;
+    if (!self || !self->state) {
+        return;
+    }
+    FileBrowserState* state = (FileBrowserState*)self->state;
+
+    FileTree* tree = GetFileTree();
+
+    if (!tree || tree->count == 0) {
+        const char* msg = cache_manager.rebuild_in_progress 
+            ? "Loading..." 
+            : "No files";
+        Vector2 size = MeasureTextEx(editor_font, msg, fontSize, 1);
+        DrawTextEx(editor_font, msg, 
+            (Vector2){
+                self->position.x + self->size.x/2 - size.x/2,
+                self->position.y + self->size.y/2 - size.y/2
+            }, 
+            fontSize, 1, TextColor);
+        return;
+    }
+
+    if (tree->root_index >= tree->count) {
+        return;
+    }
+
+    float y = self->position.y + 10 - state->scroll_offset;
+    float visible_top = self->position.y;
+    float visible_bottom = self->position.y + self->size.y;
+
+    RenderFileNode(self, tree, tree->root_index, state, self->position.x, &y, 0, fontSize + 4, visible_top, visible_bottom);
+}
+
+FileTree* CreateFileTree() {
+    FileTree* tree = calloc(1, sizeof(FileTree));
+    tree->capacity = 256;
+    tree->nodes = calloc(tree->capacity, sizeof(Node));
+    tree->count = 0;
+    return tree;
+}
+
+void FreeFileTree(FileTree* tree) {
+    if (!tree) return;
+    for (size_t i = 0; i < tree->count; i++) {
+        free(tree->nodes[i].path);
+        free(tree->nodes[i].name);
+        free(tree->nodes[i].children);
+    }
+    free(tree->nodes);
+    free(tree);
+}
+
+size_t AddNodeToTree(FileTree* tree, NodeType type, const char* path, const char* name) {
+    if (tree->count >= tree->capacity) {
+        size_t new_capacity = tree->capacity * 2;
+        Node* new_nodes = realloc(tree->nodes, sizeof(Node) * new_capacity);
+
+        if (!new_nodes) {
+            return SIZE_MAX;
+        }
+        tree->nodes = new_nodes;
+        tree->capacity = new_capacity;
+    }
+    
+    size_t index = tree->count++;
+    Node* node = &tree->nodes[index];
+    node->type = type;
+    node->path = strdup(path);
+    node->name = strdup(name);
+
+    if (!node->path || !node->name) {
+        free(node->path);
+        free(node->name);
+        tree->count--;
+        return SIZE_MAX;
+    }
+
+    node->path_length = strlen(path);
+    node->name_length = strlen(name);
+    node->children = NULL;
+    node->children_count = 0;
+    
+    return index;
+}
+
+void AddPendingDir(const char* path, size_t node_index) {
+    if (node_index == SIZE_MAX) return;
+
+    if (cache_manager.pending_count >= cache_manager.pending_capacity) {
+        size_t new_capacity = cache_manager.pending_capacity == 0 
+            ? 64 : cache_manager.pending_capacity * 2;
+        PendingDir* new_dirs = realloc(cache_manager.pending_dirs,
+            sizeof(PendingDir) * new_capacity);
+        if (!new_dirs) {
+            return;
+        }
+        cache_manager.pending_dirs = new_dirs;
+        cache_manager.pending_capacity = new_capacity;
+    }
+
+    char* path_copy = strdup(path);
+    if (!path_copy) {
+        return;
+    }
+    
+    cache_manager.pending_dirs[cache_manager.pending_count++] = (PendingDir){
+        .path = path_copy,
+        .index = node_index
+    };
+}
+
+void AddChildToTreeNode(FileTree* tree, size_t parent_index, size_t child_index) {
+    if (parent_index >= tree->count || child_index == SIZE_MAX) {
+        return;  // Invalid indices
+    }
+
+    Node* parent = &tree->nodes[parent_index];
+    size_t current_capacity = (parent->children_count == 0) ? 0 : 
+        ((parent->children_count - 1) / 16 + 1) * 16;
+    
+    if (parent->children_count >= current_capacity) {
+        size_t new_capacity = current_capacity + 16;
+        int* new_children = realloc(parent->children, sizeof(int) * new_capacity);
+        if (!new_children) {
+            return;
+        }
+        parent->children = new_children;
+    }
+
+    parent->children[parent->children_count++] = (int)child_index;
+}
+
+char* JoinPath(const char* base, const char* name) {
+    size_t base_len = strlen(base);
+    size_t name_len = strlen(name);
+    char* result = malloc(base_len + name_len + 2);
+    
+    strcpy(result, base);
+    #ifdef _WIN32
+        if (base[base_len - 1] != '\\' && base[base_len - 1] != '/') {
+            strcat(result, "\\");
+        }
+    #else
+        if (base[base_len - 1] != '/') {
+            strcat(result, "/");
+        }
+    #endif
+    strcat(result, name);
+    return result;
+}
+
+void ProcessSingleDirectory(const char* path, size_t dir_node_index) {
+    FileTree* tree = cache_manager.building;
+    if (!tree || dir_node_index >= tree->count) return;
+    
+#ifdef _WIN32
+    char search_path[MAX_PATH];
+    snprintf(search_path, MAX_PATH, "%s\\*", path);
+    
+    WIN32_FIND_DATAA find_data;
+    HANDLE find_handle = FindFirstFileA(search_path, &find_data);
+    
+    if (find_handle == INVALID_HANDLE_VALUE) return;
+    
+    do {
+        if (strcmp(find_data.cFileName, ".") == 0 || 
+            strcmp(find_data.cFileName, "..") == 0) continue;
+        
+        // Skip hidden files/folders and common large directories
+        if (find_data.cFileName[0] == '.') continue;
+        if (strcmp(find_data.cFileName, "node_modules") == 0) continue;
+        if (strcmp(find_data.cFileName, ".git") == 0) continue;
+        
+        char* full_path = JoinPath(path, find_data.cFileName);
+        size_t child_index;
+        
+        if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            child_index = AddNodeToTree(tree, TYPE_DIR, full_path, find_data.cFileName);
+            if (child_index != SIZE_MAX) {
+                AddPendingDir(full_path, child_index);
+            }
+        } else {
+            child_index = AddNodeToTree(tree, TYPE_FILE, full_path, find_data.cFileName);
+        }
+        if (child_index != SIZE_MAX) {
+            AddChildToTreeNode(tree, dir_node_index, child_index);
+        }
+        
+        free(full_path);
+        
+    } while (FindNextFileA(find_handle, &find_data));
+    
+    FindClose(find_handle);
+    
+#else
+    DIR* dir = opendir(path);
+    if (!dir) return;
+    
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || 
+            strcmp(entry->d_name, "..") == 0) continue;
+        
+        // Skip hidden and common large directories
+        if (entry->d_name[0] == '.') continue;
+        if (strcmp(entry->d_name, "node_modules") == 0) continue;
+        
+        char* full_path = JoinPath(path, entry->d_name);
+        struct stat entry_stat;
+        
+        if (stat(full_path, &entry_stat) == 0) {
+            size_t child_index;
+            
+            if (S_ISDIR(entry_stat.st_mode)) {
+                child_index = AddNodeToTree(tree, TYPE_DIR, full_path, entry->d_name);
+                AddPendingDir(full_path, child_index);
+            } else {
+                child_index = AddNodeToTree(tree, TYPE_FILE, full_path, entry->d_name);
+            }
+            
+            AddChildToTreeNode(tree, dir_node_index, child_index);
+        }
+        free(full_path);
+    }
+    closedir(dir);
+#endif
+}
+
+void LogFileTreeNode(size_t node_index, int depth) {
+    if (node_index >= cache_manager.active->count) return;  // FIXED: was file_cache_size
+    
+    Node* node = &cache_manager.active->nodes[node_index];
+    
+    char indent[256] = {0};
+    for (int i = 0; i < depth && i < 127; i++) {
+        strcat(indent, "  ");
+    }
+    
+    const char* prefix = (node->type == TYPE_DIR) ? "[DIR] " : "[FILE]";
+    
+    TraceLog(LOG_INFO, "%s%s %s", indent, prefix, node->name);
+    
+    if (node->type == TYPE_DIR) {
+        for (size_t i = 0; i < node->children_count; i++) {
+            LogFileTreeNode(node->children[i], depth + 1);
+        }
+    }
+}
+
+void LogFileTree() {
+    if (cache_manager.active == NULL || cache_manager.active->count == 0) {
+        TraceLog(LOG_WARNING, "File cache is empty");
+        return;
+    }
+    
+    TraceLog(LOG_INFO, "========== FILE TREE ==========");
+    LogFileTreeNode(cache_manager.active->root_index, 0);
+    TraceLog(LOG_INFO, "===============================");
+    TraceLog(LOG_INFO, "Total nodes: %zu", cache_manager.active->count);  // FIXED: was file_cache_size
+}
+
+void UpdateFileCache() {
+    double current_time = GetTime();
+    
+    if (!cache_manager.rebuild_in_progress && 
+        (current_time - cache_manager.last_scan_time > cache_manager.scan_interval || cache_manager.active == NULL)) {
+        cache_manager.rebuild_requested = true;
+    }
+    
+    if (cache_manager.rebuild_requested && !cache_manager.rebuild_in_progress) {
+        cache_manager.rebuild_requested = false;
+        cache_manager.rebuild_in_progress = true;
+        
+        if (cache_manager.building) {
+            FreeFileTree(cache_manager.building);
+        }
+        cache_manager.building = CreateFileTree();
+
+        if (!cache_manager.building) {
+            cache_manager.rebuild_in_progress = false;
+            return;
+        }
+    
+        for (int i = 0; i < cache_manager.pending_count; i++) {
+            if (cache_manager.pending_dirs[i].path) {
+                free(cache_manager.pending_dirs[i].path);
+            }
+        }
+        cache_manager.pending_count = 0;
+        
+        const char* name = strrchr(root_path, '/');
+        #ifdef _WIN32
+            const char* name_win = strrchr(root_path, '\\');
+            if (name_win > name) name = name_win;
+        #endif
+        name = name ? name + 1 : root_path;
+        
+        cache_manager.building->root_index = AddNodeToTree(
+            cache_manager.building, TYPE_DIR, root_path, name);
+        if (cache_manager.building->root_index == SIZE_MAX) {
+            FreeFileTree(cache_manager.building);
+            cache_manager.building = NULL;
+            cache_manager.rebuild_in_progress = false;
+            return;
+        }
+        AddPendingDir(root_path, cache_manager.building->root_index);
+    }
+    
+    if (cache_manager.rebuild_in_progress) {
+        size_t dirs_to_process = cache_manager.dirs_per_frame;
+        
+        while (dirs_to_process > 0 && cache_manager.pending_count > 0) {
+            PendingDir entry = cache_manager.pending_dirs[--cache_manager.pending_count];
+            
+            ProcessSingleDirectory(entry.path, entry.index);
+            free(entry.path);
+            dirs_to_process--;
+        }
+        
+        if (cache_manager.pending_count == 0) {
+            cache_manager.rebuild_in_progress = false;
+            cache_manager.last_scan_time = current_time;
+            
+            FileTree* old = cache_manager.active;
+            cache_manager.active = cache_manager.building;
+            cache_manager.building = NULL;
+            
+            FreeFileTree(old);
+        }
+    }
+}
 
 void InitUndoStack()  {
     undoStack.capacity = 10000;
@@ -1162,18 +1785,71 @@ void MoveWordLeft() {
     }
 }
 
+void InsurePaddingModal(void* modal) {
+    Modal* self = (Modal*)modal;
+    int screen_width = GetScreenWidth();
+    int screen_height = GetScreenHeight();
+
+    self->size.x = min(screen_width - self->padding.x, self->wanted_size.x);
+    self->size.y = min(screen_height - self->padding.y, self->wanted_size.y);
+}
+
+void CenterModal(void* modal) {
+    Modal* self = (Modal*)modal;
+    int screen_width = GetScreenWidth();
+    int screen_height = GetScreenHeight();
+
+    self->position.x = screen_width / 2.0f - self->size.x / 2.0f;
+    self->position.y = screen_height / 2.0f - self->size.y / 2.0f;
+}
+
+void BeginRenderModal(Modal* modal) {
+    for (int i = 0; i < modal->layout_count; i++) {
+        modal->layouts[i](modal);
+    }
+    BeginScissorMode(modal->position.x, modal->position.y, modal->size.x, modal->size.y);
+    DrawRectangle(modal->position.x, modal->position.y, modal->size.x, modal->size.y, modal->background_color);
+}
+
+void EndRenderModal(Modal* _modal) {
+    EndScissorMode();
+}
+void RenderModal(Modal* modal) {
+    BeginRenderModal(modal);
+    if (modal->render) {
+        modal->render(modal); 
+    }
+    EndRenderModal(modal);
+}
+
+void DebugModal(void* modal) {
+    Modal* self = (Modal*)modal;
+}
+
 int main(int argc, char** argv) {
+        size_t org_buffer_length = 0;
 
-    size_t org_buffer_length = 0;
-
-    if (argc >= 2) {
-        org_buffer = load_file(argv[1], &org_buffer_length);
-        if (!org_buffer) {
-            fprintf(stderr, "Failed to load file, using default text.\n");
+        if (argc >= 2) {
+            struct stat path_stat;
+            if (stat(argv[1], &path_stat) != 0) {
+            fprintf(stderr, "Failed to access path: %s\n", argv[1]);
             org_buffer = strdup("");
+            org_buffer_length = 0;
+        } else if (S_ISDIR(path_stat.st_mode)) {
+            fprintf(stderr, "Directory detected: %s\n", argv[1]);
+            root_path = argv[1];
+            UpdateFileCache();
+            org_buffer = strdup("");
+            org_buffer_length = 0;
+        } else if (S_ISREG(path_stat.st_mode)) {
+            org_buffer = load_file(argv[1], &org_buffer_length);
+            if (!org_buffer) {
+                fprintf(stderr, "Failed to load file, using default text.\n");
+                org_buffer = strdup("");
+                org_buffer_length = 0;
+            }
+            normalize_line_endings(org_buffer);
         }
-        org_buffer_length = strlen(org_buffer);
-        normalize_line_endings(org_buffer);
     } else {
         org_buffer = strdup("");
         org_buffer_length = strlen(org_buffer);
@@ -1186,19 +1862,43 @@ int main(int argc, char** argv) {
     pieces[0].length = strlen(org_buffer);
     piece_count = 1;
 
-
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     InitWindow(1200, 700, "Fun Editor");
+    MaximizeWindow();
+    
     SetTargetFPS(60); 
     SetExitKey(KEY_NULL);
     
     editor_font = LoadFontEx("Input.ttf", fontSize, 0, 250);
 
+    FileBrowserState browser_state = {0};
+    Modal file_browser_modal = {
+        .position = {0, 0},
+        .size = {0, 0},
+        .wanted_size = {800, 1000},
+        .padding = {50, 50},
+        .background_color = {40, 42, 48, 255},
+        .layouts = (Layout[]){InsurePaddingModal, CenterModal},
+        .layout_count = 2,
+        .render = RenderFileBrowser,
+        .input = InputFileBrowser,
+        .state = &browser_state
+    };
+
+    LogFileTree();
+
     while (!WindowShouldClose() && !exit_requested) {
+        if (root_path) {
+            UpdateFileCache();  // Process incremental rebuild
+        }
+
         size_t screenWidth = GetScreenWidth();
         size_t screenHeight = GetScreenHeight();
-
-        if (!is_command_mode) {
+        if (modal) {
+            if (modal->input) {
+                modal->input(modal);
+            }
+        } else if (!is_command_mode) {
             bool shift = IsKeyDown(KEY_LEFT_SHIFT);
             bool control = IsKeyDown(KEY_LEFT_CONTROL);
             int pointer_position_before = pointerPosition;
@@ -1309,6 +2009,10 @@ int main(int argc, char** argv) {
                 if (IsKeyPressed(KEY_X)) {
                     Cut();
                 }
+
+                if (IsKeyPressed(KEY_SPACE)) {
+                    modal = &file_browser_modal;
+                }
             } else {
                 int key = GetCharPressed();
                 while (key > 0) {
@@ -1381,6 +2085,11 @@ int main(int argc, char** argv) {
         RenderMode();
         RenderTextField(0, mode_padding * 2 + fontSize, screenWidth - 40, screenHeight - (mode_padding * 2 + fontSize * 2 + command_padding * 2));
         RenderCommand(command_padding, screenHeight - command_padding - fontSize);
+        
+        if (modal) {
+            RenderModal(modal);
+        }
+        
         EndDrawing();
     }
 
