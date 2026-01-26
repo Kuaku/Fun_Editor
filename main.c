@@ -788,6 +788,10 @@ Editor CreateEditor(EditorSettings settings, char* path) {
     return editor;
 }
 
+TextBuffer* GetActiveBuffer(Editor* editor) {
+    return &editor->state.text_buffers[editor->state.open_text_buffer_index];
+}
+
 void ClearEditor(Editor* editor) {
     if (!editor) return;
 
@@ -846,7 +850,7 @@ void MovePointerDown(TextBuffer* buffer) {
 }
 
 void MovePointerAction(Editor* editor, void(*move_function)(TextBuffer* buffer)) {
-    TextBuffer* buffer = &editor->state.text_buffers[editor->state.open_text_buffer_index];
+    TextBuffer* buffer = GetActiveBuffer(editor);
     size_t pointer_before = buffer->pointer_position;
     move_function(buffer);
     if (buffer->pointer_position != pointer_before) {
@@ -854,7 +858,7 @@ void MovePointerAction(Editor* editor, void(*move_function)(TextBuffer* buffer))
     }
 }
 void MovePointerSelectionAction(Editor* editor, void(*move_function)(TextBuffer* buffer)) {
-    TextBuffer* buffer = &editor->state.text_buffers[editor->state.open_text_buffer_index];
+    TextBuffer* buffer = GetActiveBuffer(editor);
     size_t pointer_before = buffer->pointer_position;
     move_function(buffer);
     if (pointer_before != buffer->pointer_position) {
@@ -864,6 +868,185 @@ void MovePointerSelectionAction(Editor* editor, void(*move_function)(TextBuffer*
         }
         buffer->selection_end = buffer->pointer_position;
     }
+}
+
+size_t AppendAddBuffer(TextBuffer* buffer, char* value, size_t len) {
+    if (buffer->add_buffer_count + len >= buffer->add_buffer_capacity) {
+        buffer->add_buffer = (char*)realloc(buffer->add_buffer, buffer->add_buffer_capacity * 2 * sizeof(char));
+        buffer->add_buffer_capacity *= 2;
+    }
+
+    size_t index = buffer->add_buffer_count;
+    
+    memcpy(&buffer->add_buffer[buffer->add_buffer_count], value, len);
+
+    buffer->add_buffer_count += len;
+    
+    return index;
+}
+
+void InsertString(TextBuffer* buffer, size_t position, char* value, size_t len) {
+    // TODO: Use memove and inplace to make this function O(n) for the insertion!
+    size_t new_start = AppendAddBuffer(buffer, value, len);
+
+    Piece new_piece = {ADD, new_start, len};
+
+    Piece* new_pieces = malloc((buffer->piece_count + 2) * sizeof(Piece));
+    size_t new_count = 0; 
+    size_t current_pos = 0;
+    bool inserted = false;
+
+    if (buffer->piece_count == 0) {
+        new_pieces[new_count++] = new_piece;
+        inserted = true;
+    }
+
+    for(size_t i = 0; i < buffer->piece_count; i++) {
+        Piece p = buffer->pieces[i];
+        if (current_pos + p.length < position) {
+            new_pieces[new_count++] = p;
+            current_pos += p.length;
+        } else {
+            size_t offset = position - current_pos;
+            if (offset > 0) {
+                Piece left = p;
+                left.length = offset;
+                new_pieces[new_count++] = left;
+            }
+
+            new_pieces[new_count++] = new_piece;
+            inserted = true;
+
+            if (offset < p.length) {
+                Piece right = p;
+                right.start += offset;
+                right.length -= offset;
+                new_pieces[new_count++] = right;
+            }    
+
+            for (size_t j = i + 1; j < buffer->piece_count; j++) {
+                new_pieces[new_count++] = buffer->pieces[j];
+            }
+            break;
+        }
+    }
+
+    if (!inserted) {
+        new_pieces[new_count++] = new_piece;
+    }
+
+    if (new_count > buffer->piece_capacity) {
+        buffer->piece_capacity = new_count * 2;
+        buffer->pieces = realloc(buffer->pieces, buffer->piece_capacity * sizeof(Piece));
+    }
+
+    memcpy(buffer->pieces, new_pieces, sizeof(Piece) * new_count);
+    buffer->piece_count = new_count;
+    free(new_pieces);
+
+    buffer->line_cache.is_valid = false;
+}
+
+bool RemoveCharacter(TextBuffer* buffer, size_t position) {
+    if (position > 0) {
+        Piece* new_pieces = malloc((buffer->piece_count + 1) * sizeof(Piece));
+        int new_count = 0;
+        size_t current_pos = 0;
+
+        position--;
+
+        for (size_t i = 0; i < buffer->piece_count; ++i) {
+            Piece p = buffer->pieces[i];
+
+            if (current_pos + p.length <= position) {
+                new_pieces[new_count++] = p;
+                current_pos += p.length;
+            } else if (position >= current_pos && position < current_pos + p.length) {
+                size_t local_offset = position - current_pos;
+
+                if (local_offset > 0) {
+                    Piece left = p;
+                    left.length = local_offset;
+                    new_pieces[new_count++] = left;
+                }
+
+                if (local_offset + 1 < p.length) {
+                    Piece right = p;
+                    right.start += local_offset + 1;
+                    right.length -= local_offset + 1;
+                    new_pieces[new_count++] = right;
+                }
+
+                current_pos += p.length;
+            } else {
+                new_pieces[new_count++] = p;
+                current_pos += p.length;
+            }
+        }
+
+        if (new_count > buffer->piece_capacity) {
+            buffer->piece_capacity = new_count * 2;
+            buffer->pieces = realloc(buffer->pieces, buffer->piece_capacity * sizeof(Piece));
+        }
+        memcpy(buffer->pieces, new_pieces, sizeof(Piece) * new_count);
+        buffer->piece_count = new_count;
+        buffer->line_cache.is_valid = false;
+        return true;
+    }
+    return false;
+}
+
+void ExecuteDelete(TextBuffer* buffer, size_t position, size_t length) {
+    for (size_t i = 0; i < length; ++i) {
+        RemoveCharacter(buffer, position + 1);
+    }
+    buffer->pointer_position = position;
+}
+
+
+void RemoveArea(TextBuffer* buffer, size_t position, size_t length) {
+    //char* deleted_text = GetTextRange(position, position + length);
+    //PushCommand(EDIT_DELETE, position, deleted_text, length);
+    ExecuteDelete(buffer, position, length);
+}
+
+void RemoveSelection(TextBuffer* buffer) {
+    size_t selection_length = abs((int)(buffer->selection_end) - (int)(buffer->selection_start));
+    RemoveArea(buffer, min(buffer->selection_start, buffer->selection_end), selection_length);
+    buffer->has_selection = false;
+}
+
+void InsertStringAction(Editor* editor, char* value, size_t len) {
+    TextBuffer* buffer = GetActiveBuffer(editor);
+    if (buffer->has_selection) {
+        RemoveSelection(buffer);
+    }
+    InsertString(buffer, buffer->pointer_position, value, len);
+    buffer->pointer_position += len;
+}
+
+void RemoveBackwardsAction(Editor* editor) {
+    TextBuffer* buffer = GetActiveBuffer(editor);
+    if (buffer->has_selection) {
+        RemoveSelection(buffer);
+    } else {
+        if (RemoveCharacter(buffer, buffer->pointer_position)) {
+            buffer->pointer_position--;
+        }
+    }
+}
+
+void InsertNewLineAction(Editor* editor) {
+    char new_line_buffer[1];
+    new_line_buffer[0] = '\n';
+    InsertStringAction(editor, new_line_buffer, 1);
+}
+
+void InsertTabAction(Editor* editor) {
+    char tab_buffer[2];
+    tab_buffer[0] = ' ';
+    tab_buffer[1] = ' ';
+    InsertStringAction(editor, tab_buffer, 2);
 }
 
 void DispatchInput(Editor* editor, Action action){
@@ -893,6 +1076,18 @@ void DispatchInput(Editor* editor, Action action){
     case ACTION_SELECT_UP:
         MovePointerSelectionAction(editor, MovePointerUp);
         break; 
+    case ACTION_INSERT_CHAR:
+        InsertStringAction(editor, action.text_buffer, action.length);
+        break;
+    case ACTION_DELETE_BACKWARD:
+        RemoveBackwardsAction(editor);
+        break;
+    case ACTION_INSERT_NEWLINE:
+        InsertNewLineAction(editor);
+        break;
+    case ACTION_INSERT_TAB:
+        InsertTabAction(editor);
+        break;
     default:
         TraceLog(LOG_INFO, "ActionType: %s is not implemented", ActionTypeToString(action.type));
     }
