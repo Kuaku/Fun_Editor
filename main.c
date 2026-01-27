@@ -563,7 +563,7 @@ void RebuildLineCache(TextBuffer* buffer) {
         for (size_t j = 0; j < buffer->pieces[i].length; ++j) {
             if (work_buffer[buffer->pieces[i].start + j] == '\n') {
                 
-                if (buffer->line_cache.line_count + 1 >= buffer->line_cache.capacity) {
+                while (buffer->line_cache.line_count + 1 >= buffer->line_cache.capacity) {
                     buffer->line_cache.capacity *= 2;
                     buffer->line_cache.line_positions = realloc(buffer->line_cache.line_positions, buffer->line_cache.capacity * sizeof(Position));
                 }
@@ -825,7 +825,7 @@ void ResizeTextBuffers(EditorState* state) {
 
 size_t GetFreeTextBufferIndex(EditorState* state) {
     size_t index = state->text_buffers_count++;
-    if (index >= state->text_buffers_capacity) {
+    while (index >= state->text_buffers_capacity) {
         ResizeTextBuffers(state);
     }
     return index;
@@ -1039,7 +1039,7 @@ void MovePointerSelectionAction(Editor* editor, void(*move_function)(TextBuffer*
 }
 
 size_t AppendAddBuffer(TextBuffer* buffer, char* value, size_t len) {
-    if (buffer->add_buffer_count + len >= buffer->add_buffer_capacity) {
+    while (buffer->add_buffer_count + len >= buffer->add_buffer_capacity) {
         buffer->add_buffer = (char*)realloc(buffer->add_buffer, buffer->add_buffer_capacity * 2 * sizeof(char));
         buffer->add_buffer_capacity *= 2;
     }
@@ -1103,7 +1103,7 @@ void InsertString(TextBuffer* buffer, size_t position, char* value, size_t len) 
         new_pieces[new_count++] = new_piece;
     }
 
-    if (new_count > buffer->piece_capacity) {
+    while (new_count > buffer->piece_capacity) {
         buffer->piece_capacity = new_count * 2;
         buffer->pieces = realloc(buffer->pieces, buffer->piece_capacity * sizeof(Piece));
     }
@@ -1152,7 +1152,7 @@ bool RemoveCharacter(TextBuffer* buffer, size_t position) {
             }
         }
 
-        if (new_count > buffer->piece_capacity) {
+        while (new_count > buffer->piece_capacity) {
             buffer->piece_capacity = new_count * 2;
             buffer->pieces = realloc(buffer->pieces, buffer->piece_capacity * sizeof(Piece));
         }
@@ -1174,6 +1174,8 @@ void ExecuteDelete(TextBuffer* buffer, size_t position, size_t length) {
 void RemoveArea(TextBuffer* buffer, size_t position, size_t length) {
     char* deleted_text = GetTextRange(buffer, position, position + length);
     PushCommand(buffer, EDIT_DELETE, position, deleted_text, length);
+    free(deleted_text);
+
     ExecuteDelete(buffer, position, length);
 }
 
@@ -1194,6 +1196,7 @@ void InsertStringAction(Editor* editor, char* value, size_t len) {
         memcpy(text, value, len);
         text[len] = '\0';
         PushCommand(buffer, EDIT_INSERT, buffer->pointer_position, text, len);
+        free(text);
     }
     InsertString(buffer, buffer->pointer_position, value, len);
     buffer->pointer_position += len;
@@ -1279,6 +1282,54 @@ void RedoAction(Editor* editor) {
     buffer->line_cache.is_valid = false;
 }
 
+void PasteAction(Editor* editor) {
+    TextBuffer* buffer = GetActiveBuffer(editor);
+    const char* clipboard_text = GetClipboardText();
+    if (clipboard_text == NULL || clipboard_text[0] == '\0') {
+        return;
+    }
+
+    if (buffer->has_selection) {
+        RemoveSelection(buffer);
+    }
+    
+    size_t clipboard_length = strlen(clipboard_text);
+    char* paste_buffer = malloc(clipboard_length + 1);
+    if (paste_buffer == NULL) {
+        return;
+    }
+    strcpy(paste_buffer, clipboard_text);
+
+    normalize_line_endings(paste_buffer);
+    size_t paste_buffer_length = strlen(paste_buffer);
+
+    PushCommand(buffer, EDIT_INSERT, buffer->pointer_position, paste_buffer, paste_buffer_length);
+
+    InsertString(buffer, buffer->pointer_position, paste_buffer, paste_buffer_length);
+    buffer->pointer_position += paste_buffer_length;
+    
+    free(paste_buffer);
+}
+
+void CopyAction(Editor* editor) {
+    TextBuffer* buffer = GetActiveBuffer(editor);
+    if (!buffer->has_selection) return;
+    size_t selection_length = abs((int)buffer->selection_end - (int)buffer->selection_start);
+    char* selection_buffer = GetTextRange(buffer, min(buffer->selection_start, buffer->selection_end), min(buffer->selection_start, buffer->selection_end) + selection_length);
+
+    SetClipboardText(selection_buffer);
+
+    free(selection_buffer);
+}
+
+void CutAction(Editor* editor) {
+    TextBuffer* buffer = GetActiveBuffer(editor);
+    if (!buffer->has_selection) return;
+
+    CopyAction(editor);
+    RemoveSelection(buffer);
+}
+
 void DispatchInputTextMode(Editor* editor, Action action){
     switch (action.type)
     {
@@ -1335,6 +1386,15 @@ void DispatchInputTextMode(Editor* editor, Action action){
         break;
     case ACTION_REDO:
         RedoAction(editor);
+        break;
+    case ACTION_PASTE:
+        PasteAction(editor);
+        break;
+    case ACTION_COPY:
+        CopyAction(editor);
+        break;
+    case ACTION_CUT:
+        CutAction(editor);
         break;
     default:
         TraceLog(LOG_INFO, "ActionType: %s is not implemented", ActionTypeToString(action.type));
