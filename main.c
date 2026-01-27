@@ -427,6 +427,8 @@ typedef struct {
     size_t selection_start;
     size_t selection_end;
 
+    double time_since_last_edit;
+
     Position pointer_position_cache;
     size_t last_pointer_position_cached;
     bool request_revalidate_pointer_cache;
@@ -441,6 +443,111 @@ size_t GetTextSize(TextBuffer* buffer) {
         out += buffer->pieces[i].length;
     }
     return out;
+}
+
+void PushCommand(TextBuffer* buffer, EditType type, size_t position, const char* text, size_t length) {
+    UndoStack* stack = &buffer->undo_stack;
+    for (size_t i = stack->current; i < stack->count; i++) {
+        ClearEditEntry(&stack->entries[i]);      
+    }
+    stack->count = stack->current;
+
+    if (stack->count >= stack->capacity) {
+        ClearEditEntry(&stack->entries[0]);
+        memmove(stack->entries, stack->entries + 1, (stack->capacity - 1) * sizeof(EditEntry));
+        stack->count--;
+    }
+    
+    EditEntry* entry = &stack->entries[stack->count];
+    entry->type = type;
+    entry->position = position;
+    entry->length = length;
+    entry->cursor_before = buffer->pointer_position;
+    switch (entry->type)
+    {
+        case EDIT_INSERT:
+            entry->cursor_after = buffer->pointer_position + entry->length;
+            break;
+        case EDIT_DELETE:
+            entry->cursor_after = buffer->pointer_position - entry->length;
+            break;
+    }
+
+    if (text && length > 0) {
+        entry->text = malloc(length + 1);
+        memcpy(entry->text, text, length);
+        entry->text[length] = '\0';
+    } else {
+        entry->text = NULL;
+    }
+
+    stack->count++;
+    stack->current = stack->count;
+}
+
+char GetCharAt(TextBuffer* buffer, size_t position) {
+    size_t traversed = 0;
+    char* work_buffer;
+    
+    for (size_t i = 0; i < buffer->piece_count; i++) {
+        work_buffer = buffer->pieces[i].source == ORIGINAL ? buffer->org_buffer : buffer->add_buffer;
+        
+        if (traversed + buffer->pieces[i].length > position) {
+            size_t offset = position - traversed;
+            return work_buffer[buffer->pieces[i].start + offset];
+        }
+        
+        traversed += buffer->pieces[i].length;
+    }
+    
+    return '\0'; 
+}
+
+bool TryToMergeCharacterRemove(TextBuffer* buffer, float current_time) {
+    UndoStack* stack = &buffer->undo_stack;
+    if (stack->current > 0 && current_time - buffer->time_since_last_edit < 1.0) {
+        EditEntry* prev = &stack->entries[stack->current - 1];
+        if (prev->type == EDIT_DELETE && prev->position == buffer->pointer_position) {
+            char deleted = GetCharAt(buffer, buffer->pointer_position - 1);
+
+            char* new_text = malloc(prev->length + 2);
+            new_text[0] = deleted;
+            memcpy(new_text + 1, prev->text, prev->length);
+            new_text[prev->length + 1] = '\0';
+
+            free(prev->text);
+            prev->text = new_text;
+            prev->length++;
+            prev->position--;
+            prev->cursor_after = buffer->pointer_position - 1;
+            
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TryToMergeCharacterInsert(TextBuffer* buffer, char* value, size_t len, float current_time) {
+    UndoStack* stack = &buffer->undo_stack;
+    if (stack->current > 0 && current_time - buffer->time_since_last_edit < 1.0) {
+        EditEntry* prev = &stack->entries[stack->current - 1];
+        if (prev->type == EDIT_INSERT && 
+            prev->position + prev->length == buffer->pointer_position &&
+            memchr(value, '\n', len) == NULL) {
+            
+            char* new_text = realloc(prev->text, prev->length + len + 1);
+            if (!new_text) {
+                return false;
+            }
+            memcpy(new_text + prev->length, value, len);
+            new_text[prev->length + len] = '\0';
+            prev->text = new_text;
+            prev->length += len;
+            prev->cursor_after = buffer->pointer_position + len;
+            return true;
+        }
+    }
+    return false;
 }
 
 void RebuildLineCache(TextBuffer* buffer) {
@@ -487,12 +594,23 @@ void InitTextBuffer(TextBuffer* buffer) {
     buffer->pointer_position_cache = (Position){0, 0};
     buffer->last_pointer_position_cached = 0;
     buffer->request_revalidate_pointer_cache = false;
+    buffer->time_since_last_edit = 0;
 
     buffer->selection_start = 0;
     buffer->selection_end = 0;
     buffer->has_selection = false;
 
     buffer->undo_stack = InitUndoStack();
+}
+
+char* GetTextRange(TextBuffer* buffer, size_t start, size_t end) {
+    size_t length = end - start;
+    char* result = malloc(length + 1);
+    for (size_t i = 0; i < length; i++) {
+        result[i] = GetCharAt(buffer, start + i);
+    }
+    result[length] = '\0';
+    return result;
 }
 
 void InitPieceBuffer(TextBuffer* buffer) {
@@ -849,8 +967,58 @@ void MovePointerDown(TextBuffer* buffer) {
     }
 }
 
+bool IsWordChar(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+bool IsPunct(char c) {
+    return c && !IsWordChar(c) && c != ' ' && c != '\t' && c != '\n';
+}
+
+void MovePointerWordRight(TextBuffer* buffer) {
+    size_t size = GetTextSize(buffer);
+    if (buffer->pointer_position >= size) return;
+    char c = GetCharAt(buffer, buffer->pointer_position);
+    
+    if (c == '\n') {
+        buffer->pointer_position++;
+        return;
+    }
+    
+    if (IsWordChar(c)) {
+        while (buffer->pointer_position < size && IsWordChar(GetCharAt(buffer, buffer->pointer_position))) buffer->pointer_position++;
+    } else if (IsPunct(c)) {
+        while (buffer->pointer_position < size && IsPunct(GetCharAt(buffer, buffer->pointer_position))) buffer->pointer_position++;
+    } else {
+        while (buffer->pointer_position < size && (c = GetCharAt(buffer, buffer->pointer_position), c == ' ' || c == '\t')) buffer->pointer_position++;
+        if (buffer->pointer_position < size && GetCharAt(buffer, buffer->pointer_position) == '\n') return;
+        while (buffer->pointer_position < size && IsPunct(GetCharAt(buffer, buffer->pointer_position))) buffer->pointer_position++;
+    }
+}
+
+void MovePointerWordLeft(TextBuffer* buffer) {
+    size_t size = GetTextSize(buffer);
+    if (buffer->pointer_position == 0) return;
+    buffer->pointer_position--;
+    
+    char c = GetCharAt(buffer, buffer->pointer_position);
+    if (c == '\n') return;
+    
+    while (buffer->pointer_position > 0 && (c = GetCharAt(buffer, buffer->pointer_position), c == ' ' || c == '\t')) {
+        if (GetCharAt(buffer, buffer->pointer_position - 1) == '\n') return;
+        buffer->pointer_position--;
+    }
+    
+    c = GetCharAt(buffer, buffer->pointer_position);
+    if (IsWordChar(c)) {
+        while (buffer->pointer_position > 0 && IsWordChar(GetCharAt(buffer, buffer->pointer_position - 1))) buffer->pointer_position--;
+    } else if (IsPunct(c)) {
+        while (buffer->pointer_position > 0 && IsPunct(GetCharAt(buffer, buffer->pointer_position - 1))) buffer->pointer_position--;
+    }
+}
+
 void MovePointerAction(Editor* editor, void(*move_function)(TextBuffer* buffer)) {
-    TextBuffer* buffer = GetActiveBuffer(editor);
+    TextBuffer* buffer = GetActiveBuffer(editor); 
     size_t pointer_before = buffer->pointer_position;
     move_function(buffer);
     if (buffer->pointer_position != pointer_before) {
@@ -1003,10 +1171,9 @@ void ExecuteDelete(TextBuffer* buffer, size_t position, size_t length) {
     buffer->pointer_position = position;
 }
 
-
 void RemoveArea(TextBuffer* buffer, size_t position, size_t length) {
-    //char* deleted_text = GetTextRange(position, position + length);
-    //PushCommand(EDIT_DELETE, position, deleted_text, length);
+    char* deleted_text = GetTextRange(buffer, position, position + length);
+    PushCommand(buffer, EDIT_DELETE, position, deleted_text, length);
     ExecuteDelete(buffer, position, length);
 }
 
@@ -1021,8 +1188,16 @@ void InsertStringAction(Editor* editor, char* value, size_t len) {
     if (buffer->has_selection) {
         RemoveSelection(buffer);
     }
+    double current_time = GetTime();
+    if (!TryToMergeCharacterInsert(buffer, value, len, current_time)) {
+        char* text = malloc(len + 1);
+        memcpy(text, value, len);
+        text[len] = '\0';
+        PushCommand(buffer, EDIT_INSERT, buffer->pointer_position, text, len);
+    }
     InsertString(buffer, buffer->pointer_position, value, len);
     buffer->pointer_position += len;
+    buffer->time_since_last_edit = current_time;
 }
 
 void RemoveBackwardsAction(Editor* editor) {
@@ -1030,9 +1205,19 @@ void RemoveBackwardsAction(Editor* editor) {
     if (buffer->has_selection) {
         RemoveSelection(buffer);
     } else {
+        if (buffer->pointer_position == 0) return;
+
+        double current_time = GetTime();
+
+        if (!TryToMergeCharacterRemove(buffer, current_time)) {
+            char deleted_char = GetCharAt(buffer, buffer->pointer_position - 1);
+            PushCommand(buffer, EDIT_DELETE, buffer->pointer_position - 1, &deleted_char, 1);
+        }
+
         if (RemoveCharacter(buffer, buffer->pointer_position)) {
             buffer->pointer_position--;
         }
+        buffer->time_since_last_edit = current_time;
     }
 }
 
@@ -1049,7 +1234,52 @@ void InsertTabAction(Editor* editor) {
     InsertStringAction(editor, tab_buffer, 2);
 }
 
-void DispatchInput(Editor* editor, Action action){
+void UndoAction(Editor* editor) {
+    TextBuffer* buffer = GetActiveBuffer(editor);
+    UndoStack* stack = &buffer->undo_stack;
+    if (stack->current == 0) return;
+
+    stack->current--;
+    EditEntry* entry = &stack->entries[stack->current];
+
+    switch (entry->type) 
+    {
+        case EDIT_INSERT:
+            ExecuteDelete(buffer, entry->position, entry->length);        
+            break;
+        case EDIT_DELETE:
+            InsertString(buffer, entry->position, entry->text, entry->length);
+            break;
+    }
+
+    buffer->pointer_position = entry->cursor_before;
+    buffer->line_cache.is_valid = false;
+}
+
+void RedoAction(Editor* editor) {
+    TextBuffer* buffer = GetActiveBuffer(editor);
+    UndoStack* stack = &buffer->undo_stack;
+    if (stack->current >= stack->count) return;
+    
+    EditEntry* entry = &stack->entries[stack->current];
+    
+    switch (entry->type) {
+        case EDIT_INSERT: {
+            InsertString(buffer, entry->position, entry->text, entry->length);
+            break;
+        }
+        case EDIT_DELETE: {
+            ExecuteDelete(buffer, entry->position, entry->length);
+            break;
+        }
+    }
+    
+    buffer->pointer_position = entry->cursor_after;
+    stack->current++;
+    buffer->line_cache.is_valid = false;
+}
+
+void DispatchInputTextMode(Editor* editor, Action action){
     switch (action.type)
     {
     case ACTION_CURSOR_LEFT:
@@ -1064,6 +1294,12 @@ void DispatchInput(Editor* editor, Action action){
     case ACTION_CURSOR_UP:
         MovePointerAction(editor, MovePointerUp);
         break;
+    case ACTION_CURSOR_WORD_RIGHT:
+        MovePointerAction(editor, MovePointerWordRight);
+        break;
+    case ACTION_CURSOR_WORD_LEFT:
+        MovePointerAction(editor, MovePointerWordLeft);
+        break;
     case ACTION_SELECT_LEFT:
         MovePointerSelectionAction(editor, MovePointerLeft);
         break;
@@ -1076,6 +1312,12 @@ void DispatchInput(Editor* editor, Action action){
     case ACTION_SELECT_UP:
         MovePointerSelectionAction(editor, MovePointerUp);
         break; 
+    case ACTION_SELECT_WORD_RIGHT:
+        MovePointerSelectionAction(editor, MovePointerWordRight);
+        break;
+    case ACTION_SELECT_WORD_LEFT:
+        MovePointerSelectionAction(editor, MovePointerWordLeft);
+        break;
     case ACTION_INSERT_CHAR:
         InsertStringAction(editor, action.text_buffer, action.length);
         break;
@@ -1088,6 +1330,12 @@ void DispatchInput(Editor* editor, Action action){
     case ACTION_INSERT_TAB:
         InsertTabAction(editor);
         break;
+    case ACTION_UNDO:
+        UndoAction(editor);
+        break;
+    case ACTION_REDO:
+        RedoAction(editor);
+        break;
     default:
         TraceLog(LOG_INFO, "ActionType: %s is not implemented", ActionTypeToString(action.type));
     }
@@ -1097,7 +1345,11 @@ void EditorHandleInput(Editor* editor) {
     Action action = InputSystemPoll(&editor->input_system);
 
     while (action.type != ACTION_NONE) {
-        DispatchInput(editor, action);
+        if (editor->input_system.current_mode == MODE_TEXT) {
+            DispatchInputTextMode(editor, action);
+        } else if (editor->input_system.current_mode == MODE_COMMAND) {
+            // TODO: Dispatch Command actions
+        }
         ClearAction(&action);
         action = InputSystemPoll(&editor->input_system);
     }
