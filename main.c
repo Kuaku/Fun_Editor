@@ -29,11 +29,13 @@
     #define max(a, b) ((a) > (b) ? (a) : (b))
 #endif
 #define BREAK_DOWN_RECT(rect) rect.position.x, rect.position.y, rect.size.x, rect.size.y
+#define ARRAY_LEN(arr) (sizeof(arr) / sizeof((arr)[0]))
 
 #define INITIAL_TEXT_BUFFER_CAPACITY 10
 #define INITIAL_ADD_BUFFER_CAPACITY 4096
 #define INITIAL_UNDO_STACK_CAPACITY 4096
 #define INITIAL_PIECE_BUFFER_CAPACITY 1024
+#define INITIAL_COMMAND_BUFFER_CAPACITY 1024
 
 typedef enum { ORIGINAL, ADD } BufferType;
 typedef enum { TYPE_DIR, TYPE_FILE, TYPE_ERROR } FileType;
@@ -72,7 +74,9 @@ typedef enum {
     ACTION_SEARCH,
     ACTION_QUIT,
     ACTION_CANCEL,
-    ACTION_OPEN_COMMAND_PALETTE
+    ACTION_OPEN_COMMAND_PALETTE,
+
+    ACTION_EXECUTE_COMMAND
 } ActionType;
 
 
@@ -176,9 +180,93 @@ static KeyBinding default_normal_bindings[] = {
     // Editor
     { KEY_ESCAPE, MODI_NONE, ACTION_CANCEL },
     { KEY_Q,      MODI_CTRL, ACTION_QUIT },
+
+    // Command
+    { KEY_P, MODI_CTRL, ACTION_OPEN_COMMAND_PALETTE}
 };
 
-#define ARRAY_LEN(arr) (sizeof(arr) / sizeof((arr)[0]))
+static KeyBinding default_command_bindings[] = {
+    { KEY_LEFT,  MODI_NONE,  ACTION_CURSOR_LEFT },
+    { KEY_RIGHT, MODI_NONE,  ACTION_CURSOR_RIGHT },
+
+    { KEY_BACKSPACE, MODI_NONE, ACTION_DELETE_BACKWARD },
+
+    { KEY_P, MODI_CTRL, ACTION_OPEN_COMMAND_PALETTE},
+
+    { KEY_ESCAPE, MODI_NONE, ACTION_CANCEL },
+
+    { KEY_ENTER,     MODI_NONE, ACTION_EXECUTE_COMMAND },
+};
+
+
+typedef struct {
+    char* command_buffer;
+    size_t command_buffer_capacity;
+
+
+    size_t pointer_position;
+} CommandSystem;
+
+CommandSystem InitCommandSystem() {
+    CommandSystem system;
+    system.command_buffer = calloc(INITIAL_COMMAND_BUFFER_CAPACITY, sizeof(char));
+    system.command_buffer_capacity = INITIAL_COMMAND_BUFFER_CAPACITY;
+    system.pointer_position = 0;
+
+    return system;
+}
+
+void CommandSystemInsertString(CommandSystem* system, char* value, size_t len) {
+    size_t command_buffer_length = strlen(system->command_buffer);
+    while (command_buffer_length + len >= system->command_buffer_capacity) {
+        system->command_buffer = realloc(system->command_buffer, system->command_buffer_capacity * 2 * sizeof(char));
+        system->command_buffer_capacity *= 2;
+    }
+    memmove(system->command_buffer + system->pointer_position + len, system->command_buffer + system->pointer_position, command_buffer_length - system->pointer_position + 1);
+    memcpy(system->command_buffer + system->pointer_position, value, len);
+    system->pointer_position += len;
+}
+
+void CommandSystemRemoveChar(CommandSystem* system) {
+    size_t command_buffer_length = strlen(system->command_buffer);
+    
+    if (system->pointer_position >= command_buffer_length) {
+        return;
+    }
+    
+    memmove(system->command_buffer + system->pointer_position,
+            system->command_buffer + system->pointer_position + 1,
+            command_buffer_length - system->pointer_position);
+}
+
+void CommandSystemBackspace(CommandSystem* system) {
+    if (system->pointer_position == 0) {
+        return;
+    }
+    
+    system->pointer_position--;
+    CommandSystemRemoveChar(system);
+}
+
+void MoveCommandPointerLeft(CommandSystem* system) {
+    if (system->pointer_position <= 0) return;
+    system->pointer_position--;
+}
+
+void MoveCommandPointerRight(CommandSystem* system) {
+    size_t command_buffer_length = strlen(system->command_buffer);
+    if (system->pointer_position >= command_buffer_length) return;
+    system->pointer_position++;
+}
+
+void ClearCommandSystem(CommandSystem* system) {
+    if (system->command_buffer) {
+        free(system->command_buffer);
+    }
+
+    system->command_buffer_capacity = 0;
+    system->pointer_position = 0;
+}
 
 typedef struct {
     EditorMode current_mode;
@@ -186,6 +274,7 @@ typedef struct {
     KeyBinding* bindings[MODE_COUNT];
     size_t binding_counts[MODE_COUNT];
     
+    CommandSystem command_system;
 } InputSystem;
 
 InputSystem InitInputSystem() {
@@ -195,6 +284,12 @@ InputSystem InitInputSystem() {
     sys.binding_counts[MODE_TEXT] = ARRAY_LEN(default_normal_bindings);
     sys.bindings[MODE_TEXT] = malloc(sizeof(default_normal_bindings));
     memcpy(sys.bindings[MODE_TEXT], default_normal_bindings, sizeof(default_normal_bindings));
+
+    sys.binding_counts[MODE_COMMAND] = ARRAY_LEN(default_command_bindings);
+    sys.bindings[MODE_COMMAND] = malloc(sizeof(default_command_bindings));
+    memcpy(sys.bindings[MODE_COMMAND], default_command_bindings, sizeof(default_command_bindings));
+    
+    sys.command_system = InitCommandSystem();
     return sys;
 }
 
@@ -301,6 +396,10 @@ char* LoadFile(const char* filename, size_t* out_len) {
     fclose(f);
     if (out_len) *out_len = len;
     return buf;
+}
+
+void ClearInputSystem(InputSystem* system) {
+    ClearCommandSystem(&system->command_system);   
 }
 
 typedef enum {
@@ -855,6 +954,7 @@ typedef struct {
     Color background_color;
     Color mode_color;
     Color text_color;
+    Color command_color;
     Color line_number_color;
 } ColorScheme;
 
@@ -915,6 +1015,7 @@ void ClearEditor(Editor* editor) {
 
     ClearEditorState(&editor->state);
     ClearEditorSettings(&editor->settings);
+    ClearInputSystem(&editor->input_system);
 }
 
 bool ShouldEditorClose(Editor* editor) {
@@ -1330,6 +1431,14 @@ void CutAction(Editor* editor) {
     RemoveSelection(buffer);
 }
 
+void ToggleCommandModeAction(Editor* editor) {
+    if (editor->input_system.current_mode == MODE_COMMAND) {
+        editor->input_system.current_mode = MODE_TEXT;
+    } else {
+        editor->input_system.current_mode = MODE_COMMAND;
+    }
+}
+
 void DispatchInputTextMode(Editor* editor, Action action){
     switch (action.type)
     {
@@ -1396,8 +1505,38 @@ void DispatchInputTextMode(Editor* editor, Action action){
     case ACTION_CUT:
         CutAction(editor);
         break;
+    case ACTION_OPEN_COMMAND_PALETTE:
+        ToggleCommandModeAction(editor);
     default:
-        TraceLog(LOG_INFO, "ActionType: %s is not implemented", ActionTypeToString(action.type));
+        TraceLog(LOG_INFO, "ActionType: %s is not implemented for Text Mode", ActionTypeToString(action.type));
+    }
+}
+
+void DispatchInputCommandMode(Editor* editor, Action action) {
+    switch (action.type)
+    {
+    case ACTION_OPEN_COMMAND_PALETTE:
+        ToggleCommandModeAction(editor);
+        break;
+    case ACTION_CANCEL:
+        ToggleCommandModeAction(editor);
+        break;
+    case ACTION_CURSOR_LEFT:
+        MoveCommandPointerLeft(&editor->input_system.command_system);
+        break;
+    case ACTION_CURSOR_RIGHT:
+        MoveCommandPointerRight(&editor->input_system.command_system);
+        break;
+    case ACTION_DELETE_BACKWARD:
+        CommandSystemBackspace(&editor->input_system.command_system);
+        break;
+    case ACTION_EXECUTE_COMMAND:
+        break;
+    case ACTION_INSERT_CHAR:
+        CommandSystemInsertString(&editor->input_system.command_system, action.text_buffer, action.length);
+        break;
+    default:
+        TraceLog(LOG_INFO, "ActionType: %s is not implemented for Command Mode", ActionTypeToString(action.type));
     }
 }
 
@@ -1408,7 +1547,7 @@ void EditorHandleInput(Editor* editor) {
         if (editor->input_system.current_mode == MODE_TEXT) {
             DispatchInputTextMode(editor, action);
         } else if (editor->input_system.current_mode == MODE_COMMAND) {
-            // TODO: Dispatch Command actions
+            DispatchInputCommandMode(editor, action);
         }
         ClearAction(&action);
         action = InputSystemPoll(&editor->input_system);
@@ -1525,6 +1664,26 @@ void RenderLine(Editor* editor, TextBuffer* buffer, int y_line, Position positio
     }
 }
 
+void EditorRenderCommand(Editor* editor) {
+    int screen_height = GetScreenHeight();
+    Position offset = (Position){editor->settings.command_padding.x, screen_height - editor->settings.command_padding.y - editor->settings.font_size};
+    DrawTextEx(editor->settings.editor_font, ":", (Vector2){offset.x, offset.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color); 
+    Vector2 offset_prefix = MeasureTextEx(editor->settings.editor_font, ":", editor->settings.font_size, 1); 
+    if (editor->input_system.current_mode != MODE_COMMAND) {
+        DrawTextEx(editor->settings.editor_font, editor->input_system.command_system.command_buffer, (Vector2){offset.x + offset_prefix.x, offset.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);    
+    } else {
+        char* temp;
+        temp = calloc(editor->input_system.command_system.pointer_position + 1, sizeof(char));
+        strncpy(temp, editor->input_system.command_system.command_buffer, editor->input_system.command_system.pointer_position);
+        DrawTextEx(editor->settings.editor_font, temp, (Vector2){offset.x + offset_prefix.x, offset.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);
+        Vector2 offset_first_part = MeasureTextEx(editor->settings.editor_font, temp, editor->settings.font_size, 1);
+        DrawRectangle(offset.x + offset_prefix.x + offset_first_part.x + editor->settings.pointer_padding.x, offset.y + editor->settings.pointer_padding.y, editor->settings.pointer_width, editor->settings.font_size - editor->settings.pointer_padding.y * 2, WHITE);
+        char* last_part = editor->input_system.command_system.command_buffer + editor->input_system.command_system.pointer_position;
+        DrawTextEx(editor->settings.editor_font, last_part, (Vector2){offset.x + offset_prefix.x + offset_first_part.x + editor->settings.pointer_padding.x * 2 + editor->settings.pointer_width, offset.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);
+        free(temp);
+    }
+}
+
 void EditorRenderTextBuffer(Editor* editor, Rect render_field) {
     TextBuffer* buffer = &editor->state.text_buffers[editor->state.open_text_buffer_index]; 
     Position pointer = GetPointerPosition(buffer);
@@ -1615,6 +1774,7 @@ void EditorRender(Editor* editor) {
     ClearBackground(editor->settings.scheme.background_color);
     EditorRenderMode(editor);
     EditorRenderTextField(editor, GetEditorTextFieldSize(editor));
+    EditorRenderCommand(editor);
 }
 
 void SetupWindow() {
@@ -1633,6 +1793,7 @@ int main(int argc, char** argv) {
         .background_color = (Color){32, 35, 41, 255},
         .mode_color = WHITE,
         .text_color = WHITE,
+        .command_color = WHITE,
         .line_number_color = YELLOW
     };
 
