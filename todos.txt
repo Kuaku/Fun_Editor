@@ -13,7 +13,7 @@
 11. Bracket Matching                    [ ]
 12. Comment Toggle                      [ ]
 13. Page Up/Down                        [ ]
-14. Multiple Buffer Management          [ ]
+14. Multiple Buffer Management          [x]
 15. File Explorer (Modal)               [x]
 16. File Operations                     [ ]
 17. Buffer Overflow Protection          [ ]

@@ -38,12 +38,28 @@
 #define INITIAL_COMMAND_BUFFER_CAPACITY 1024
 #define INITIAL_COMMAND_BINDING_CAPACITY 1024
 #define INITIAL_TOKENIZER_BUFFER_CAPACITY 8
+#define INITIAL_MODAL_BUFFER_CAPACITY 8
+#define INITIAL_MODAL_CACHE_BUFFER_CAPACITY 8
 
 typedef struct Editor Editor;
 
 typedef enum { ORIGINAL, ADD } BufferType;
 typedef enum { TYPE_DIR, TYPE_FILE, TYPE_ERROR } FileType;
 typedef enum { MODE_TEXT, MODE_COMMAND, MODE_COUNT } EditorMode;
+
+typedef struct {
+    size_t x;
+    size_t y;
+} Position;
+
+typedef struct {
+    Position position;
+    Position size;
+} Rect;
+
+Vector2 PositionToVector(Position position) {
+    return (Vector2){position.x, position.y};
+}
 
 typedef enum {
     ACTION_NONE = 0,
@@ -81,6 +97,9 @@ typedef enum {
     ACTION_CANCEL,
     ACTION_OPEN_COMMAND_PALETTE,
 
+    ACTION_OPEN_BUFFER_LIST,
+    ACTION_OPEN_FILE,
+
     ACTION_EXECUTE_COMMAND
 } ActionType;
 
@@ -116,6 +135,9 @@ const char* ActionTypeToString(ActionType type) {
         case ACTION_QUIT: return "ACTION_QUIT";
         case ACTION_CANCEL: return "ACTION_CANCEL";
         case ACTION_OPEN_COMMAND_PALETTE: return "ACTION_OPEN_COMMAND_PALETTE";
+        case ACTION_EXECUTE_COMMAND: return "ACTION_EXECUTE_COMMAND";
+        case ACTION_OPEN_BUFFER_LIST: return "ACTION_OPEN_BUFFER_LIST";
+        case ACTION_OPEN_FILE: return "ACTION_OPEN_FILE";
         default: return "UNKNOWN_ACTION";
     }
 }
@@ -205,7 +227,9 @@ static KeyBinding default_normal_bindings[] = {
     { KEY_P, MODI_CTRL, ACTION_OPEN_COMMAND_PALETTE},
     { KEY_G, MODI_CTRL, ACTION_GOTO},
     { KEY_F, MODI_CTRL, ACTION_SEARCH},
-    { KEY_Q, MODI_CTRL, ACTION_QUIT }
+    { KEY_Q, MODI_CTRL, ACTION_QUIT },
+    { KEY_B, MODI_CTRL, ACTION_OPEN_BUFFER_LIST },
+    { KEY_O, MODI_CTRL, ACTION_OPEN_FILE }
 };
 
 static KeyBinding default_command_bindings[] = {
@@ -220,6 +244,268 @@ static KeyBinding default_command_bindings[] = {
 
     { KEY_ENTER,     MODI_NONE, ACTION_EXECUTE_COMMAND },
 };
+
+typedef struct Modal Modal;
+
+typedef void (*LayoutFunc)(Modal* modal);
+
+typedef struct {
+    Color background;
+    Color border;
+    Color text;
+    Color text_muted;
+    Color selection;
+    Color input_background;
+    Color focused_border;
+    int border_width;
+    Position content_padding;
+    int widget_spacing;
+    int title_height;
+    Position title_padding;
+    bool draw_title;
+} ModalStyle;
+
+typedef struct {
+    ModifierFlags modifiers;
+    int key;
+} RawInput;
+
+typedef void (*ModalRenderFunc)(Modal* modal, Rect content_bounds);
+typedef void (*ModalInputFunc)(Modal* modal, RawInput input);
+typedef void (*ModalCleanupFunc)(void* state);
+typedef void (*ModalResultCallback)(Modal* modal, bool confirmed, void* result, void* user_data);
+
+struct Modal {
+    char* title;
+
+    Rect bounds;
+    Position wanted_size;
+    Position min_size;
+    Position max_size;
+    Position margin; 
+    
+    ModalStyle style;
+
+    LayoutFunc* layouts;
+    size_t layout_count;
+    size_t layout_capacity;
+
+    bool is_cached;
+
+    ModalRenderFunc custom_render;
+    ModalInputFunc custom_input;
+    ModalCleanupFunc cleanup;
+
+    ModalResultCallback on_result;
+    void* on_result_user_data;
+    void* result_data;
+
+    void* state;
+};
+
+void ApplyWantedSize(Modal* modal) {
+    modal->bounds.size = modal->wanted_size;
+}
+
+void ApplyMaxSize(Modal* modal) {
+    if (modal->max_size.x > 0 && modal->bounds.size.x > modal->max_size.x) {
+        modal->bounds.size.x = modal->max_size.x;
+    }
+    if (modal->max_size.y > 0 && modal->bounds.size.y > modal->max_size.y) {
+        modal->bounds.size.y = modal->max_size.y;
+    }
+}
+
+void ApplyMinSize(Modal* modal) {
+    if (modal->min_size.x > 0 && modal->bounds.size.x < modal->min_size.x) {
+        modal->bounds.size.x = modal->min_size.x;
+    }
+    if (modal->min_size.y > 0 && modal->bounds.size.y < modal->min_size.y) {
+        modal->bounds.size.y = modal->min_size.y;
+    }
+}
+
+void ApplyMargin(Modal* modal) {
+    int sw = GetScreenWidth();
+    int sh = GetScreenHeight();
+    size_t max_w = sw - modal->margin.x * 2;
+    size_t max_h = sh - modal->margin.y * 2;
+    if (modal->bounds.size.x > max_w) {
+        modal->bounds.size.x = max_w;
+    }
+    if (modal->bounds.size.y > max_h) {
+        modal->bounds.size.y = max_h;
+    }
+}
+
+void CenterModal(Modal* modal) {
+    int sw = GetScreenWidth();
+    int sh = GetScreenHeight();
+    modal->bounds.position.x = (sw - modal->bounds.size.x) / 2;
+    modal->bounds.position.y = (sh - modal->bounds.size.y) / 2;
+}
+
+void ModalAddLayout(Modal* modal, LayoutFunc layout) {
+    if (modal->layouts == NULL) {
+        modal->layout_capacity = 4;
+        modal->layouts = calloc(modal->layout_capacity, sizeof(LayoutFunc));
+    }
+    if (modal->layout_count >= modal->layout_capacity) {
+        modal->layout_capacity *= 2;
+        modal->layouts = realloc(modal->layouts, modal->layout_capacity * sizeof(LayoutFunc));
+    }
+    modal->layouts[modal->layout_count++] = layout;
+}
+
+typedef struct {
+    char** modal_keys;
+    Modal** modal_cache;
+    size_t cache_count;
+    size_t cache_capacity;
+
+    Modal** stack;
+    size_t stack_count;
+    size_t stack_capacity;
+    
+    // Default style
+    ModalStyle default_style;
+    
+    // Font for rendering
+    Font font;
+    int font_size;
+    
+    int screen_width;
+    int screen_height;
+} ModalSystem;
+
+ModalSystem InitModalSystem() {
+    ModalSystem system;
+    system.stack_capacity = INITIAL_MODAL_BUFFER_CAPACITY;
+    system.stack = calloc(system.stack_capacity, sizeof(Modal*));
+    system.stack_count = 0;
+
+    system.cache_capacity = INITIAL_MODAL_CACHE_BUFFER_CAPACITY;
+    system.modal_cache = calloc(system.cache_capacity, sizeof(Modal*));
+    system.modal_keys = calloc(system.cache_capacity, sizeof(char*));
+    system.cache_count = 0;
+
+
+    system.default_style = (ModalStyle){
+        .background    = (Color){45, 48, 55, 240},
+        .border        = (Color){80, 85, 95, 255},
+        .text          = WHITE,
+        .text_muted    = (Color){150, 150, 150, 255},
+        .selection     = (Color){60, 100, 180, 255},
+        .input_background = (Color){30, 32, 38, 255},
+        .focused_border   = (Color){100, 140, 220, 255},
+        .border_width     = 2,
+        .content_padding  = (Position){12, 12},
+        .widget_spacing   = 4,
+        .title_height     = 32,
+    };
+
+    return system;
+}
+
+void RegisterModalToQuickCatch(ModalSystem* system, const char* key, Modal* modal) {
+    if (system->cache_count >= system->cache_capacity) {
+        system->cache_capacity *= 2;
+        system->modal_cache = realloc(system->modal_cache, system->cache_capacity * sizeof(Modal*));
+        system->modal_keys = realloc(system->modal_keys, system->cache_capacity * sizeof(char*));
+    }
+    size_t index = system->cache_count++;
+    system->modal_cache[index] = modal;
+    system->modal_keys[index] = strdup(key);
+}
+
+Modal* CreateModal(ModalSystem* system, const char* title, Position wanted_size, ModalRenderFunc render, ModalInputFunc input, ModalCleanupFunc cleanup, void* state) {
+    Modal* modal = calloc(1, sizeof(Modal));
+    modal->title = strdup(title);
+    modal->wanted_size = wanted_size;
+    modal->style = system->default_style;
+    modal->custom_render = render;
+    modal->custom_input = input;
+    modal->cleanup = cleanup;
+    modal->state = state;
+
+    return modal;
+}
+
+void PushModal(ModalSystem* system, Modal* modal) {
+    if (system->stack_count >= system->stack_capacity) {
+        system->stack_capacity *= 2;
+        system->stack = realloc(system->stack, system->stack_capacity * sizeof(Modal*));
+    }
+    system->stack[system->stack_count++] = modal;
+}
+
+void PushModalFromCache(ModalSystem* system, char* key) {
+    for (int i = 0; i < system->cache_count; i++) {
+        if (strcmp(key, system->modal_keys[i]) == 0) {
+          PushModal(system, system->modal_cache[i]);  
+        }
+    }
+}
+
+Modal* GetTopModal(ModalSystem* system) {
+    if (system->stack_count == 0) return NULL;
+    return system->stack[system->stack_count - 1];
+}
+
+void ClearModal(Modal* modal);
+
+void CloseModal(ModalSystem* system, bool confirmed) {
+    if (system->stack_count == 0) return;
+
+    Modal* modal = system->stack[--system->stack_count];
+
+    if (modal->on_result) {
+        modal->on_result(modal, confirmed, modal->result_data, modal->on_result_user_data);
+    }
+
+    if (modal->is_cached) return;
+
+    if (modal->cleanup) {
+        modal->cleanup(modal->state);
+    }
+
+    ClearModal(modal);
+    free(modal);
+}
+
+void ClearModal(Modal* modal) {
+    if (modal->title) {
+        free(modal->title);
+    }
+
+    if (modal->layouts) {
+        free(modal->layouts);
+    }
+
+    if (modal->cleanup) {
+        modal->cleanup(modal->state);
+    }
+}
+
+bool ModalSystemHasActive(ModalSystem* system) {
+    return system->stack_count > 0;
+}
+
+void ClearModalSystem(ModalSystem* system) {
+    system->stack_count = 0;
+
+    for (size_t i = 0; i < system->cache_count; i++) {
+        Modal* modal = system->modal_cache[i];
+        if (modal->cleanup) {
+            modal->cleanup(modal->state);
+        }
+        ClearModal(modal);
+    }
+
+    free(system->stack);
+    free(system->modal_cache);
+    free(system->modal_keys);
+}
 
 typedef enum  {
     TOKENTYPE_STRING,
@@ -370,7 +656,7 @@ CommandSystem InitCommandSystem() {
     system.pointer_position = 0;
 
     system.bindings = calloc(INITIAL_COMMAND_BINDING_CAPACITY, sizeof(CommandBinding));
-    system.command_bindings_count = INITIAL_COMMAND_BINDING_CAPACITY;
+    system.command_bindings_capacity = INITIAL_COMMAND_BINDING_CAPACITY;
     system.command_bindings_count = 0;
 
     return system;
@@ -508,8 +794,9 @@ Action InputSystemPoll(InputSystem* sys) {
         int ch = GetCharPressed();
         if (ch != 0) {
             action.type = ACTION_INSERT_CHAR;
-            action.text_buffer = malloc(1);
+            action.text_buffer = malloc(2);
             action.text_buffer[0] = (char)ch;
+            action.text_buffer[1] = '\0';
             action.length = 1;
             return action;
         }
@@ -523,6 +810,26 @@ Action InputSystemPoll(InputSystem* sys) {
     }
 
     return action;
+}
+
+bool HasModifiers(ModifierFlags modiefers, ModifierFlags check) {
+    return modiefers & check;
+}
+
+RawInput InputSystemPollRawInput() {
+    RawInput input = {0};
+    input.modifiers = GetCurrentModifiers();
+    input.key = GetCharPressed();
+    if (!HasModifiers(input.modifiers, MODI_CTRL | MODI_ALT | MODI_SUPER)) {
+        int ch = GetCharPressed();
+        if (ch != 0) {
+            input.key = ch;
+            return input;
+        }
+    }
+
+    input.key = GetKeyPressed();
+    return input;
 }
 
 void normalize_line_endings(char* buf) {
@@ -630,20 +937,6 @@ void ClearUndoStack(UndoStack* stack) {
     stack->current = 0;
     stack->count = 0;
 }
-
-typedef struct {
-    size_t x;
-    size_t y;
-} Position;
-
-Vector2 PositionToVector(Position position) {
-    return (Vector2){position.x, position.y};
-}
-
-typedef struct {
-    Position position;
-    Position size;
-} Rect;
 
 typedef struct {
     BufferType source;
@@ -1091,6 +1384,7 @@ void ClearEditorState(EditorState* state) {
 void ResizeTextBuffers(EditorState* state) {
     size_t new_size = state->text_buffers_capacity * 2;
     state->text_buffers = realloc(state->text_buffers, new_size * sizeof(TextBuffer));
+    state->text_buffers_capacity = new_size;
 
     if (!state->text_buffers) {
         // TODO: Handle realloc fail gracefully
@@ -1156,7 +1450,184 @@ struct Editor{
     EditorState state;
     EditorSettings settings;
     InputSystem input_system;
+    ModalSystem modal_system;
 };
+
+void ModalSystemRender(Editor* editor) {
+    ModalSystem* system = &editor->modal_system;
+    if (system->stack_count == 0) return;
+    int sw = GetScreenWidth();
+    int sh = GetScreenHeight();
+
+    DrawRectangle(0, 0, sw, sh, (Color){0, 0, 0, 120});
+
+    Modal* active_modal = GetTopModal(system);
+
+    for (size_t i = 0; i < active_modal->layout_count; i++) {
+        active_modal->layouts[i](active_modal);
+    }
+
+    Rect bounding = active_modal->bounds;
+
+    BeginScissorMode(BREAK_DOWN_RECT(bounding));
+
+    DrawRectangle(BREAK_DOWN_RECT(bounding), active_modal->style.background);
+
+    if (active_modal->style.draw_title) {
+        int title_height = active_modal->style.title_height + active_modal->style.title_padding.y * 2;
+
+        DrawTextEx(editor->settings.editor_font, active_modal->title, (Vector2){bounding.position.x + active_modal->style.title_padding.x, bounding.position.y + active_modal->style.title_padding.y}, active_modal->style.title_height, 1, active_modal->style.text);
+
+
+        bounding.position.y += title_height;
+        bounding.size.y -= title_height;
+    }
+
+
+    if (active_modal->custom_render) {
+        active_modal->custom_render(active_modal, bounding);
+    }
+
+    EndScissorMode();
+}
+
+typedef struct {
+    Editor* editor;
+    size_t selected_index;
+    size_t scroll_offset;
+} BufferListState;
+
+void BufferListRender(Modal* modal, Rect content) {
+    BufferListState* state = (BufferListState*)modal->state;
+    Editor* editor = state->editor;
+    EditorState* es = &editor->state;
+    Font font = editor->settings.editor_font;
+    int font_size = editor->settings.font_size;
+    int row_height = font_size + modal->style.widget_spacing;
+    size_t visible_rows = content.size.y / row_height;
+
+    if (state->selected_index < state->scroll_offset) {
+        state->scroll_offset = state->selected_index;
+    }
+    if (state->selected_index >= state->scroll_offset + visible_rows) {
+        state->scroll_offset = state->selected_index - visible_rows + 1;
+    }
+
+    BeginScissorMode(content.position.x, content.position.y,
+                     content.size.x, content.size.y);
+
+    for (size_t i = state->scroll_offset; i < es->text_buffers_count; i++) {
+        size_t display_i = i - state->scroll_offset;
+        if (display_i >= visible_rows) break;
+
+        int y = content.position.y + display_i * row_height;
+
+        const char* full_path = es->text_buffers[i].file_path;
+        const char* label = "[untitled]";
+        if (full_path) {
+            const char* slash = strrchr(full_path, '/');
+            const char* bslash = strrchr(full_path, '\\');
+            if (bslash && (!slash || bslash > slash)) slash = bslash;
+            label = slash ? slash + 1 : full_path;
+        }
+
+        const char* prefix = (i == state->selected_index) ? "> " : "  ";
+        Color text_color = modal->style.text;
+        if ((int)i == es->open_text_buffer_index) {
+            text_color = modal->style.focused_border;
+        }
+
+        DrawTextEx(font, TextFormat("%s%s", prefix, label),
+                   (Vector2){content.position.x + 4,
+                             y + modal->style.widget_spacing / 2},
+                   font_size, 1, text_color);
+    }
+
+    EndScissorMode();
+}
+
+void BufferListInput(Modal* modal, RawInput input) {
+    BufferListState* state = (BufferListState*)modal->state;
+    size_t count = state->editor->state.text_buffers_count;
+
+    switch (input.key) {
+        case KEY_DOWN:
+            if (state->selected_index + 1 < count) {
+                state->selected_index++;
+            }
+            break;
+        case KEY_UP:
+            if (state->selected_index > 0) {
+                state->selected_index--;
+            }
+            break;
+        case KEY_ENTER:
+            modal->result_data = (void*)(uintptr_t)state->selected_index;
+            CloseModal(&state->editor->modal_system, true);
+            break;
+        case KEY_ESCAPE:
+            CloseModal(&state->editor->modal_system, false);
+            break;
+    }
+}
+
+void BufferListResult(Modal* modal, bool confirmed, void* result, void* user_data) {
+    if (!confirmed) return;
+
+    Editor* editor = (Editor*)user_data;
+    size_t index = (size_t)(uintptr_t)result;
+
+    if (index < editor->state.text_buffers_count) {
+        editor->state.open_text_buffer_index = (int)index;
+    }
+}
+
+void BufferListCleanup(void* state) {
+    free(state);
+}
+
+void RegisterBufferListModal(Editor* editor) {
+    BufferListState* state = calloc(1, sizeof(BufferListState));
+    state->editor = editor;
+    state->selected_index = 0;
+    state->scroll_offset = 0;
+
+    Modal* modal = CreateModal(
+        &editor->modal_system,
+        "Open Buffers",
+        (Position){500, 400},
+        BufferListRender,
+        BufferListInput,
+        BufferListCleanup,
+        state
+    );
+    modal->style.draw_title = true;
+    modal->style.title_padding = (Position){10, 10};
+    modal->on_result = BufferListResult;
+    modal->on_result_user_data = editor;
+    modal->is_cached = true;
+    modal->margin = (Position){50, 50};
+
+    ModalAddLayout(modal, ApplyWantedSize);
+    ModalAddLayout(modal, ApplyMinSize);
+    ModalAddLayout(modal, ApplyMaxSize);
+    ModalAddLayout(modal, ApplyMargin);
+    ModalAddLayout(modal, CenterModal);
+
+    RegisterModalToQuickCatch(&editor->modal_system, "buffer_list", modal);
+}
+
+void OpenBufferListModal(Editor* editor) {
+    PushModalFromCache(&editor->modal_system, "buffer_list");
+
+    Modal* top = GetTopModal(&editor->modal_system);
+    if (top) {
+        BufferListState* state = (BufferListState*)top->state;
+        state->selected_index = editor->state.open_text_buffer_index >= 0
+                              ? (size_t)editor->state.open_text_buffer_index : 0;
+        state->scroll_offset = 0;
+    }
+}
 
 void TryExecuteCommandSystem(Editor* editor) {
     CommandSystem* system = &editor->input_system.command_system;
@@ -1217,6 +1688,9 @@ Editor CreateEditor(EditorSettings settings, char* path) {
     }
 
     editor.input_system = InitInputSystem();
+    editor.modal_system = InitModalSystem();
+    
+    RegisterBufferListModal(&editor);
 
     return editor;
 }
@@ -1231,6 +1705,7 @@ void ClearEditor(Editor* editor) {
     ClearEditorState(&editor->state);
     ClearEditorSettings(&editor->settings);
     ClearInputSystem(&editor->input_system);
+    ClearModalSystem(&editor->modal_system);
 }
 
 bool ShouldEditorClose(Editor* editor) {
@@ -1659,6 +2134,16 @@ void ResetCommandBuffer(CommandSystem* system) {
     system->pointer_position = 0;
 }
 
+void OpenCommand(Editor* editor, CommandToken* tokens, size_t token_count) {
+    struct stat st;
+    if (stat(tokens[0].char_value, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return;
+    }
+    OpenFileFromPath(&editor->state, tokens[0].char_value);
+    ResetCommandBuffer(&editor->input_system.command_system);
+    editor->input_system.current_mode = MODE_TEXT;
+}
+
 void QuitCommando(Editor* editor, CommandToken* tokens, size_t token_count) {
     editor->state.exit_requested = true;
 }
@@ -1732,6 +2217,9 @@ void RegisterDefaultCommandBinding(CommandSystem* system) {
     AddCommandBinding(system, CreateCommandBinding("find", find_types, 1, FindCommand));
     
     AddCommandBinding(system, CreateCommandBinding("quit", NULL, 0, QuitCommando));
+
+    CommandTokenType open_types[] = { TOKENTYPE_STRING };
+    AddCommandBinding(system, CreateCommandBinding("open", open_types, 1, OpenCommand));
 }
 
 void EnterCommandModeWithCommand(Editor* editor, const char* command, size_t pointer_position) {
@@ -1828,6 +2316,12 @@ void DispatchInputTextMode(Editor* editor, Action action){
     case ACTION_SEARCH:
         EnterCommandModeWithCommand(editor, "find \"\"", strlen("find \"\"") - 1);
         break;
+    case ACTION_OPEN_BUFFER_LIST:
+        OpenBufferListModal(editor);
+        break;
+    case ACTION_OPEN_FILE:
+        EnterCommandModeWithCommand(editor, "open \"\"", strlen("open \"\"") - 1);
+        break;
     default:
         TraceLog(LOG_INFO, "ActionType: %s is not implemented for Text Mode", ActionTypeToString(action.type));
     }
@@ -1863,6 +2357,21 @@ void DispatchInputCommandMode(Editor* editor, Action action) {
 }
 
 void EditorHandleInput(Editor* editor) {
+    if (ModalSystemHasActive(&editor->modal_system)) {
+        RawInput input = InputSystemPollRawInput();
+
+        while (input.key != 0) {
+            Modal* top = GetTopModal(&editor->modal_system);
+            if (top && top->custom_input) {
+                top->custom_input(top, input);
+            }
+
+            input = InputSystemPollRawInput();
+        }
+        return;
+    }
+
+
     Action action = InputSystemPoll(&editor->input_system);
 
     while (action.type != ACTION_NONE) {
@@ -2097,6 +2606,7 @@ void EditorRender(Editor* editor) {
     EditorRenderMode(editor);
     EditorRenderTextField(editor, GetEditorTextFieldSize(editor));
     EditorRenderCommand(editor);
+    ModalSystemRender(editor);
 }
 
 void SetupWindow() {
