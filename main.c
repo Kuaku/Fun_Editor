@@ -42,6 +42,9 @@
 #define INITIAL_MODAL_CACHE_BUFFER_CAPACITY 8
 #define INITIAL_FILE_TREE_CAPACITY 256
 
+#define INITIAL_SCAN_INTERVAL 5.0
+#define INITIAL_DIRS_PER_FRAME 50
+
 typedef struct Editor Editor;
 
 typedef enum { ORIGINAL, ADD } BufferType;
@@ -101,6 +104,8 @@ typedef enum {
     ACTION_OPEN_BUFFER_LIST,
     ACTION_OPEN_FILE,
 
+    ACTION_OPEN_FILE_EXPLORER,
+
     ACTION_EXECUTE_COMMAND
 } ActionType;
 
@@ -139,6 +144,7 @@ const char* ActionTypeToString(ActionType type) {
         case ACTION_EXECUTE_COMMAND: return "ACTION_EXECUTE_COMMAND";
         case ACTION_OPEN_BUFFER_LIST: return "ACTION_OPEN_BUFFER_LIST";
         case ACTION_OPEN_FILE: return "ACTION_OPEN_FILE";
+        case ACTION_OPEN_FILE_EXPLORER: return "ACTION_OPEN_FILE_EXPLORER";
         default: return "UNKNOWN_ACTION";
     }
 }
@@ -230,7 +236,8 @@ static KeyBinding default_normal_bindings[] = {
     { KEY_F, MODI_CTRL, ACTION_SEARCH},
     { KEY_Q, MODI_CTRL, ACTION_QUIT },
     { KEY_B, MODI_CTRL, ACTION_OPEN_BUFFER_LIST },
-    { KEY_O, MODI_CTRL, ACTION_OPEN_FILE }
+    { KEY_O, MODI_CTRL, ACTION_OPEN_FILE },
+    { KEY_E, MODI_CTRL, ACTION_OPEN_FILE_EXPLORER },
 };
 
 static KeyBinding default_command_bindings[] = {
@@ -333,6 +340,7 @@ size_t AddNodeToTree(FileTree* tree, FileType type, const char* path, const char
 }
 
 void ClearFileTree(FileTree* tree) {
+    if (!tree) return;
     if (tree->nodes) {
         for (size_t i = 0; i < tree->count; i++) {
             ClearNode(&tree->nodes[i]);
@@ -365,9 +373,11 @@ typedef struct {
 FileSystem InitFileSystem(char* root_path) {
     FileSystem system = {0};
 
-    system.root_path = strdup(root_path);
+    system.root_path = root_path ? strdup(root_path) : NULL;
 
     system.rebuild_requested = true;
+    system.scan_interval = INITIAL_SCAN_INTERVAL;
+    system.dirs_per_frame = INITIAL_DIRS_PER_FRAME;
 
     return system;
 }
@@ -559,8 +569,9 @@ void UpdateFileCache(FileSystem* system) {
         if (system->active) {
             initial_capacity = system->active->capacity;
         }
-        FileTree new_file_tree = InitFileTree(initial_capacity);
-        system->building = &new_file_tree;
+
+        system->building = malloc(sizeof(FileTree));
+        *system->building = InitFileTree(initial_capacity);
 
         if (!system->building) {
             system->rebuild_in_progress = false;
@@ -580,7 +591,6 @@ void UpdateFileCache(FileSystem* system) {
             if (name_win > name) name = name_win;
         #endif
         name = name ? name + 1 : system->root_path;
-        
         system->building->root_index = AddNodeToTree(
             system->building, TYPE_DIR, system->root_path, name);
         if (system->building->root_index == SIZE_MAX) {
@@ -640,6 +650,7 @@ typedef struct {
 typedef struct {
     ModifierFlags modifiers;
     int key;
+    bool is_char;
 } RawInput;
 
 typedef void (*ModalRenderFunc)(Modal* modal, Rect content_bounds);
@@ -1189,8 +1200,8 @@ bool HasModifiers(ModifierFlags modiefers, ModifierFlags check) {
 
 RawInput InputSystemPollRawInput() {
     RawInput input = {0};
+    input.is_char = true;
     input.modifiers = GetCurrentModifiers();
-    input.key = GetCharPressed();
     if (!HasModifiers(input.modifiers, MODI_CTRL | MODI_ALT | MODI_SUPER)) {
         int ch = GetCharPressed();
         if (ch != 0) {
@@ -1198,7 +1209,7 @@ RawInput InputSystemPollRawInput() {
             return input;
         }
     }
-
+    input.is_char = false;
     input.key = GetKeyPressed();
     return input;
 }
@@ -1831,6 +1842,25 @@ void OpenFileFromPath(Editor* editor, const char* path) {
     state->open_text_buffer_index = index;
 }
 
+int FindBufferByPath(Editor* editor, const char* path) {
+    EditorState* state = &editor->state;
+    for (size_t i = 0; i < state->text_buffers_count; i++) {
+        if (state->text_buffers[i].file_path && strcmp(state->text_buffers[i].file_path, path) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+void OpenOrSwitchToFile(Editor* editor, const char* path) {
+    int existing = FindBufferByPath(editor, path);
+    if (existing >= 0) {
+        editor->state.open_text_buffer_index = existing;
+    } else {
+        OpenFileFromPath(editor, path);
+    }
+}
+
 void ModalSystemRender(Editor* editor) {
     ModalSystem* system = &editor->modal_system;
     if (system->stack_count == 0) return;
@@ -2007,6 +2037,489 @@ void OpenBufferListModal(Editor* editor) {
     }
 }
 
+typedef struct {
+    size_t* node_indices;
+    int* depths;
+    size_t count;
+    size_t capacity;
+} VisibleNodeList;
+
+void VisibleNodeListAdd(VisibleNodeList* list, size_t node_index, int depth) {
+    if (list->count >= list->capacity) {
+        size_t new_cap = list->capacity == 0 ? 256 : list->capacity * 2;
+        list->node_indices = realloc(list->node_indices, new_cap * sizeof(size_t));
+        list->depths = realloc(list->depths, new_cap * sizeof(int));
+        list->capacity = new_cap;
+    }
+    list->node_indices[list->count] = node_index;
+    list->depths[list->count] = depth;
+    list->count++;
+}
+
+void ClearVisibleNodeList(VisibleNodeList* list) {
+    if (list->node_indices) free(list->node_indices);
+    if (list->depths) free(list->depths);
+    list->node_indices = NULL;
+    list->depths = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+typedef struct {
+    Editor* editor;
+
+    char* search_buffer;
+    size_t search_capacity;
+    size_t search_length;
+    size_t search_cursor;
+
+    size_t selected_visible;
+    size_t selected_node;
+    size_t scroll_offset;
+
+    bool* folder_open;
+    size_t folder_open_capacity;
+
+    VisibleNodeList visible;
+    bool needs_rebuild;
+
+    FileTree* last_tree;
+} FileExplorerState;
+
+void FileExplorerCleanup(void* raw_state) {
+    FileExplorerState* state = (FileExplorerState*)raw_state;
+    if (state->search_buffer) free(state->search_buffer);
+    if (state->folder_open) free(state->folder_open);
+    ClearVisibleNodeList(&state->visible);
+    free(state);
+}
+
+bool StrContainsCaseInsensitive(const char* haystack, const char* needle) {
+    if (!needle || !needle[0]) return true;
+    if (!haystack) return false;
+    size_t h_len = strlen(haystack);
+    size_t n_len = strlen(needle);
+    if (n_len > h_len) return false;
+    for (size_t i = 0; i <= h_len - n_len; i++) {
+        bool match = true;
+        for (size_t j = 0; j < n_len; j++) {
+            char a = haystack[i + j];
+            char b = needle[j];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+void EnsureFolderOpenCapacity(FileExplorerState* state, size_t needed) {
+    if (needed <= state->folder_open_capacity) return;
+    size_t new_cap = state->folder_open_capacity == 0 ? 256 : state->folder_open_capacity;
+    while (new_cap < needed) new_cap *= 2;
+    state->folder_open = realloc(state->folder_open, new_cap * sizeof(bool));
+    memset(state->folder_open + state->folder_open_capacity, 0,
+           (new_cap - state->folder_open_capacity) * sizeof(bool));
+    state->folder_open_capacity = new_cap;
+}
+
+void FileExplorerBuildTreeDFS(FileExplorerState* state, FileTree* tree, size_t node_idx, int depth) {
+    if (node_idx >= tree->count) return;
+    VisibleNodeListAdd(&state->visible, node_idx, depth);
+
+    Node* node = &tree->nodes[node_idx];
+    if (node->type == TYPE_DIR) {
+        EnsureFolderOpenCapacity(state, node_idx + 1);
+        if (state->folder_open[node_idx]) {
+            for (size_t i = 0; i < node->children_count; i++) {
+                FileExplorerBuildTreeDFS(state, tree, (size_t)node->children[i], depth + 1);
+            }
+        }
+    }
+}
+
+void FileExplorerBuildSearchDFS(FileExplorerState* state, FileTree* tree, size_t node_idx, const char* query) {
+    if (node_idx >= tree->count) return;
+    Node* node = &tree->nodes[node_idx];
+
+    if (StrContainsCaseInsensitive(node->name, query)) {
+        VisibleNodeListAdd(&state->visible, node_idx, 0);
+    }
+
+    if (node->type == TYPE_DIR) {
+        for (size_t i = 0; i < node->children_count; i++) {
+            FileExplorerBuildSearchDFS(state, tree, (size_t)node->children[i], query);
+        }
+    }
+}
+
+void FileExplorerRebuildVisible(FileExplorerState* state) {
+    FileTree* tree = state->editor->file_system.active;
+    if (!tree || tree->count == 0) {
+        ClearVisibleNodeList(&state->visible);
+        state->needs_rebuild = false;
+        return;
+    }
+
+    if (tree != state->last_tree) {
+        if (state->folder_open) {
+            memset(state->folder_open, 0, state->folder_open_capacity * sizeof(bool));
+        }
+        EnsureFolderOpenCapacity(state, tree->root_index + 1);
+        state->folder_open[tree->root_index] = true;
+        state->last_tree = tree;
+        state->selected_node = tree->root_index;
+    }
+
+    ClearVisibleNodeList(&state->visible);
+
+    bool searching = state->search_length > 0;
+    if (searching) {
+        FileExplorerBuildSearchDFS(state, tree, tree->root_index, state->search_buffer);
+    } else {
+        FileExplorerBuildTreeDFS(state, tree, tree->root_index, 0);
+    }
+
+    state->selected_visible = 0;
+    for (size_t i = 0; i < state->visible.count; i++) {
+        if (state->visible.node_indices[i] == state->selected_node) {
+            state->selected_visible = i;
+            break;
+        }
+    }
+
+    if (state->visible.count > 0 && state->selected_visible >= state->visible.count) {
+        state->selected_visible = state->visible.count - 1;
+    }
+
+    if (state->visible.count > 0) {
+        state->selected_node = state->visible.node_indices[state->selected_visible];
+    }
+
+    state->needs_rebuild = false;
+}
+
+bool FileExplorerOpenPathToNode(FileExplorerState* state, FileTree* tree, size_t current, size_t target) {
+    if (current == target) return true;
+
+    Node* node = &tree->nodes[current];
+    if (node->type != TYPE_DIR) return false;
+
+    for (size_t i = 0; i < node->children_count; i++) {
+        if (FileExplorerOpenPathToNode(state, tree, (size_t)node->children[i], target)) {
+            EnsureFolderOpenCapacity(state, current + 1);
+            state->folder_open[current] = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+void FileExplorerSearchChanged(FileExplorerState* state) {
+    FileTree* tree = state->editor->file_system.active;
+    if (!tree) return;
+
+    if (state->search_length == 0 && state->visible.count > 0) {
+        FileExplorerOpenPathToNode(state, tree, tree->root_index, state->selected_node);
+    }
+
+    state->needs_rebuild = true;
+}
+
+void FileExplorerRender(Modal* modal, Rect content) {
+    FileExplorerState* state = (FileExplorerState*)modal->state;
+    Editor* editor = state->editor;
+    Font font = editor->settings.editor_font;
+    int font_size = editor->settings.font_size;
+    int row_height = font_size + modal->style.widget_spacing;
+    int pad = modal->style.content_padding.x;
+    int search_bar_height = font_size + 12;
+
+    if (state->needs_rebuild) {
+        FileExplorerRebuildVisible(state);
+    }
+
+    Rect search_rect = {
+        .position = { content.position.x + pad, content.position.y + 6 },
+        .size = { content.size.x - pad * 2, search_bar_height }
+    };
+    DrawRectangle(BREAK_DOWN_RECT(search_rect), modal->style.input_background);
+    DrawRectangleLines(search_rect.position.x, search_rect.position.y,
+                       search_rect.size.x, search_rect.size.y, modal->style.focused_border);
+
+    int text_y = search_rect.position.y + (search_bar_height - font_size) / 2;
+    int text_x = search_rect.position.x + 6;
+
+    if (state->search_length == 0) {
+        DrawTextEx(font, "Search...", (Vector2){text_x, text_y}, font_size, 1, modal->style.text_muted);
+    }
+
+    if (state->search_length > 0 || true) {
+        char* before = calloc(state->search_cursor + 1, sizeof(char));
+        if (state->search_cursor > 0) {
+            memcpy(before, state->search_buffer, state->search_cursor);
+        }
+        before[state->search_cursor] = '\0';
+
+        Vector2 before_size = MeasureTextEx(font, before, font_size, 1);
+        if (state->search_length > 0) {
+            DrawTextEx(font, before, (Vector2){text_x, text_y}, font_size, 1, modal->style.text);
+        }
+
+        DrawRectangle(text_x + (int)before_size.x + 1, text_y + 2, 2, font_size - 4, modal->style.focused_border);
+
+        if (state->search_cursor < state->search_length) {
+            char* after = state->search_buffer + state->search_cursor;
+            DrawTextEx(font, after, (Vector2){text_x + (int)before_size.x + 4, text_y}, font_size, 1, modal->style.text);
+        }
+
+        free(before);
+    }
+
+    Rect list_rect = {
+        .position = { content.position.x, content.position.y + search_bar_height + 14 },
+        .size = { content.size.x, content.size.y - search_bar_height - 14 }
+    };
+
+    FileTree* tree = editor->file_system.active;
+    if (!tree || tree->count == 0) {
+        DrawTextEx(font, "No files loaded",
+                   (Vector2){list_rect.position.x + pad, list_rect.position.y + 4},
+                   font_size, 1, modal->style.text_muted);
+        return;
+    }
+
+    size_t visible_rows = list_rect.size.y / row_height;
+    if (visible_rows == 0) visible_rows = 1;
+
+    if (state->selected_visible < state->scroll_offset) {
+        state->scroll_offset = state->selected_visible;
+    }
+    if (state->selected_visible >= state->scroll_offset + visible_rows) {
+        state->scroll_offset = state->selected_visible - visible_rows + 1;
+    }
+
+    BeginScissorMode(list_rect.position.x, list_rect.position.y,
+                     list_rect.size.x, list_rect.size.y);
+
+    bool searching = state->search_length > 0;
+    int indent_width = font_size;
+
+    for (size_t i = state->scroll_offset; i < state->visible.count; i++) {
+        size_t display_i = i - state->scroll_offset;
+        if (display_i >= visible_rows) break;
+
+        size_t node_idx = state->visible.node_indices[i];
+        int depth = state->visible.depths[i];
+        Node* node = &tree->nodes[node_idx];
+
+        int y = list_rect.position.y + display_i * row_height;
+        int x = list_rect.position.x + pad;
+
+        if (i == state->selected_visible) {
+            DrawRectangle(list_rect.position.x, y, list_rect.size.x, row_height, modal->style.selection);
+        }
+
+        if (!searching) {
+            x += depth * indent_width;
+        }
+
+        const char* prefix = "";
+        if (node->type == TYPE_DIR) {
+            EnsureFolderOpenCapacity(state, node_idx + 1);
+            prefix = state->folder_open[node_idx] ? "v " : "> ";
+        } else {
+            prefix = "  ";
+        }
+
+        Color text_color = modal->style.text;
+        if (node->type == TYPE_DIR) {
+            text_color = modal->style.focused_border;
+        }
+
+        DrawTextEx(font, TextFormat("%s%s", prefix, node->name),
+                   (Vector2){x, y + modal->style.widget_spacing / 2},
+                   font_size, 1, text_color);
+    }
+
+    EndScissorMode();
+}
+
+void FileExplorerSearchInsertChar(FileExplorerState* state, char ch) {
+    if (state->search_length + 1 >= state->search_capacity) {
+        size_t new_cap = state->search_capacity * 2;
+        state->search_buffer = realloc(state->search_buffer, new_cap);
+        state->search_capacity = new_cap;
+    }
+    memmove(state->search_buffer + state->search_cursor + 1,
+            state->search_buffer + state->search_cursor,
+            state->search_length - state->search_cursor + 1);
+    state->search_buffer[state->search_cursor] = ch;
+    state->search_cursor++;
+    state->search_length++;
+    state->search_buffer[state->search_length] = '\0';
+    FileExplorerSearchChanged(state);
+}
+
+void FileExplorerSearchBackspace(FileExplorerState* state) {
+    if (state->search_cursor == 0) return;
+    memmove(state->search_buffer + state->search_cursor - 1,
+            state->search_buffer + state->search_cursor,
+            state->search_length - state->search_cursor + 1);
+    state->search_cursor--;
+    state->search_length--;
+    state->search_buffer[state->search_length] = '\0';
+    FileExplorerSearchChanged(state);
+}
+
+void FileExplorerSearchClear(FileExplorerState* state) {
+    state->search_length = 0;
+    state->search_cursor = 0;
+    state->search_buffer[0] = '\0';
+    FileExplorerSearchChanged(state);
+}
+
+void FileExplorerInput(Modal* modal, RawInput input) {
+    FileExplorerState* state = (FileExplorerState*)modal->state;
+    Editor* editor = state->editor;
+
+    switch (input.key) {
+        case KEY_UP: {
+            if (state->selected_visible > 0) {
+                state->selected_visible--;
+                state->selected_node = state->visible.node_indices[state->selected_visible];
+            }
+            return;
+        }
+        case KEY_DOWN: {
+            if (state->selected_visible + 1 < state->visible.count) {
+                state->selected_visible++;
+                state->selected_node = state->visible.node_indices[state->selected_visible];
+            }
+            return;
+        }
+        case KEY_ENTER: {
+            if (state->visible.count == 0) return;
+            size_t node_idx = state->visible.node_indices[state->selected_visible];
+            FileTree* tree = editor->file_system.active;
+            if (!tree) return;
+            Node* node = &tree->nodes[node_idx];
+
+            if (node->type == TYPE_DIR) {
+                EnsureFolderOpenCapacity(state, node_idx + 1);
+                state->folder_open[node_idx] = !state->folder_open[node_idx];
+                state->needs_rebuild = true;
+            } else {
+                printf("CLosing explorer with: %s\n", (void*)node->path);
+                modal->result_data = (void*)node->path;
+                CloseModal(&editor->modal_system, true);
+            }
+            return;
+        }
+        case KEY_ESCAPE: {
+            if (state->search_length > 0) {
+                FileExplorerSearchClear(state);
+            } else {
+                CloseModal(&editor->modal_system, false);
+            }
+            return;
+        }
+        case KEY_BACKSPACE: {
+            FileExplorerSearchBackspace(state);
+            return;
+        }
+        case KEY_LEFT: {
+            if (state->search_cursor > 0) {
+                state->search_cursor--;
+            }
+            return;
+        }
+        case KEY_RIGHT: {
+            if (state->search_cursor < state->search_length) {
+                state->search_cursor++;
+            }
+            return;
+        }
+    }
+
+    if (input.is_char && input.key >= 32 && input.key < 127 &&
+        !HasModifiers(input.modifiers, MODI_CTRL | MODI_ALT | MODI_SUPER)) {
+        FileExplorerSearchInsertChar(state, (char)input.key);
+        return;
+    }
+}
+
+void FileExplorerResult(Modal* modal, bool confirmed, void* result, void* user_data) {
+    if (!confirmed) return;
+
+    Editor* editor = (Editor*)user_data;
+    const char* path = (const char*)result;
+    if (path) {
+        OpenOrSwitchToFile(editor, path);
+    }
+}
+
+void RegisterFileExplorerModal(Editor* editor) {
+    FileExplorerState* state = calloc(1, sizeof(FileExplorerState));
+    state->editor = editor;
+
+    state->search_capacity = 256;
+    state->search_buffer = calloc(state->search_capacity, sizeof(char));
+    state->search_length = 0;
+    state->search_cursor = 0;
+
+    state->selected_visible = 0;
+    state->selected_node = 0;
+    state->scroll_offset = 0;
+
+    state->folder_open = NULL;
+    state->folder_open_capacity = 0;
+
+    state->visible = (VisibleNodeList){0};
+    state->needs_rebuild = true;
+    state->last_tree = NULL;
+
+    Modal* modal = CreateModal(
+        &editor->modal_system,
+        "File Explorer",
+        (Position){600, 500},
+        FileExplorerRender,
+        FileExplorerInput,
+        FileExplorerCleanup,
+        state
+    );
+    modal->style.draw_title = true;
+    modal->style.title_padding = (Position){10, 10};
+    modal->on_result = FileExplorerResult;
+    modal->on_result_user_data = editor;
+    modal->is_cached = true;
+    modal->margin = (Position){50, 50};
+
+    ModalAddLayout(modal, ApplyWantedSize);
+    ModalAddLayout(modal, ApplyMinSize);
+    ModalAddLayout(modal, ApplyMaxSize);
+    ModalAddLayout(modal, ApplyMargin);
+    ModalAddLayout(modal, CenterModal);
+
+    RegisterModalToQuickCatch(&editor->modal_system, "file_explorer", modal);
+}
+
+void OpenFileExplorerModal(Editor* editor) {
+    PushModalFromCache(&editor->modal_system, "file_explorer");
+
+    Modal* top = GetTopModal(&editor->modal_system);
+    if (top) {
+        FileExplorerState* state = (FileExplorerState*)top->state;
+        // Reset search on open
+        state->search_length = 0;
+        state->search_cursor = 0;
+        state->search_buffer[0] = '\0';
+        state->scroll_offset = 0;
+        state->needs_rebuild = true;
+    }
+}
+
 void TryExecuteCommandSystem(Editor* editor) {
     CommandSystem* system = &editor->input_system.command_system;
     TokenList tokens = Tokenize(system->command_buffer);
@@ -2071,6 +2584,7 @@ Editor CreateEditor(EditorSettings settings, char* path) {
 
     
     RegisterBufferListModal(&editor);
+    RegisterFileExplorerModal(&editor);
 
     return editor;
 }
@@ -2567,6 +3081,7 @@ void FindCommand(Editor* editor, CommandToken* tokens, size_t token_count) {
         size_t line_length = strlen(line);
         
         if (line_length < search_length) {
+            free(line);
             continue;
         }
 
@@ -2702,6 +3217,9 @@ void DispatchInputTextMode(Editor* editor, Action action){
         break;
     case ACTION_OPEN_FILE:
         EnterCommandModeWithCommand(editor, "open \"\"", strlen("open \"\"") - 1);
+        break;
+    case ACTION_OPEN_FILE_EXPLORER:
+        OpenFileExplorerModal(editor);
         break;
     default:
         TraceLog(LOG_INFO, "ActionType: %s is not implemented for Text Mode", ActionTypeToString(action.type));
@@ -3035,6 +3553,8 @@ int main(int argc, char** argv) {
     }
 
     while (!WindowShouldClose() && !ShouldEditorClose(&editor)) {
+        UpdateFileCache(&editor.file_system);
+        
         BeginDrawing();
 
         EditorHandleInput(&editor);
