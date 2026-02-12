@@ -40,6 +40,7 @@
 #define INITIAL_TOKENIZER_BUFFER_CAPACITY 8
 #define INITIAL_MODAL_BUFFER_CAPACITY 8
 #define INITIAL_MODAL_CACHE_BUFFER_CAPACITY 8
+#define INITIAL_FILE_TREE_CAPACITY 256
 
 typedef struct Editor Editor;
 
@@ -48,8 +49,8 @@ typedef enum { TYPE_DIR, TYPE_FILE, TYPE_ERROR } FileType;
 typedef enum { MODE_TEXT, MODE_COMMAND, MODE_COUNT } EditorMode;
 
 typedef struct {
-    size_t x;
-    size_t y;
+    int x;
+    int y;
 } Position;
 
 typedef struct {
@@ -244,6 +245,377 @@ static KeyBinding default_command_bindings[] = {
 
     { KEY_ENTER,     MODI_NONE, ACTION_EXECUTE_COMMAND },
 };
+
+typedef struct {
+    FileType type;
+
+    char* path;
+    size_t path_length;
+    char* name;
+    size_t name_length;
+    int* children;
+    size_t children_count;
+} Node;
+
+void ClearNode(Node* node) {
+    if (node->path) {
+        free(node->path);
+    }
+    node->path_length = 0;
+
+    if (node->name) {
+        free(node->name);
+    }
+    node->name_length = 0;
+
+    if (node->children) {
+        free(node->children);
+    }
+    node->children = 0;
+}
+
+typedef struct {
+    char* path;
+    size_t index;
+} PendingDir;
+
+void ClearPendingDir(PendingDir* dir) {
+    if (dir->path) {
+        free(dir->path);
+    }
+}
+
+typedef struct {
+    Node* nodes;
+    size_t count;
+    size_t capacity;
+    size_t root_index;
+} FileTree;
+
+FileTree InitFileTree(size_t init_capacity) {
+    FileTree tree = {0};
+    tree.capacity = init_capacity;
+    tree.nodes = calloc(tree.capacity, sizeof(Node));
+    return tree;
+}
+
+size_t AddNodeToTree(FileTree* tree, FileType type, const char* path, const char* name) {
+    if (tree->count >= tree->capacity) {
+        size_t new_capacity = tree->capacity * 2;
+        Node* new_nodes = realloc(tree->nodes, sizeof(Node) * new_capacity);
+
+        if (!new_nodes) {
+            return SIZE_MAX;
+        }
+        tree->nodes = new_nodes;
+        tree->capacity = new_capacity;
+    }
+    
+    size_t index = tree->count++;
+    Node* node = &tree->nodes[index];
+    node->type = type;
+    node->path = strdup(path);
+    node->name = strdup(name);
+
+    if (!node->path || !node->name) {
+        free(node->path);
+        free(node->name);
+        tree->count--;
+        return SIZE_MAX;
+    }
+
+    node->path_length = strlen(path);
+    node->name_length = strlen(name);
+    node->children = NULL;
+    node->children_count = 0;
+    
+    return index;
+}
+
+void ClearFileTree(FileTree* tree) {
+    if (tree->nodes) {
+        for (size_t i = 0; i < tree->count; i++) {
+            ClearNode(&tree->nodes[i]);
+        }
+        free(tree->nodes);
+    }
+
+    tree->capacity = 0;
+    tree->count = 0;
+}
+ 
+typedef struct {
+    char* root_path;
+
+    FileTree* active;
+    FileTree* building;
+
+    double last_scan_time;
+    double scan_interval;
+
+    bool rebuild_requested;
+    bool rebuild_in_progress;
+
+    PendingDir* pending_dirs;
+    size_t pending_count;
+    size_t pending_capacity;
+    size_t dirs_per_frame;
+} FileSystem;
+
+FileSystem InitFileSystem(char* root_path) {
+    FileSystem system = {0};
+
+    system.root_path = strdup(root_path);
+
+    system.rebuild_requested = true;
+
+    return system;
+}
+
+void AddPendingDir(FileSystem* system, const char* path, size_t node_index) {
+    if (node_index == SIZE_MAX) return;
+
+    if (system->pending_count >= system->pending_capacity) {
+        size_t new_capacity = system->pending_capacity == 0 
+            ? 64 : system->pending_capacity * 2;
+        PendingDir* new_dirs = realloc(system->pending_dirs,
+            sizeof(PendingDir) * new_capacity);
+        if (!new_dirs) {
+            return;
+        }
+        system->pending_dirs = new_dirs;
+        system->pending_capacity = new_capacity;
+    }
+
+    char* path_copy = strdup(path);
+    if (!path_copy) {
+        return;
+    }
+    
+    system->pending_dirs[system->pending_count++] = (PendingDir){
+        .path = path_copy,
+        .index = node_index
+    };
+}
+
+void ClearFileSystem(FileSystem* system) {
+    if (system->root_path) {
+        free(system->root_path);
+    }
+
+    if (system->active) {
+        ClearFileTree(system->active);
+        free(system->active);
+    }
+
+    if (system->building) {
+        ClearFileTree(system->building);
+        free(system->building);
+    }
+
+    if (system->pending_dirs) {
+        for (size_t i = 0; i < system->pending_count; i++) {
+            ClearPendingDir(&system->pending_dirs[i]);
+        }
+        free(system->pending_dirs);
+    }
+}
+
+void AddChildToTreeNode(FileTree* tree, size_t parent_index, size_t child_index) {
+    if (parent_index >= tree->count || child_index == SIZE_MAX) {
+        return;
+    }
+
+    Node* parent = &tree->nodes[parent_index];
+    size_t current_capacity = (parent->children_count == 0) ? 0 : 
+        ((parent->children_count - 1) / 16 + 1) * 16;
+    
+    if (parent->children_count >= current_capacity) {
+        size_t new_capacity = current_capacity + 16;
+        int* new_children = realloc(parent->children, sizeof(int) * new_capacity);
+        if (!new_children) {
+            return;
+        }
+        parent->children = new_children;
+    }
+
+    parent->children[parent->children_count++] = (int)child_index;
+}
+
+char* JoinPath(const char* base, const char* name) {
+    size_t base_len = strlen(base);
+    size_t name_len = strlen(name);
+    char* result = malloc(base_len + name_len + 2);
+    
+    strcpy(result, base);
+    #ifdef _WIN32
+        if (base[base_len - 1] != '\\' && base[base_len - 1] != '/') {
+            strcat(result, "\\");
+        }
+    #else
+        if (base[base_len - 1] != '/') {
+            strcat(result, "/");
+        }
+    #endif
+    strcat(result, name);
+    return result;
+}
+
+#ifdef _WIN32
+    void ProcessSingleDirectory(FileSystem* system, const char* path, size_t dir_node_index) {
+        FileTree* tree = system->building;
+        if (!tree || dir_node_index >= tree->count) return;
+        
+        char search_path[MAX_PATH];
+        snprintf(search_path, MAX_PATH, "%s\\*", path);
+        
+        WIN32_FIND_DATAA find_data;
+        HANDLE find_handle = FindFirstFileA(search_path, &find_data);
+        
+        if (find_handle == INVALID_HANDLE_VALUE) return;
+        
+        do {
+            if (strcmp(find_data.cFileName, ".") == 0 || 
+                strcmp(find_data.cFileName, "..") == 0) continue;
+            
+            if (find_data.cFileName[0] == '.') continue;
+            if (strcmp(find_data.cFileName, "node_modules") == 0) continue;
+            if (strcmp(find_data.cFileName, ".git") == 0) continue;
+            
+            char* full_path = JoinPath(path, find_data.cFileName);
+            size_t child_index;
+            
+            if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                child_index = AddNodeToTree(tree, TYPE_DIR, full_path, find_data.cFileName);
+                if (child_index != SIZE_MAX) {
+                    AddPendingDir(system, full_path, child_index);
+                }
+            } else {
+                child_index = AddNodeToTree(tree, TYPE_FILE, full_path, find_data.cFileName);
+            }
+            if (child_index != SIZE_MAX) {
+                AddChildToTreeNode(tree, dir_node_index, child_index);
+            }
+            
+            free(full_path);
+            
+        } while (FindNextFileA(find_handle, &find_data));
+        
+        FindClose(find_handle);
+    }
+#else
+    void ProcessSingleDirectory(FileSystem* system, const char* path, size_t dir_node_index) {
+        FileTree* tree = system->building;
+        DIR* dir = opendir(path);
+        if (!dir) return;
+        
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 || 
+                strcmp(entry->d_name, "..") == 0) continue;
+            
+            if (entry->d_name[0] == '.') continue;
+            if (strcmp(entry->d_name, "node_modules") == 0) continue;
+            
+            char* full_path = JoinPath(path, entry->d_name);
+            struct stat entry_stat;
+            
+            if (stat(full_path, &entry_stat) == 0) {
+                size_t child_index;
+                
+                if (S_ISDIR(entry_stat.st_mode)) {
+                    child_index = AddNodeToTree(tree, TYPE_DIR, full_path, entry->d_name);
+                    AddPendingDir(system, full_path, child_index);
+                } else {
+                    child_index = AddNodeToTree(tree, TYPE_FILE, full_path, entry->d_name);
+                }
+                
+                AddChildToTreeNode(tree, dir_node_index, child_index);
+            }
+            free(full_path);
+        }
+        closedir(dir);
+    }
+#endif
+
+void UpdateFileCache(FileSystem* system) {
+    if (!system || !system->root_path) return;
+
+    double current_time = GetTime();
+    
+    if (!system->rebuild_in_progress && 
+        (current_time - system->last_scan_time > system->scan_interval || system->active == NULL)) {
+        system->rebuild_requested = true;
+    }
+    
+    if (system->rebuild_requested && !system->rebuild_in_progress) {
+        system->rebuild_requested = false;
+        system->rebuild_in_progress = true;
+        
+        if (system->building) {
+            ClearFileTree(system->building);
+        }
+        size_t initial_capacity = INITIAL_FILE_TREE_CAPACITY;
+        if (system->active) {
+            initial_capacity = system->active->capacity;
+        }
+        FileTree new_file_tree = InitFileTree(initial_capacity);
+        system->building = &new_file_tree;
+
+        if (!system->building) {
+            system->rebuild_in_progress = false;
+            return;
+        }
+    
+        for (int i = 0; i < system->pending_count; i++) {
+            if (system->pending_dirs[i].path) {
+                ClearPendingDir(&system->pending_dirs[i]);
+            }
+        }
+        system->pending_count = 0;
+        
+        const char* name = strrchr(system->root_path, '/');
+        #ifdef _WIN32
+            const char* name_win = strrchr(system->root_path, '\\');
+            if (name_win > name) name = name_win;
+        #endif
+        name = name ? name + 1 : system->root_path;
+        
+        system->building->root_index = AddNodeToTree(
+            system->building, TYPE_DIR, system->root_path, name);
+        if (system->building->root_index == SIZE_MAX) {
+            ClearFileTree(system->building);
+            system->building = NULL;
+            system->rebuild_in_progress = false;
+            return;
+        }
+        AddPendingDir(system, system->root_path, system->building->root_index);
+    }
+    
+    if (system->rebuild_in_progress) {
+        size_t dirs_to_process = system->dirs_per_frame;
+        
+        while (dirs_to_process > 0 && system->pending_count > 0) {
+            PendingDir entry = system->pending_dirs[--system->pending_count];
+            
+            ProcessSingleDirectory(system, entry.path, entry.index);
+            free(entry.path);
+            dirs_to_process--;
+        }
+        
+        if (system->pending_count == 0) {
+            system->rebuild_in_progress = false;
+            system->last_scan_time = current_time;
+            
+            FileTree* old = system->active;
+            system->active = system->building;
+            system->building = NULL;
+            // TODO: Maybe build diff for cool features
+            ClearFileTree(old);
+            free(old);
+        }
+    }
+}
 
 typedef struct Modal Modal;
 
@@ -496,10 +868,9 @@ void ClearModalSystem(ModalSystem* system) {
 
     for (size_t i = 0; i < system->cache_count; i++) {
         Modal* modal = system->modal_cache[i];
-        if (modal->cleanup) {
-            modal->cleanup(modal->state);
-        }
         ClearModal(modal);
+        free(modal);
+        free(system->modal_keys[i]);
     }
 
     free(system->stack);
@@ -881,7 +1252,12 @@ char* LoadFile(const char* filename, size_t* out_len) {
 }
 
 void ClearInputSystem(InputSystem* system) {
-    ClearCommandSystem(&system->command_system);   
+    for (size_t i = 0; i < MODE_COUNT; i++) {
+        if (system->bindings[i]) {
+            free(system->bindings[i]);
+        }
+    }
+    ClearCommandSystem(&system->command_system);
 }
 
 typedef enum {
@@ -1399,26 +1775,6 @@ size_t GetFreeTextBufferIndex(EditorState* state) {
     return index;
 }
 
-void OpenDirectoryFromPath(EditorState* state, const char* path) {
-    state->root_dir = strdup(path);
-
-    //TODO: introduce file cache and modal system
-}
-
-void OpenFileFromPath(EditorState* state, const char* path) {
-    size_t index = GetFreeTextBufferIndex(state); 
-
-    InitTextBufferFromPath(&state->text_buffers[index], path);
-    state->open_text_buffer_index = index;
-}
- 
-void OpenEmptyBuffer(EditorState* state) {
-    size_t index = GetFreeTextBufferIndex(state); 
-
-    InitEmptyTextBuffer(&state->text_buffers[index]);
-    state->open_text_buffer_index = index;
-}
-
 typedef struct {
     Color background_color;
     Color mode_color;
@@ -1451,7 +1807,29 @@ struct Editor{
     EditorSettings settings;
     InputSystem input_system;
     ModalSystem modal_system;
+    FileSystem file_system;
 };
+ 
+void OpenEmptyBuffer(Editor* editor) {
+    EditorState* state = &editor->state;
+    size_t index = GetFreeTextBufferIndex(state); 
+
+    InitEmptyTextBuffer(&state->text_buffers[index]);
+    state->open_text_buffer_index = index;
+}
+
+void OpenDirectoryFromPath(Editor* editor, const char* path) {
+    editor->file_system.root_path = strdup(path);
+    OpenEmptyBuffer(editor);
+}
+
+void OpenFileFromPath(Editor* editor, const char* path) {
+    EditorState* state = &editor->state;
+    size_t index = GetFreeTextBufferIndex(state); 
+
+    InitTextBufferFromPath(&state->text_buffers[index], path);
+    state->open_text_buffer_index = index;
+}
 
 void ModalSystemRender(Editor* editor) {
     ModalSystem* system = &editor->modal_system;
@@ -1679,16 +2057,18 @@ Editor CreateEditor(EditorSettings settings, char* path) {
         root_type = GetFileTypeFromPath(path);
     } 
 
-    if (root_type == TYPE_FILE) {
-        OpenFileFromPath(&editor.state, path);
-    } else if (root_type == TYPE_DIR) {
-        OpenDirectoryFromPath(&editor.state, path);
-    } else {
-        OpenEmptyBuffer(&editor.state);
-    }
-
     editor.input_system = InitInputSystem();
     editor.modal_system = InitModalSystem();
+    editor.file_system = InitFileSystem(NULL);
+
+    if (root_type == TYPE_FILE) {
+        OpenFileFromPath(&editor, path);
+    } else if (root_type == TYPE_DIR) {
+        OpenDirectoryFromPath(&editor, path);
+    } else {
+        OpenEmptyBuffer(&editor);
+    }
+
     
     RegisterBufferListModal(&editor);
 
@@ -1706,6 +2086,7 @@ void ClearEditor(Editor* editor) {
     ClearEditorSettings(&editor->settings);
     ClearInputSystem(&editor->input_system);
     ClearModalSystem(&editor->modal_system);
+    ClearFileSystem(&editor->file_system);
 }
 
 bool ShouldEditorClose(Editor* editor) {
@@ -2139,7 +2520,7 @@ void OpenCommand(Editor* editor, CommandToken* tokens, size_t token_count) {
     if (stat(tokens[0].char_value, &st) != 0 || !S_ISREG(st.st_mode)) {
         return;
     }
-    OpenFileFromPath(&editor->state, tokens[0].char_value);
+    OpenFileFromPath(editor, tokens[0].char_value);
     ResetCommandBuffer(&editor->input_system.command_system);
     editor->input_system.current_mode = MODE_TEXT;
 }
