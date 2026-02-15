@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include "raylib.h"
 #include <string.h>
+#include <stdint.h>
 #include <sys/stat.h>
 
 #ifdef _WIN32
@@ -22,12 +23,22 @@
 #else
     #include <dirent.h>
     #include <unistd.h>
+    #include <limits.h>
+    #include <time.h>
 #endif
 
 #ifndef _WIN32
     #define min(a, b) ((a) < (b) ? (a) : (b))
     #define max(a, b) ((a) > (b) ? (a) : (b))
 #endif
+
+#ifdef _WIN32
+    #define PATH_MAX_LEN MAX_PATH
+#else
+    #define PATH_MAX_LEN PATH_MAX
+#endif
+#define NAME_MAX_LEN 256
+
 #define BREAK_DOWN_RECT(rect) rect.position.x, rect.position.y, rect.size.x, rect.size.y
 #define ARRAY_LEN(arr) (sizeof(arr) / sizeof((arr)[0]))
 
@@ -46,10 +57,22 @@
 #define INITIAL_DIRS_PER_FRAME 50
 
 typedef struct Editor Editor;
+typedef struct FileSystem FileSystem;
 
 typedef enum { ORIGINAL, ADD } BufferType;
 typedef enum { TYPE_DIR, TYPE_FILE, TYPE_ERROR } FileType;
 typedef enum { MODE_TEXT, MODE_COMMAND, MODE_COUNT } EditorMode;
+
+typedef enum {
+    FRAME_TIMER = 0,
+    RENDER_TIMER,
+    UPDATE_TIMER,
+    FILE_POLLING_TIMER,
+    FILE_POLLING_STEP_TIMER,
+    MODAL_UPDATE,
+    INPUT_TIMER,
+    EDITOR_TIMER_COUNT
+} EditorTimer;
 
 typedef struct {
     int x;
@@ -60,6 +83,958 @@ typedef struct {
     Position position;
     Position size;
 } Rect;
+
+typedef struct {
+    uint64_t start_ns;
+    uint64_t total_ns;
+    uint64_t count;
+    uint64_t min_ns;
+    uint64_t max_ns;
+} StatisticTimer;
+
+typedef struct {
+    StatisticTimer* timers;
+    size_t count;
+    size_t capacity;
+    uint64_t frame_count;
+} StatisticSystem;
+
+StatisticSystem InitStatisticSystem() {
+    StatisticSystem system = {0};
+
+    system.capacity = EDITOR_TIMER_COUNT;
+    system.timers = calloc(system.capacity, sizeof(StatisticTimer));
+
+    return system;
+}
+
+void ClearStatisticsSystem(StatisticSystem* system) {
+    free(system->timers);
+    system->timers = NULL;
+    system->count = 0;
+    system->capacity = 0;
+    system->frame_count = 0;
+}
+
+static inline uint64_t GetTimeNs() {
+#ifdef _WIN32
+    static LARGE_INTEGER frequency;
+    static int initialized = 0;
+    
+    if (!initialized) {
+        QueryPerformanceFrequency(&frequency);
+        initialized = 1;
+    }
+    
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    
+    return (uint64_t)(counter.QuadPart * 1000000000 / frequency.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+#endif
+}
+
+void TimerStart(StatisticSystem* system, uint32_t index) {
+    system->timers[index].start_ns = GetTimeNs();
+}
+
+void TimerEnd(StatisticSystem* system, uint32_t index) {
+    StatisticTimer* timer = &system->timers[index];
+    uint64_t elapsed = GetTimeNs() - timer->start_ns;
+    timer->total_ns += elapsed;
+    timer->count++;
+    
+    if (timer->count == 1 || elapsed < timer->min_ns) {
+        timer->min_ns = elapsed;
+    }
+    if (elapsed > timer->max_ns) {
+        timer->max_ns = elapsed;
+    }
+}
+
+double TimerAverage(StatisticSystem* system, uint32_t index) {
+    StatisticTimer* timer = &system->timers[index];
+    if (timer->count == 0) return 0.0;
+    return (timer->total_ns / timer->count) / 1000000.0;
+}
+
+typedef struct {
+    uint32_t index;
+    uint32_t generation;
+} CacheHandle;
+
+#define CACHE_HANDLE_INVALID ((CacheHandle){ UINT32_MAX, 0 })
+
+static inline bool cache_handle_eq(CacheHandle a, CacheHandle b) {
+    return a.index == b.index && a.generation == b.generation;
+}
+
+static inline bool cache_handle_is_invalid(CacheHandle h) {
+    return h.index == UINT32_MAX;
+}
+
+typedef struct {
+    CacheHandle* items;
+    uint32_t     count;
+    uint32_t     capacity;
+} ChildArray;
+
+typedef struct {
+    uint32_t generation;
+    bool     alive;
+
+    CacheHandle parent;
+    ChildArray  children;
+
+    char     name[NAME_MAX_LEN];
+    char     name_lower[NAME_MAX_LEN]; 
+    char     rel_path[PATH_MAX_LEN];
+    FileType type;
+
+    uint64_t mtime; 
+
+    bool is_open;
+} FileCacheEntry;
+
+typedef struct {
+    CacheHandle parent_handle;
+    char abs_path[PATH_MAX_LEN];
+    char rel_path[PATH_MAX_LEN];
+} ScanFrame;
+
+typedef struct {
+    ScanFrame* items;
+    size_t count;
+    size_t capacity;
+} ScanStack;
+
+
+typedef struct {
+        CacheHandle  dir_handle;
+        char         abs_path[PATH_MAX_LEN];
+        char         rel_path[PATH_MAX_LEN];
+        uint64_t cached_mtime;
+} PollFrame;
+
+typedef struct {
+    char     name[NAME_MAX_LEN];
+    bool     is_dir;
+    uint64_t mtime;
+} FsEntry;
+
+typedef struct {
+    FsEntry* items;
+    size_t   count;
+    size_t   capacity;
+} FsEntryList;
+
+typedef struct {
+    FileSystem* fs;         
+    PollFrame* stack;
+    size_t stack_count;
+    size_t stack_capacity;
+
+    ScanStack scan_stack;     
+    FsEntryList fs_list;
+
+    bool in_progress;
+    bool changed;
+    size_t dirs_per_frame;
+} PollState;
+
+struct FileSystem {
+    FileCacheEntry* entries;
+    size_t capacity;
+    size_t count;
+
+    uint32_t* free_list;
+    size_t free_capacity;
+    size_t free_count;
+
+    ChildArray root_children;
+
+    CacheHandle* all_handles;
+    size_t all_handles_capacity;
+    size_t all_handles_count;
+
+    char root_path[PATH_MAX_LEN];
+    uint64_t root_mtime;
+
+    double last_scan_time;
+    double scan_interval;
+
+    PollState poll_state;
+
+    bool dirty;
+};
+
+#ifdef _WIN32
+    static uint64_t PlatformGetMTime(const char* path) {
+        WIN32_FILE_ATTRIBUTE_DATA attr;
+        if (!GetFileAttributesExA(path, GetFileExInfoStandard, &attr)) return 0;
+        ULARGE_INTEGER uli;
+        uli.LowPart = attr.ftLastWriteTime.dwLowDateTime;
+        uli.HighPart = attr.ftLastWriteTime.dwHighDateTime;
+
+        return uli.QuadPart;
+    }
+
+    static bool PlatformReadDirectory(const char* dir_path, FsEntryList* out) {
+        out->count = 0;
+
+        char search_path[PATH_MAX_LEN];
+        snprintf(search_path, sizeof(search_path), "%s\\*", dir_path);
+
+        WIN32_FIND_DATAA fd;
+        HANDLE hFind = FindFirstFileA(search_path, &fd);
+        if (hFind == INVALID_HANDLE_VALUE) return false;
+        
+        do {
+            if (fd.cFileName[0] == '.' &&
+                (fd.cFileName[1] == '\0' ||
+                (fd.cFileName[1] == '.' && fd.cFileName[2] == '\0'))) {
+                continue; // Skip . and ..
+            }
+
+            if (out->count == out->capacity) {
+                out->capacity = out->capacity ? out->capacity * 2 : 64;
+                out->items = (FsEntry*)realloc(out->items, out->capacity * sizeof(FsEntry));
+            }
+
+            FsEntry* e = &out->items[out->count++];
+            strncpy(e->name, fd.cFileName, NAME_MAX_LEN - 1);
+            e->name[NAME_MAX_LEN - 1] = '\0';
+            e->is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+            ULARGE_INTEGER uli;
+            uli.LowPart  = fd.ftLastWriteTime.dwLowDateTime;
+            uli.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+            e->mtime = uli.QuadPart;
+        } while (FindNextFileA(hFind, &fd));
+
+        FindClose(hFind);
+        return true;
+    }
+
+    static bool PlatformJoinPath(char* out, size_t out_size, const char* a, const char* b) {
+        int written = snprintf(out, out_size, "%s\\%s", a, b);
+        if (written < 0 || written >= out_size) {
+            fprintf(stderr, "Warning: Path too long, skipping: %s\\%s\n", a, b);
+            return false;
+        }
+        return true;
+    }
+#else
+    static uint64_t PlatformGetMTime(const char* path) {
+        struct stat st;
+        if (stat(path, &st) != 0) return 0;
+        return (uint64_t)st.st_mtime;
+    }
+
+    static bool PlatformReadDirectory(const char* dir_path, FsEntryList* out) {
+        out->count = 0;
+
+        DIR* dir = opendir(dir_path);
+        if (!dir) return false;
+
+        struct dirent* de;
+        while ((de = readdir(dir)) != NULL) {
+            if (de->d_name[0] == '.' &&
+                (de->d_name[1] == '\0' ||
+                (de->d_name[1] == '.' && de->d_name[2] == '\0'))) {
+                continue;
+            }
+
+            if (out->count == out->capacity) {
+                out->capacity = out->capacity ? out->capacity * 2 : 64;
+                out->items = (FsEntry*)realloc(out->items, out->capacity * sizeof(FsEntry));
+            }
+
+            FsEntry* e = &out->items[out->count];
+            strncpy(e->name, de->d_name, NAME_MAX_LEN - 1);
+            e->name[NAME_MAX_LEN - 1] = '\0';
+
+            // Need full path for stat
+            char full[PATH_MAX_LEN];
+            snprintf(full, sizeof(full), "%s/%s", dir_path, de->d_name);
+
+            struct stat st;
+            if (stat(full, &st) != 0) continue; // skip entries we can't stat
+
+            e->is_dir = S_ISDIR(st.st_mode);
+            e->mtime  = (uint64_t)st.st_mtime;
+            out->count++;
+        }
+
+        closedir(dir);
+        return true;
+    }
+
+    static bool PlatformJoinPath(char* out, size_t out_size, const char* a, const char* b) {
+        int written = snprintf(out, out_size, "%s/%s", a, b);
+        if (written < 0 || written >= out_size) {
+            // Path too long - truncation occurred
+            fprintf(stderr, "Warning: Path too long, skipping: %s/%s\n", a, b);
+            return false;
+        }
+        return true;
+    }
+#endif
+
+static void StrToLower(const char* src, char* dst, size_t dst_size) {
+    size_t i = 0;
+    for (; src[i] && i < dst_size - 1; i++) {
+        dst[i] = (char)tolower((unsigned char)src[i]);
+    }
+    dst[i] = '\0';
+}
+
+static void InitFsEntryList(FsEntryList* list) {
+    list->items = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static void ClearFsEntryList(FsEntryList* list) {
+    free(list->items);
+    list->items = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static int CompareFsEntry(const void* a, const void* b) {
+    const FsEntry* ea = (const FsEntry*)a;
+    const FsEntry* eb = (const FsEntry*)b;
+
+    if (ea->is_dir != eb->is_dir) {
+        return ea->is_dir ? -1 : 1;
+    }
+
+    #ifdef _WIN32
+        return _stricmp(ea->name, eb->name);
+    #else
+        return strcasecmp(ea->name, eb->name);
+    #endif
+}
+
+static void SortFsEntry(FsEntryList* list) {
+    if (list->count > 1) {
+        qsort(list->items, list->count, sizeof(FsEntry), CompareFsEntry);
+    }
+}
+
+static void InitChildArray(ChildArray* arr) {
+    arr->items = NULL;
+    arr->count = 0;
+    arr->capacity = 0;
+}
+
+static void ClearChildArray(ChildArray* arr) {
+    free(arr->items);
+    arr->items = NULL;
+    arr->count = 0;
+    arr->capacity = 0;
+}
+
+static void PushChildArray(ChildArray* arr, CacheHandle handle) {
+    if (arr->count == arr->capacity) {
+        arr->capacity = arr->capacity ? arr->capacity * 2 : 8;
+        arr->items = (CacheHandle*)realloc(arr->items, arr->capacity * sizeof(CacheHandle));
+    }
+    arr->items[arr->count++] = handle;
+}
+
+FileCacheEntry* FileSystemGetEntry(const FileSystem* system, CacheHandle handle) {
+    if (cache_handle_is_invalid(handle)) return NULL;
+    if (handle.index >= system->count) return NULL;
+
+    FileCacheEntry* e = &system->entries[handle.index];
+    if (e->generation != handle.generation) return NULL;
+    if (!e->alive) return NULL;
+    return e;
+}
+
+static uint32_t FindSortedPosChildArray(const FileSystem* system, const ChildArray* arr, const FileCacheEntry* new_entry) {
+    for (uint32_t i = 0; i < arr->count; i++) {
+        const FileCacheEntry* existing = FileSystemGetEntry(system, arr->items[i]);
+        if (!existing) continue;
+
+        if (new_entry->type == TYPE_DIR && existing->type == TYPE_FILE) {
+            return i;
+        }
+        if (new_entry->type == TYPE_FILE && existing->type == TYPE_DIR) {
+            continue;
+        }
+
+        #ifdef _WIN32
+            if (_stricmp(new_entry->name, existing->name) < 0) return i;
+        #else
+            if (strcasecmp(new_entry->name, existing->name) < 0) return i;
+        #endif
+    }
+    return arr->count;
+}
+
+static void InsertSortedChildArray(FileSystem* system, ChildArray* arr, CacheHandle handle) {
+    const FileCacheEntry* entry = FileSystemGetEntry(system, handle);
+    if (!entry) return;
+
+    uint32_t pos = FindSortedPosChildArray(system, arr, entry);
+
+    if (arr->count == arr->capacity) {
+        arr->capacity = arr->capacity ? arr->capacity * 2 : 8;
+        arr->items = (CacheHandle*)realloc(arr->items,
+                                           arr->capacity * sizeof(CacheHandle));
+    }
+
+    if (pos < arr->count) {
+        memmove(&arr->items[pos + 1], &arr->items[pos],
+                (arr->count - pos) * sizeof(CacheHandle));
+    }
+    arr->items[pos] = handle;
+    arr->count++;
+}
+
+static void FileSystemEnsureCapacity(FileSystem* system, size_t needed) {
+    if (needed <= system->capacity) return;
+
+    size_t new_cap = system->capacity ? system->capacity * 2 : 256;
+    while (new_cap < needed) new_cap *= 2;
+
+    system->entries = (FileCacheEntry*)realloc(system->entries, new_cap * sizeof(FileCacheEntry));
+    system->capacity = new_cap;
+}
+
+static CacheHandle FileSystemAlloc(FileSystem* system) {
+    uint32_t idx;
+
+    if (system->free_count > 0) {
+        idx = system->free_list[--system->free_count];
+        system->entries[idx].generation++;
+    } else {
+        FileSystemEnsureCapacity(system, system->count + 1);
+        idx = (uint32_t)system->count++;
+        system->entries[idx].generation = 1;
+    }
+
+    FileCacheEntry* e = &system->entries[idx];
+    e->alive = true;
+    e->parent = CACHE_HANDLE_INVALID;
+    InitChildArray(&e->children);
+    e->name[0] = '\0';
+    e->name_lower[0] = '\0';
+    e->rel_path[0] = '\0';
+    e->type = TYPE_FILE;
+    e->mtime = 0;
+    e->is_open = false;
+
+    return (CacheHandle){idx, e->generation};
+}
+
+static void FileSystemFree(FileSystem* system, CacheHandle handle) {
+    FileCacheEntry* e = FileSystemGetEntry(system, handle);
+    if (!e) return;
+
+    ClearChildArray(&e->children);
+    e->alive = false;
+
+    if (system->free_count == system->free_capacity) {
+        system->free_capacity = system->free_capacity ? system->free_capacity * 2 : 64;
+        system->free_list = (uint32_t*)realloc(
+            system->free_list, system->free_capacity * sizeof(uint32_t)
+        );
+    }
+    system->free_list[system->free_count++] = handle.index;
+}
+
+static void RemoveChildFromArray(ChildArray* arr, CacheHandle handle) {
+    for (uint32_t i = 0; i < arr->count; i++) {
+        if (cache_handle_eq(arr->items[i], handle)) {
+            memmove(&arr->items[i], &arr->items[i + 1],
+                (arr->count - i - 1) * sizeof(CacheHandle));
+                arr->count--;
+                return;
+        }
+    }
+}
+
+static void FileSystemDeleteRecursive(FileSystem* system, CacheHandle handle) {
+    FileCacheEntry* root_entry = FileSystemGetEntry(system, handle);
+    if (!root_entry) return;
+
+    FileCacheEntry* parent = FileSystemGetEntry(system, root_entry->parent);
+    if (parent) {
+        RemoveChildFromArray(&parent->children, handle);
+    } else {
+        RemoveChildFromArray(&system->root_children, handle);
+    }
+
+
+    size_t stack_cap = 64;
+    size_t stack_count = 0;
+    CacheHandle* stack = (CacheHandle*)malloc(stack_cap * sizeof(CacheHandle));
+
+    stack[stack_count++] = handle;
+
+    while (stack_count > 0) {
+        CacheHandle current = stack[stack_count - 1];
+        FileCacheEntry* entry = FileSystemGetEntry(system, current);
+
+        if (!entry) {
+            stack_count--;
+            continue;
+        }
+
+        if (entry->type == TYPE_DIR && entry->children.count > 0) {
+            uint32_t n = entry->children.count;
+
+            while (stack_count + n > stack_cap) {
+                stack_cap *= 2;
+                stack = (CacheHandle*)realloc(stack, stack_cap * sizeof(CacheHandle));
+            }
+
+            for (uint32_t i = 0; i < n; i++) {
+                stack[stack_count++] = entry->children.items[i];
+            }
+
+            entry->children.count = 0;
+        } else {
+            stack_count--;
+            FileSystemFree(system, current);
+        }
+    }
+
+    free(stack);
+}
+
+static void FileSystemRebuildAllHandles(FileSystem* system) {
+    system->all_handles_count = 0;
+
+    for (size_t i = 0; i < system->count; i++) {
+        if (!system->entries[i].alive) continue;
+
+        if (system->all_handles_count == system->all_handles_capacity) {
+            system->all_handles_capacity = system->all_handles_capacity ? system->all_handles_capacity * 2 : 256;
+            system->all_handles = (CacheHandle*)realloc(system->all_handles, system->all_handles_capacity * sizeof(CacheHandle));
+        }
+
+        system->all_handles[system->all_handles_count++] = (CacheHandle) {(uint32_t)i, system->entries[i].generation};
+    }
+}
+
+static void InitScaneStack(ScanStack* stack) {
+    stack->items = NULL;
+    stack->count = 0; 
+    stack->capacity = 0;
+}
+
+static void ClearScanStack(ScanStack* stack) {
+    free(stack->items);
+    stack->items = NULL;
+    stack->count = 0;
+    stack->capacity = 0;
+}
+
+static void PushScanStack(ScanStack* stack, CacheHandle parent, const char* abs_path, const char* rel_path) {
+    if (stack->count == stack->capacity) {
+        stack->capacity = stack->capacity ? stack->capacity * 2 : 32;
+        stack->items = (ScanFrame*)realloc(stack->items, stack->capacity * sizeof(ScanFrame));
+    }
+
+    ScanFrame* f = &stack->items[stack->count++];
+    f->parent_handle = parent;
+    strncpy(f->abs_path, abs_path, PATH_MAX_LEN - 1);
+    f->abs_path[PATH_MAX_LEN - 1] = '\0';
+    strncpy(f->rel_path, rel_path, PATH_MAX_LEN - 1);
+    f->rel_path[PATH_MAX_LEN - 1] = '\0';
+}
+
+static bool PopScanStack(ScanStack* stack, ScanFrame* out) {
+    if (stack->count == 0) return false;
+    *out = stack->items[--stack->count];
+    return true;
+}
+
+static CacheHandle FileSystemCreateEntry(FileSystem* system, CacheHandle parent_handle, const char* rel_dir_path, const FsEntry* fs) {
+    size_t estimated_len;
+    if (rel_dir_path[0] == '\0') {
+        estimated_len = strlen(fs->name);
+    } else {
+        estimated_len = strlen(rel_dir_path) + 1 + strlen(fs->name);
+    }
+    
+    if (estimated_len >= PATH_MAX_LEN) {
+        fprintf(stderr, "Warning: Relative path too long, skipping: %s\n", fs->name);
+        return CACHE_HANDLE_INVALID;
+    }
+
+    CacheHandle handle = FileSystemAlloc(system);
+    FileCacheEntry* entry = FileSystemGetEntry(system, handle);
+    if (!entry) return CACHE_HANDLE_INVALID;
+
+    strncpy(entry->name, fs->name, NAME_MAX_LEN - 1);
+    entry->name[NAME_MAX_LEN - 1] = '\0';
+    StrToLower(entry->name, entry->name_lower, NAME_MAX_LEN);
+    
+    if (rel_dir_path[0] == '\0') {
+        strncpy(entry->rel_path, fs->name, PATH_MAX_LEN - 1);
+    } else {
+#ifdef _WIN32
+        snprintf(entry->rel_path, PATH_MAX_LEN, "%s\\%s", rel_dir_path, fs->name);
+#else
+        snprintf(entry->rel_path, PATH_MAX_LEN, "%s/%s", rel_dir_path, fs->name);
+#endif
+    }
+    entry->rel_path[PATH_MAX_LEN - 1] = '\0';
+
+
+    entry->type = fs->is_dir ? TYPE_DIR : TYPE_FILE;
+    entry->mtime = fs->mtime;
+    entry->parent = parent_handle;
+    entry->is_open = false;
+    return handle;
+}
+
+void ClearFileSystem(FileSystem* system) {
+    for (size_t i = 0; i < system->count; i++) {
+        if (system->entries[i].alive) {
+            ClearChildArray(&system->entries[i].children);
+        }
+    }
+
+    free(system->entries);
+    system->entries = 0;
+    system->capacity = 0;
+    system->count = 0;
+    
+    free(system->free_list);
+    system->free_list = NULL;
+    system->free_capacity = 0;
+    system->free_count = 0;
+
+    ClearChildArray(&system->root_children);
+    
+    free(system->all_handles);
+    system->all_handles = NULL;
+    system->all_handles_capacity = 0;
+    system->all_handles_count = 0;
+
+    
+    system->root_path[0] = '\0';
+    system->root_mtime   = 0;
+    system->dirty         = false;
+}
+
+bool FileSystemBuild(FileSystem* system, const char* root_path) {
+    printf("Hello\n");
+    ClearFileSystem(system);
+
+    strncpy(system->root_path, root_path, PATH_MAX_LEN - 1);
+    system->root_path[PATH_MAX_LEN - 1] = '\0';
+
+    system->root_mtime = PlatformGetMTime(root_path);
+    if (system->root_mtime == 0) return false;
+
+    FsEntryList fs_list;
+    InitFsEntryList(&fs_list);
+
+    ScanStack stack;
+    InitScaneStack(&stack);
+
+    PushScanStack(&stack, CACHE_HANDLE_INVALID, root_path, "");
+
+    ScanFrame frame;
+    while (PopScanStack(&stack, &frame)) {
+        if (!PlatformReadDirectory(frame.abs_path, &fs_list)) continue;
+        SortFsEntry(&fs_list);
+
+        for (size_t i = 0; i < fs_list.count; i++) {
+            FsEntry* fs = &fs_list.items[i];
+
+            CacheHandle handle = FileSystemCreateEntry(system, frame.parent_handle, frame.rel_path, fs);
+            if (cache_handle_is_invalid(handle)) continue;
+
+            // Get parent_children AFTER allocation to avoid pointer invalidation
+            ChildArray* parent_children;
+            if (cache_handle_is_invalid(frame.parent_handle)) {
+                parent_children = &system->root_children;
+            } else {
+                FileCacheEntry* parent_entry = FileSystemGetEntry(system, frame.parent_handle);
+                if (!parent_entry) continue;
+                parent_children = &parent_entry->children;
+            }
+
+            PushChildArray(parent_children, handle);
+
+            if (fs->is_dir) {
+                char abs_child[PATH_MAX_LEN];
+                if (PlatformJoinPath(abs_child, sizeof(abs_child), frame.abs_path, fs->name)) {
+                    FileCacheEntry* entry = FileSystemGetEntry(system, handle);
+                    if (entry) {
+                        PushScanStack(&stack, handle, abs_child, entry->rel_path);
+                    }
+                } else {
+                    fprintf(stderr, "Skipping directory (path too long): %s\n", fs->name);
+                }
+            }
+        }
+    }
+    printf("Hello2");
+
+    ClearFsEntryList(&fs_list);
+    ClearScanStack(&stack);
+
+    FileSystemRebuildAllHandles(system);
+    system->dirty = true;
+    printf("End");
+    
+    return true;
+}
+
+static CacheHandle FindChildByName(const FileSystem* system, const ChildArray* children, const char* name) {
+    for (uint32_t i = 0; i < children->count; i++) {
+        const FileCacheEntry* e = FileSystemGetEntry(system, children->items[i]);
+        if (!e) continue;
+#ifdef _WIN32
+        if (_stricmp(e->name, name) == 0) return children->items[i];
+#else
+        if (strcmp(e->name, name) == 0) return children->items[i];
+#endif
+    }
+    return CACHE_HANDLE_INVALID;
+}
+
+static bool FsEntryListContains(const FsEntryList* list, const char* name) {
+    for (size_t i = 0; i < list->count; i++) {
+#ifdef _WIN32
+        if (_stricmp(list->items[i].name, name) == 0) return true;
+#else
+        if (strcmp(list->items[i].name, name) == 0) return true;
+#endif
+    }
+    return false;
+}
+
+void FileSystemPollBegin(FileSystem* system) {
+    PollState* ps = &system->poll_state;
+    ps->in_progress = true;
+    ps->changed = false;
+    ps->stack_count = 0;
+
+    if (ps->stack_count >= ps->stack_capacity) {
+        ps->stack_capacity = ps->stack_capacity ? ps->stack_capacity * 2 : 32;
+        ps->stack = realloc(ps->stack, ps->stack_capacity * sizeof(PollFrame));
+    }
+    PollFrame* f = &ps->stack[ps->stack_count++];
+    f->dir_handle = CACHE_HANDLE_INVALID;
+    strncpy(f->abs_path, system->root_path, PATH_MAX_LEN - 1);
+    f->abs_path[PATH_MAX_LEN - 1] = '\0';
+    f->rel_path[0] = '\0';
+    f->cached_mtime = system->root_mtime;
+}
+
+bool FileSystemPollStep(FileSystem* system, size_t max_dirs) {
+    PollState* ps = &system->poll_state;
+    size_t dirs_processed = 0;
+
+    // Phase 1: Process poll stack (check existing dirs for changes)
+    while (ps->stack_count > 0 && dirs_processed < max_dirs) {
+        PollFrame frame = ps->stack[--ps->stack_count];
+
+        ChildArray* dir_children;
+        if (cache_handle_is_invalid(frame.dir_handle)) {
+            dir_children = &system->root_children;
+        } else {
+            FileCacheEntry* e = FileSystemGetEntry(system, frame.dir_handle);
+            if (!e) continue;
+            dir_children = &e->children;
+        }
+
+        dirs_processed++;
+
+        uint64_t current_mtime = PlatformGetMTime(frame.abs_path);
+
+        if (current_mtime != frame.cached_mtime) {
+            FileCacheEntry* e = FileSystemGetEntry(system, frame.dir_handle);
+            if (e) e->mtime = current_mtime;
+
+            
+
+            if (PlatformReadDirectory(frame.abs_path, &ps->fs_list)) {
+                // Remove children that no longer exist on disk
+                for (int32_t i = (int32_t)dir_children->count - 1; i >= 0; i--) {
+                    CacheHandle child_h = dir_children->items[i];
+                    FileCacheEntry* child = FileSystemGetEntry(system, child_h);
+                    if (!child) continue;
+
+                    if (!FsEntryListContains(&ps->fs_list, child->name)) {
+                        FileSystemDeleteRecursive(system, child_h);
+                        ps->changed = true;
+                    }
+                }
+
+                // Add or update children from disk
+                for (size_t i = 0; i < ps->fs_list.count; i++) {
+                    FsEntry* fs = &ps->fs_list.items[i];
+                    CacheHandle existing = FindChildByName(system, dir_children, fs->name);
+
+                    if (cache_handle_is_invalid(existing)) {
+                        CacheHandle handle = FileSystemCreateEntry(system, frame.dir_handle, frame.rel_path, fs);
+                        if (cache_handle_is_invalid(handle)) continue;
+
+                        ChildArray* dir_children;
+                        if (cache_handle_is_invalid(frame.dir_handle)) {
+                            dir_children = &system->root_children;
+                        } else {
+                            FileCacheEntry* dir_entry = FileSystemGetEntry(system, frame.dir_handle);
+                            if (!dir_entry) continue;
+                            dir_children = &dir_entry->children;
+                        }
+
+                        InsertSortedChildArray(system, dir_children, handle);
+
+                        if (fs->is_dir) {
+                            char abs_child[PATH_MAX_LEN];
+                            if (!PlatformJoinPath(abs_child, sizeof(abs_child), frame.abs_path, fs->name)) {
+                                continue;
+                            }
+                            FileCacheEntry* entry = FileSystemGetEntry(system, handle);
+                            if (entry) {
+                                PushScanStack(&ps->scan_stack, handle, abs_child, entry->rel_path);
+                            }
+                        }
+
+                        ps->changed = true;
+                    } else {
+                        FileCacheEntry* e = FileSystemGetEntry(system, existing);
+                        if (e) {
+                            FileType fs_type = fs->is_dir ? TYPE_DIR : TYPE_FILE;
+                            if (e->type != fs_type) {
+                                FileSystemDeleteRecursive(system, existing);
+
+                                CacheHandle handle = FileSystemCreateEntry(system, frame.dir_handle, frame.rel_path, fs);
+                                if (cache_handle_is_invalid(handle)) continue;
+
+                                ChildArray* dir_children;
+                                if (cache_handle_is_invalid(frame.dir_handle)) {
+                                    dir_children = &system->root_children;
+                                } else {
+                                    FileCacheEntry* dir_entry = FileSystemGetEntry(system, frame.dir_handle);
+                                    if (!dir_entry) continue;
+                                    dir_children = &dir_entry->children;
+                                }
+
+                                InsertSortedChildArray(system, dir_children, handle);
+
+                                if (fs->is_dir) {
+                                    char abs_child[PATH_MAX_LEN];
+                                    if (!PlatformJoinPath(abs_child, sizeof(abs_child), frame.abs_path, fs->name)) {
+                                        continue;
+                                    }
+                                    FileCacheEntry* entry = FileSystemGetEntry(system, handle);
+                                    if (entry) {
+                                        PushScanStack(&ps->scan_stack, handle, abs_child, entry->rel_path);
+                                    }
+                                }
+
+                                ps->changed = true;
+                            } else {
+                                e->mtime = fs->mtime;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Enqueue child directories for future poll frames
+        {
+            uint32_t n = dir_children->count;
+            for (uint32_t i = 0; i < n; i++) {
+                CacheHandle child_h = dir_children->items[i];
+                FileCacheEntry* child = FileSystemGetEntry(system, child_h);
+                if (!child || child->type != TYPE_DIR) continue;
+
+                if (ps->stack_count == ps->stack_capacity) {
+                    ps->stack_capacity = ps->stack_capacity ? ps->stack_capacity * 2 : 32;
+                    ps->stack = (PollFrame*)realloc(ps->stack, ps->stack_capacity * sizeof(PollFrame));
+                }
+
+                PollFrame* pf = &ps->stack[ps->stack_count++];
+                pf->dir_handle = child_h;
+                if (!PlatformJoinPath(pf->abs_path, sizeof(pf->abs_path), frame.abs_path, child->name)) {
+                    ps->stack_count--;
+                    continue;
+                }
+                strncpy(pf->rel_path, child->rel_path, PATH_MAX_LEN - 1);
+                pf->rel_path[PATH_MAX_LEN - 1] = '\0';
+                pf->cached_mtime = child->mtime;
+            }
+        }
+    }
+
+    // Phase 2: Drain scan_stack (fully expand newly discovered directories)
+    // Uses remaining budget from this frame
+    {
+        ScanFrame sf;
+        while (dirs_processed < max_dirs && PopScanStack(&ps->scan_stack, &sf)) {
+            dirs_processed++;
+
+            if (!PlatformReadDirectory(sf.abs_path, &ps->fs_list)) continue;
+            SortFsEntry(&ps->fs_list);
+
+            for (size_t i = 0; i < ps->fs_list.count; i++) {
+                FsEntry* fs = &ps->fs_list.items[i];
+
+                CacheHandle handle = FileSystemCreateEntry(system, sf.parent_handle, sf.rel_path, fs);
+                if (cache_handle_is_invalid(handle)) continue;
+
+                ChildArray* parent_children;
+                if (cache_handle_is_invalid(sf.parent_handle)) {
+                    parent_children = &system->root_children;
+                } else {
+                    FileCacheEntry* parent_entry = FileSystemGetEntry(system, sf.parent_handle);
+                    if (!parent_entry) continue;
+                    parent_children = &parent_entry->children;
+                }
+
+                PushChildArray(parent_children, handle);
+
+                if (fs->is_dir) {
+                    char abs_child[PATH_MAX_LEN];
+                    if (!PlatformJoinPath(abs_child, sizeof(abs_child), sf.abs_path, fs->name)) {
+                        continue;
+                    }
+                    FileCacheEntry* entry = FileSystemGetEntry(system, handle);
+                    if (entry) {
+                        PushScanStack(&ps->scan_stack, handle, abs_child, entry->rel_path);
+                    }
+                }
+            }
+        }
+    }
+
+    // Check if both stacks are empty → poll complete
+    if (ps->stack_count == 0 && ps->scan_stack.count == 0) {
+        if (ps->changed) {
+            FileSystemRebuildAllHandles(system);
+            system->dirty = true;
+        }
+        ps->in_progress = false;
+        return true;
+    }
+    return false;
+}
+
+FileSystem InitFileSystem() {
+    FileSystem system = {0};
+    system.scan_interval = INITIAL_SCAN_INTERVAL;
+    InitChildArray(&system.root_children);
+    return system;
+}
 
 Vector2 PositionToVector(Position position) {
     return (Vector2){position.x, position.y};
@@ -105,6 +1080,7 @@ typedef enum {
     ACTION_OPEN_FILE,
 
     ACTION_OPEN_FILE_EXPLORER,
+    ACTION_OPEN_STATISTICS,
 
     ACTION_EXECUTE_COMMAND
 } ActionType;
@@ -145,6 +1121,7 @@ const char* ActionTypeToString(ActionType type) {
         case ACTION_OPEN_BUFFER_LIST: return "ACTION_OPEN_BUFFER_LIST";
         case ACTION_OPEN_FILE: return "ACTION_OPEN_FILE";
         case ACTION_OPEN_FILE_EXPLORER: return "ACTION_OPEN_FILE_EXPLORER";
+        case ACTION_OPEN_STATISTICS: return "ACTION_OPEN_STATISTICS";
         default: return "UNKNOWN_ACTION";
     }
 }
@@ -238,6 +1215,7 @@ static KeyBinding default_normal_bindings[] = {
     { KEY_B, MODI_CTRL, ACTION_OPEN_BUFFER_LIST },
     { KEY_O, MODI_CTRL, ACTION_OPEN_FILE },
     { KEY_E, MODI_CTRL, ACTION_OPEN_FILE_EXPLORER },
+    { KEY_D, MODI_CTRL, ACTION_OPEN_STATISTICS },
 };
 
 static KeyBinding default_command_bindings[] = {
@@ -252,380 +1230,6 @@ static KeyBinding default_command_bindings[] = {
 
     { KEY_ENTER,     MODI_NONE, ACTION_EXECUTE_COMMAND },
 };
-
-typedef struct {
-    FileType type;
-
-    char* path;
-    size_t path_length;
-    char* name;
-    size_t name_length;
-    int* children;
-    size_t children_count;
-} Node;
-
-void ClearNode(Node* node) {
-    if (node->path) {
-        free(node->path);
-    }
-    node->path_length = 0;
-
-    if (node->name) {
-        free(node->name);
-    }
-    node->name_length = 0;
-
-    if (node->children) {
-        free(node->children);
-    }
-    node->children = 0;
-}
-
-typedef struct {
-    char* path;
-    size_t index;
-} PendingDir;
-
-void ClearPendingDir(PendingDir* dir) {
-    if (dir->path) {
-        free(dir->path);
-    }
-}
-
-typedef struct {
-    Node* nodes;
-    size_t count;
-    size_t capacity;
-    size_t root_index;
-} FileTree;
-
-FileTree InitFileTree(size_t init_capacity) {
-    FileTree tree = {0};
-    tree.capacity = init_capacity;
-    tree.nodes = calloc(tree.capacity, sizeof(Node));
-    return tree;
-}
-
-size_t AddNodeToTree(FileTree* tree, FileType type, const char* path, const char* name) {
-    if (tree->count >= tree->capacity) {
-        size_t new_capacity = tree->capacity * 2;
-        Node* new_nodes = realloc(tree->nodes, sizeof(Node) * new_capacity);
-
-        if (!new_nodes) {
-            return SIZE_MAX;
-        }
-        tree->nodes = new_nodes;
-        tree->capacity = new_capacity;
-    }
-    
-    size_t index = tree->count++;
-    Node* node = &tree->nodes[index];
-    node->type = type;
-    node->path = strdup(path);
-    node->name = strdup(name);
-
-    if (!node->path || !node->name) {
-        free(node->path);
-        free(node->name);
-        tree->count--;
-        return SIZE_MAX;
-    }
-
-    node->path_length = strlen(path);
-    node->name_length = strlen(name);
-    node->children = NULL;
-    node->children_count = 0;
-    
-    return index;
-}
-
-void ClearFileTree(FileTree* tree) {
-    if (!tree) return;
-    if (tree->nodes) {
-        for (size_t i = 0; i < tree->count; i++) {
-            ClearNode(&tree->nodes[i]);
-        }
-        free(tree->nodes);
-    }
-
-    tree->capacity = 0;
-    tree->count = 0;
-}
- 
-typedef struct {
-    char* root_path;
-
-    FileTree* active;
-    FileTree* building;
-
-    double last_scan_time;
-    double scan_interval;
-
-    bool rebuild_requested;
-    bool rebuild_in_progress;
-
-    PendingDir* pending_dirs;
-    size_t pending_count;
-    size_t pending_capacity;
-    size_t dirs_per_frame;
-} FileSystem;
-
-FileSystem InitFileSystem(char* root_path) {
-    FileSystem system = {0};
-
-    system.root_path = root_path ? strdup(root_path) : NULL;
-
-    system.rebuild_requested = true;
-    system.scan_interval = INITIAL_SCAN_INTERVAL;
-    system.dirs_per_frame = INITIAL_DIRS_PER_FRAME;
-
-    return system;
-}
-
-void AddPendingDir(FileSystem* system, const char* path, size_t node_index) {
-    if (node_index == SIZE_MAX) return;
-
-    if (system->pending_count >= system->pending_capacity) {
-        size_t new_capacity = system->pending_capacity == 0 
-            ? 64 : system->pending_capacity * 2;
-        PendingDir* new_dirs = realloc(system->pending_dirs,
-            sizeof(PendingDir) * new_capacity);
-        if (!new_dirs) {
-            return;
-        }
-        system->pending_dirs = new_dirs;
-        system->pending_capacity = new_capacity;
-    }
-
-    char* path_copy = strdup(path);
-    if (!path_copy) {
-        return;
-    }
-    
-    system->pending_dirs[system->pending_count++] = (PendingDir){
-        .path = path_copy,
-        .index = node_index
-    };
-}
-
-void ClearFileSystem(FileSystem* system) {
-    if (system->root_path) {
-        free(system->root_path);
-    }
-
-    if (system->active) {
-        ClearFileTree(system->active);
-        free(system->active);
-    }
-
-    if (system->building) {
-        ClearFileTree(system->building);
-        free(system->building);
-    }
-
-    if (system->pending_dirs) {
-        for (size_t i = 0; i < system->pending_count; i++) {
-            ClearPendingDir(&system->pending_dirs[i]);
-        }
-        free(system->pending_dirs);
-    }
-}
-
-void AddChildToTreeNode(FileTree* tree, size_t parent_index, size_t child_index) {
-    if (parent_index >= tree->count || child_index == SIZE_MAX) {
-        return;
-    }
-
-    Node* parent = &tree->nodes[parent_index];
-    size_t current_capacity = (parent->children_count == 0) ? 0 : 
-        ((parent->children_count - 1) / 16 + 1) * 16;
-    
-    if (parent->children_count >= current_capacity) {
-        size_t new_capacity = current_capacity + 16;
-        int* new_children = realloc(parent->children, sizeof(int) * new_capacity);
-        if (!new_children) {
-            return;
-        }
-        parent->children = new_children;
-    }
-
-    parent->children[parent->children_count++] = (int)child_index;
-}
-
-char* JoinPath(const char* base, const char* name) {
-    size_t base_len = strlen(base);
-    size_t name_len = strlen(name);
-    char* result = malloc(base_len + name_len + 2);
-    
-    strcpy(result, base);
-    #ifdef _WIN32
-        if (base[base_len - 1] != '\\' && base[base_len - 1] != '/') {
-            strcat(result, "\\");
-        }
-    #else
-        if (base[base_len - 1] != '/') {
-            strcat(result, "/");
-        }
-    #endif
-    strcat(result, name);
-    return result;
-}
-
-#ifdef _WIN32
-    void ProcessSingleDirectory(FileSystem* system, const char* path, size_t dir_node_index) {
-        FileTree* tree = system->building;
-        if (!tree || dir_node_index >= tree->count) return;
-        
-        char search_path[MAX_PATH];
-        snprintf(search_path, MAX_PATH, "%s\\*", path);
-        
-        WIN32_FIND_DATAA find_data;
-        HANDLE find_handle = FindFirstFileA(search_path, &find_data);
-        
-        if (find_handle == INVALID_HANDLE_VALUE) return;
-        
-        do {
-            if (strcmp(find_data.cFileName, ".") == 0 || 
-                strcmp(find_data.cFileName, "..") == 0) continue;
-            
-            if (find_data.cFileName[0] == '.') continue;
-            if (strcmp(find_data.cFileName, "node_modules") == 0) continue;
-            if (strcmp(find_data.cFileName, ".git") == 0) continue;
-            
-            char* full_path = JoinPath(path, find_data.cFileName);
-            size_t child_index;
-            
-            if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                child_index = AddNodeToTree(tree, TYPE_DIR, full_path, find_data.cFileName);
-                if (child_index != SIZE_MAX) {
-                    AddPendingDir(system, full_path, child_index);
-                }
-            } else {
-                child_index = AddNodeToTree(tree, TYPE_FILE, full_path, find_data.cFileName);
-            }
-            if (child_index != SIZE_MAX) {
-                AddChildToTreeNode(tree, dir_node_index, child_index);
-            }
-            
-            free(full_path);
-            
-        } while (FindNextFileA(find_handle, &find_data));
-        
-        FindClose(find_handle);
-    }
-#else
-    void ProcessSingleDirectory(FileSystem* system, const char* path, size_t dir_node_index) {
-        FileTree* tree = system->building;
-        DIR* dir = opendir(path);
-        if (!dir) return;
-        
-        struct dirent* entry;
-        while ((entry = readdir(dir)) != NULL) {
-            if (strcmp(entry->d_name, ".") == 0 || 
-                strcmp(entry->d_name, "..") == 0) continue;
-            
-            if (entry->d_name[0] == '.') continue;
-            if (strcmp(entry->d_name, "node_modules") == 0) continue;
-            
-            char* full_path = JoinPath(path, entry->d_name);
-            struct stat entry_stat;
-            
-            if (stat(full_path, &entry_stat) == 0) {
-                size_t child_index;
-                
-                if (S_ISDIR(entry_stat.st_mode)) {
-                    child_index = AddNodeToTree(tree, TYPE_DIR, full_path, entry->d_name);
-                    AddPendingDir(system, full_path, child_index);
-                } else {
-                    child_index = AddNodeToTree(tree, TYPE_FILE, full_path, entry->d_name);
-                }
-                
-                AddChildToTreeNode(tree, dir_node_index, child_index);
-            }
-            free(full_path);
-        }
-        closedir(dir);
-    }
-#endif
-
-void UpdateFileCache(FileSystem* system) {
-    if (!system || !system->root_path) return;
-
-    double current_time = GetTime();
-    
-    if (!system->rebuild_in_progress && 
-        (current_time - system->last_scan_time > system->scan_interval || system->active == NULL)) {
-        system->rebuild_requested = true;
-    }
-    
-    if (system->rebuild_requested && !system->rebuild_in_progress) {
-        system->rebuild_requested = false;
-        system->rebuild_in_progress = true;
-        
-        if (system->building) {
-            ClearFileTree(system->building);
-        }
-        size_t initial_capacity = INITIAL_FILE_TREE_CAPACITY;
-        if (system->active) {
-            initial_capacity = system->active->capacity;
-        }
-
-        system->building = malloc(sizeof(FileTree));
-        *system->building = InitFileTree(initial_capacity);
-
-        if (!system->building) {
-            system->rebuild_in_progress = false;
-            return;
-        }
-    
-        for (int i = 0; i < system->pending_count; i++) {
-            if (system->pending_dirs[i].path) {
-                ClearPendingDir(&system->pending_dirs[i]);
-            }
-        }
-        system->pending_count = 0;
-        
-        const char* name = strrchr(system->root_path, '/');
-        #ifdef _WIN32
-            const char* name_win = strrchr(system->root_path, '\\');
-            if (name_win > name) name = name_win;
-        #endif
-        name = name ? name + 1 : system->root_path;
-        system->building->root_index = AddNodeToTree(
-            system->building, TYPE_DIR, system->root_path, name);
-        if (system->building->root_index == SIZE_MAX) {
-            ClearFileTree(system->building);
-            system->building = NULL;
-            system->rebuild_in_progress = false;
-            return;
-        }
-        AddPendingDir(system, system->root_path, system->building->root_index);
-    }
-    
-    if (system->rebuild_in_progress) {
-        size_t dirs_to_process = system->dirs_per_frame;
-        
-        while (dirs_to_process > 0 && system->pending_count > 0) {
-            PendingDir entry = system->pending_dirs[--system->pending_count];
-            
-            ProcessSingleDirectory(system, entry.path, entry.index);
-            free(entry.path);
-            dirs_to_process--;
-        }
-        
-        if (system->pending_count == 0) {
-            system->rebuild_in_progress = false;
-            system->last_scan_time = current_time;
-            
-            FileTree* old = system->active;
-            system->active = system->building;
-            system->building = NULL;
-            // TODO: Maybe build diff for cool features
-            ClearFileTree(old);
-            free(old);
-        }
-    }
-}
 
 typedef struct Modal Modal;
 
@@ -657,6 +1261,7 @@ typedef void (*ModalRenderFunc)(Modal* modal, Rect content_bounds);
 typedef void (*ModalInputFunc)(Modal* modal, RawInput input);
 typedef void (*ModalCleanupFunc)(void* state);
 typedef void (*ModalResultCallback)(Modal* modal, bool confirmed, void* result, void* user_data);
+typedef void (*ModalUpdateFunc)(Modal* modal);
 
 struct Modal {
     char* title;
@@ -676,6 +1281,7 @@ struct Modal {
     bool is_cached;
 
     ModalRenderFunc custom_render;
+    ModalUpdateFunc custom_update;
     ModalInputFunc custom_input;
     ModalCleanupFunc cleanup;
 
@@ -801,13 +1407,14 @@ void RegisterModalToQuickCatch(ModalSystem* system, const char* key, Modal* moda
     system->modal_keys[index] = strdup(key);
 }
 
-Modal* CreateModal(ModalSystem* system, const char* title, Position wanted_size, ModalRenderFunc render, ModalInputFunc input, ModalCleanupFunc cleanup, void* state) {
+Modal* CreateModal(ModalSystem* system, const char* title, Position wanted_size, ModalRenderFunc render, ModalUpdateFunc update, ModalInputFunc input, ModalCleanupFunc cleanup, void* state) {
     Modal* modal = calloc(1, sizeof(Modal));
     modal->title = strdup(title);
     modal->wanted_size = wanted_size;
     modal->style = system->default_style;
     modal->custom_render = render;
     modal->custom_input = input;
+    modal->custom_update = update;
     modal->cleanup = cleanup;
     modal->state = state;
 
@@ -1813,12 +2420,40 @@ void ClearEditorSettings(EditorSettings* settings) {
     }
 }
 
+
+
+static void PrintTree(const FileSystem* system, const ChildArray* children, int indent) {
+    for (uint32_t i = 0; i < children->count; i++) {
+        FileCacheEntry* e = FileSystemGetEntry(system, children->items[i]);
+        if (!e) continue;
+        for (int j = 0; j < indent; j++) printf("  ");
+        if (e->type == TYPE_DIR) {
+            printf("[DIR]  %s  (rel: %s)\n", e->name, e->rel_path);
+            PrintTree(system, &e->children, indent + 1);
+        } else {
+            printf("[FILE] %s  (rel: %s)\n", e->name, e->rel_path);
+        }
+    }
+}
+
+static void PrintFileSystem(const FileSystem* system) {
+    printf("\n=== FileSystem ===\n");
+    printf("Root: %s\n", system->root_path);
+    printf("Alive: %zu / %zu slots, Free: %zu\n",
+           system->all_handles_count, system->count, system->free_count);
+    printf("Dirty: %s\n\n", system->dirty ? "YES" : "NO");
+    PrintTree(system, &system->root_children, 0);
+    printf("\n");
+}
+
+
 struct Editor{
     EditorState state;
     EditorSettings settings;
     InputSystem input_system;
     ModalSystem modal_system;
     FileSystem file_system;
+    StatisticSystem statistic_system;
 };
  
 void OpenEmptyBuffer(Editor* editor) {
@@ -1830,7 +2465,8 @@ void OpenEmptyBuffer(Editor* editor) {
 }
 
 void OpenDirectoryFromPath(Editor* editor, const char* path) {
-    editor->file_system.root_path = strdup(path);
+    FileSystemBuild(&editor->file_system, path);
+    //PrintFileSystem(&editor->file_system);
     OpenEmptyBuffer(editor);
 }
 
@@ -1897,6 +2533,161 @@ void ModalSystemRender(Editor* editor) {
     }
 
     EndScissorMode();
+}
+
+typedef struct {
+    Editor* editor;
+    size_t scroll_offset;
+} StatisticsState;
+
+void StatisticsRender(Modal* modal, Rect content) {
+    StatisticsState* state = (StatisticsState*)modal->state;
+    Editor* editor = state->editor;
+    StatisticSystem* stats = &editor->statistic_system;
+    Font font = editor->settings.editor_font;
+    int font_size = editor->settings.font_size;
+    int row_height = font_size + modal->style.widget_spacing;
+    int pad = modal->style.content_padding.x;
+
+    BeginScissorMode(content.position.x, content.position.y,
+                     content.size.x, content.size.y);
+
+    int y = content.position.y + pad;
+    
+    char buffer[256];
+    snprintf(buffer, sizeof(buffer), "Frame Count: %llu", 
+             (unsigned long long)stats->frame_count);
+    DrawTextEx(font, buffer, (Vector2){content.position.x + pad, y}, 
+               font_size, 1, modal->style.text);
+    y += row_height;
+    
+    y += row_height / 2;
+    DrawLine(content.position.x + pad, y, 
+             content.position.x + content.size.x - pad, y, 
+             modal->style.border);
+    y += row_height / 2;
+    
+    const char* timer_names[] = {
+        "Frame Timer",
+        "Render Timer",
+        "Update Timer",
+        "File Polling Timer",
+        "File Step Polling Timer",
+        "Modal Update",
+        "Input Timer"
+    };
+    
+    for (int i = 0; i < EDITOR_TIMER_COUNT; i++) {
+        if (i >= state->scroll_offset && 
+            y < content.position.y + content.size.y - row_height) {
+            
+            StatisticTimer* timer = &stats->timers[i];
+            
+            DrawTextEx(font, timer_names[i], 
+                      (Vector2){content.position.x + pad, y}, 
+                      font_size, 1, modal->style.focused_border);
+            y += row_height;
+            
+            double avg_ms = TimerAverage(stats, i);
+            snprintf(buffer, sizeof(buffer), "  Average: %.3f ms", avg_ms);
+            DrawTextEx(font, buffer, 
+                      (Vector2){content.position.x + pad * 2, y}, 
+                      font_size * 0.8, 1, modal->style.text);
+            y += row_height;
+            
+            double min_ms = timer->count > 0 ? timer->min_ns / 1000000.0 : 0.0;
+            snprintf(buffer, sizeof(buffer), "  Min: %.3f ms", min_ms);
+            DrawTextEx(font, buffer, 
+                      (Vector2){content.position.x + pad * 2, y}, 
+                      font_size * 0.8, 1, modal->style.text);
+            y += row_height;
+            
+            double max_ms = timer->max_ns / 1000000.0;
+            snprintf(buffer, sizeof(buffer), "  Max: %.3f ms", max_ms);
+            DrawTextEx(font, buffer, 
+                      (Vector2){content.position.x + pad * 2, y}, 
+                      font_size * 0.8, 1, modal->style.text);
+            y += row_height;
+            
+            snprintf(buffer, sizeof(buffer), "  Count: %llu", 
+                    (unsigned long long)timer->count);
+            DrawTextEx(font, buffer, 
+                      (Vector2){content.position.x + pad * 2, y}, 
+                      font_size * 0.8, 1, modal->style.text_muted);
+            y += row_height + row_height / 2;
+        }
+    }
+
+    EndScissorMode();
+}
+
+void StatisticsInput(Modal* modal, RawInput input) {
+    StatisticsState* state = (StatisticsState*)modal->state;
+    
+    switch (input.key) {
+        case KEY_UP:
+            if (state->scroll_offset > 0) {
+                state->scroll_offset--;
+            }
+            break;
+        case KEY_DOWN:
+            if (state->scroll_offset < EDITOR_TIMER_COUNT - 1) {
+                state->scroll_offset++;
+            }
+            break;
+        case KEY_ESCAPE:
+        case KEY_D: 
+            if (input.key == KEY_D && !HasModifiers(input.modifiers, MODI_CTRL)) {
+                break;
+            }
+            CloseModal(&state->editor->modal_system, false);
+            break;
+    }
+}
+
+void StatisticsCleanup(void* raw_state) {
+    StatisticsState* state = (StatisticsState*)raw_state;
+    free(state);
+}
+
+void RegisterStatisticsModal(Editor* editor) {
+    StatisticsState* state = calloc(1, sizeof(StatisticsState));
+    state->editor = editor;
+    state->scroll_offset = 0;
+
+    Modal* modal = CreateModal(
+        &editor->modal_system,
+        "Performance Statistics",
+        (Position){700, 600},
+        StatisticsRender,
+        NULL,  // No update function needed
+        StatisticsInput,
+        StatisticsCleanup,
+        state
+    );
+    
+    modal->style.draw_title = true;
+    modal->style.title_padding = (Position){10, 10};
+    modal->is_cached = true;
+    modal->margin = (Position){50, 50};
+
+    ModalAddLayout(modal, ApplyWantedSize);
+    ModalAddLayout(modal, ApplyMinSize);
+    ModalAddLayout(modal, ApplyMaxSize);
+    ModalAddLayout(modal, ApplyMargin);
+    ModalAddLayout(modal, CenterModal);
+
+    RegisterModalToQuickCatch(&editor->modal_system, "statistics", modal);
+}
+
+void OpenStatisticsModal(Editor* editor) {
+    PushModalFromCache(&editor->modal_system, "statistics");
+    
+    Modal* top = GetTopModal(&editor->modal_system);
+    if (top) {
+        StatisticsState* state = (StatisticsState*)top->state;
+        state->scroll_offset = 0;  // Reset scroll on open
+    }
 }
 
 typedef struct {
@@ -2005,6 +2796,7 @@ void RegisterBufferListModal(Editor* editor) {
         "Open Buffers",
         (Position){500, 400},
         BufferListRender,
+        NULL,
         BufferListInput,
         BufferListCleanup,
         state
@@ -2067,30 +2859,10 @@ void ClearVisibleNodeList(VisibleNodeList* list) {
 
 typedef struct {
     Editor* editor;
-
-    char* search_buffer;
-    size_t search_capacity;
-    size_t search_length;
-    size_t search_cursor;
-
-    size_t selected_visible;
-    size_t selected_node;
-    size_t scroll_offset;
-
-    bool* folder_open;
-    size_t folder_open_capacity;
-
-    VisibleNodeList visible;
-    bool needs_rebuild;
-
-    FileTree* last_tree;
 } FileExplorerState;
 
 void FileExplorerCleanup(void* raw_state) {
     FileExplorerState* state = (FileExplorerState*)raw_state;
-    if (state->search_buffer) free(state->search_buffer);
-    if (state->folder_open) free(state->folder_open);
-    ClearVisibleNodeList(&state->visible);
     free(state);
 }
 
@@ -2114,119 +2886,6 @@ bool StrContainsCaseInsensitive(const char* haystack, const char* needle) {
     return false;
 }
 
-void EnsureFolderOpenCapacity(FileExplorerState* state, size_t needed) {
-    if (needed <= state->folder_open_capacity) return;
-    size_t new_cap = state->folder_open_capacity == 0 ? 256 : state->folder_open_capacity;
-    while (new_cap < needed) new_cap *= 2;
-    state->folder_open = realloc(state->folder_open, new_cap * sizeof(bool));
-    memset(state->folder_open + state->folder_open_capacity, 0,
-           (new_cap - state->folder_open_capacity) * sizeof(bool));
-    state->folder_open_capacity = new_cap;
-}
-
-void FileExplorerBuildTreeDFS(FileExplorerState* state, FileTree* tree, size_t node_idx, int depth) {
-    if (node_idx >= tree->count) return;
-    VisibleNodeListAdd(&state->visible, node_idx, depth);
-
-    Node* node = &tree->nodes[node_idx];
-    if (node->type == TYPE_DIR) {
-        EnsureFolderOpenCapacity(state, node_idx + 1);
-        if (state->folder_open[node_idx]) {
-            for (size_t i = 0; i < node->children_count; i++) {
-                FileExplorerBuildTreeDFS(state, tree, (size_t)node->children[i], depth + 1);
-            }
-        }
-    }
-}
-
-void FileExplorerBuildSearchDFS(FileExplorerState* state, FileTree* tree, size_t node_idx, const char* query) {
-    if (node_idx >= tree->count) return;
-    Node* node = &tree->nodes[node_idx];
-
-    if (StrContainsCaseInsensitive(node->name, query)) {
-        VisibleNodeListAdd(&state->visible, node_idx, 0);
-    }
-
-    if (node->type == TYPE_DIR) {
-        for (size_t i = 0; i < node->children_count; i++) {
-            FileExplorerBuildSearchDFS(state, tree, (size_t)node->children[i], query);
-        }
-    }
-}
-
-void FileExplorerRebuildVisible(FileExplorerState* state) {
-    FileTree* tree = state->editor->file_system.active;
-    if (!tree || tree->count == 0) {
-        ClearVisibleNodeList(&state->visible);
-        state->needs_rebuild = false;
-        return;
-    }
-
-    if (tree != state->last_tree) {
-        if (state->folder_open) {
-            memset(state->folder_open, 0, state->folder_open_capacity * sizeof(bool));
-        }
-        EnsureFolderOpenCapacity(state, tree->root_index + 1);
-        state->folder_open[tree->root_index] = true;
-        state->last_tree = tree;
-        state->selected_node = tree->root_index;
-    }
-
-    ClearVisibleNodeList(&state->visible);
-
-    bool searching = state->search_length > 0;
-    if (searching) {
-        FileExplorerBuildSearchDFS(state, tree, tree->root_index, state->search_buffer);
-    } else {
-        FileExplorerBuildTreeDFS(state, tree, tree->root_index, 0);
-    }
-
-    state->selected_visible = 0;
-    for (size_t i = 0; i < state->visible.count; i++) {
-        if (state->visible.node_indices[i] == state->selected_node) {
-            state->selected_visible = i;
-            break;
-        }
-    }
-
-    if (state->visible.count > 0 && state->selected_visible >= state->visible.count) {
-        state->selected_visible = state->visible.count - 1;
-    }
-
-    if (state->visible.count > 0) {
-        state->selected_node = state->visible.node_indices[state->selected_visible];
-    }
-
-    state->needs_rebuild = false;
-}
-
-bool FileExplorerOpenPathToNode(FileExplorerState* state, FileTree* tree, size_t current, size_t target) {
-    if (current == target) return true;
-
-    Node* node = &tree->nodes[current];
-    if (node->type != TYPE_DIR) return false;
-
-    for (size_t i = 0; i < node->children_count; i++) {
-        if (FileExplorerOpenPathToNode(state, tree, (size_t)node->children[i], target)) {
-            EnsureFolderOpenCapacity(state, current + 1);
-            state->folder_open[current] = true;
-            return true;
-        }
-    }
-    return false;
-}
-
-void FileExplorerSearchChanged(FileExplorerState* state) {
-    FileTree* tree = state->editor->file_system.active;
-    if (!tree) return;
-
-    if (state->search_length == 0 && state->visible.count > 0) {
-        FileExplorerOpenPathToNode(state, tree, tree->root_index, state->selected_node);
-    }
-
-    state->needs_rebuild = true;
-}
-
 void FileExplorerRender(Modal* modal, Rect content) {
     FileExplorerState* state = (FileExplorerState*)modal->state;
     Editor* editor = state->editor;
@@ -2235,149 +2894,20 @@ void FileExplorerRender(Modal* modal, Rect content) {
     int row_height = font_size + modal->style.widget_spacing;
     int pad = modal->style.content_padding.x;
     int search_bar_height = font_size + 12;
-
-    if (state->needs_rebuild) {
-        FileExplorerRebuildVisible(state);
-    }
-
-    Rect search_rect = {
-        .position = { content.position.x + pad, content.position.y + 6 },
-        .size = { content.size.x - pad * 2, search_bar_height }
-    };
-    DrawRectangle(BREAK_DOWN_RECT(search_rect), modal->style.input_background);
-    DrawRectangleLines(search_rect.position.x, search_rect.position.y,
-                       search_rect.size.x, search_rect.size.y, modal->style.focused_border);
-
-    int text_y = search_rect.position.y + (search_bar_height - font_size) / 2;
-    int text_x = search_rect.position.x + 6;
-
-    if (state->search_length == 0) {
-        DrawTextEx(font, "Search...", (Vector2){text_x, text_y}, font_size, 1, modal->style.text_muted);
-    }
-
-    if (state->search_length > 0 || true) {
-        char* before = calloc(state->search_cursor + 1, sizeof(char));
-        if (state->search_cursor > 0) {
-            memcpy(before, state->search_buffer, state->search_cursor);
-        }
-        before[state->search_cursor] = '\0';
-
-        Vector2 before_size = MeasureTextEx(font, before, font_size, 1);
-        if (state->search_length > 0) {
-            DrawTextEx(font, before, (Vector2){text_x, text_y}, font_size, 1, modal->style.text);
-        }
-
-        DrawRectangle(text_x + (int)before_size.x + 1, text_y + 2, 2, font_size - 4, modal->style.focused_border);
-
-        if (state->search_cursor < state->search_length) {
-            char* after = state->search_buffer + state->search_cursor;
-            DrawTextEx(font, after, (Vector2){text_x + (int)before_size.x + 4, text_y}, font_size, 1, modal->style.text);
-        }
-
-        free(before);
-    }
-
-    Rect list_rect = {
-        .position = { content.position.x, content.position.y + search_bar_height + 14 },
-        .size = { content.size.x, content.size.y - search_bar_height - 14 }
-    };
-
-    FileTree* tree = editor->file_system.active;
-    if (!tree || tree->count == 0) {
-        DrawTextEx(font, "No files loaded",
-                   (Vector2){list_rect.position.x + pad, list_rect.position.y + 4},
-                   font_size, 1, modal->style.text_muted);
-        return;
-    }
-
-    size_t visible_rows = list_rect.size.y / row_height;
-    if (visible_rows == 0) visible_rows = 1;
-
-    if (state->selected_visible < state->scroll_offset) {
-        state->scroll_offset = state->selected_visible;
-    }
-    if (state->selected_visible >= state->scroll_offset + visible_rows) {
-        state->scroll_offset = state->selected_visible - visible_rows + 1;
-    }
-
-    BeginScissorMode(list_rect.position.x, list_rect.position.y,
-                     list_rect.size.x, list_rect.size.y);
-
-    bool searching = state->search_length > 0;
-    int indent_width = font_size;
-
-    for (size_t i = state->scroll_offset; i < state->visible.count; i++) {
-        size_t display_i = i - state->scroll_offset;
-        if (display_i >= visible_rows) break;
-
-        size_t node_idx = state->visible.node_indices[i];
-        int depth = state->visible.depths[i];
-        Node* node = &tree->nodes[node_idx];
-
-        int y = list_rect.position.y + display_i * row_height;
-        int x = list_rect.position.x + pad;
-
-        if (i == state->selected_visible) {
-            DrawRectangle(list_rect.position.x, y, list_rect.size.x, row_height, modal->style.selection);
-        }
-
-        if (!searching) {
-            x += depth * indent_width;
-        }
-
-        const char* prefix = "";
-        if (node->type == TYPE_DIR) {
-            EnsureFolderOpenCapacity(state, node_idx + 1);
-            prefix = state->folder_open[node_idx] ? "v " : "> ";
-        } else {
-            prefix = "  ";
-        }
-
-        Color text_color = modal->style.text;
-        if (node->type == TYPE_DIR) {
-            text_color = modal->style.focused_border;
-        }
-
-        DrawTextEx(font, TextFormat("%s%s", prefix, node->name),
-                   (Vector2){x, y + modal->style.widget_spacing / 2},
-                   font_size, 1, text_color);
-    }
-
-    EndScissorMode();
 }
 
 void FileExplorerSearchInsertChar(FileExplorerState* state, char ch) {
-    if (state->search_length + 1 >= state->search_capacity) {
-        size_t new_cap = state->search_capacity * 2;
-        state->search_buffer = realloc(state->search_buffer, new_cap);
-        state->search_capacity = new_cap;
-    }
-    memmove(state->search_buffer + state->search_cursor + 1,
-            state->search_buffer + state->search_cursor,
-            state->search_length - state->search_cursor + 1);
-    state->search_buffer[state->search_cursor] = ch;
-    state->search_cursor++;
-    state->search_length++;
-    state->search_buffer[state->search_length] = '\0';
-    FileExplorerSearchChanged(state);
 }
 
 void FileExplorerSearchBackspace(FileExplorerState* state) {
-    if (state->search_cursor == 0) return;
-    memmove(state->search_buffer + state->search_cursor - 1,
-            state->search_buffer + state->search_cursor,
-            state->search_length - state->search_cursor + 1);
-    state->search_cursor--;
-    state->search_length--;
-    state->search_buffer[state->search_length] = '\0';
-    FileExplorerSearchChanged(state);
 }
 
 void FileExplorerSearchClear(FileExplorerState* state) {
-    state->search_length = 0;
-    state->search_cursor = 0;
-    state->search_buffer[0] = '\0';
-    FileExplorerSearchChanged(state);
+}
+
+void FileExplorerUpdate(Modal* modal) {
+    FileExplorerState* state = (FileExplorerState*)modal->state;
+    Editor* editor = state->editor;
 }
 
 void FileExplorerInput(Modal* modal, RawInput input) {
@@ -2386,59 +2916,18 @@ void FileExplorerInput(Modal* modal, RawInput input) {
 
     switch (input.key) {
         case KEY_UP: {
-            if (state->selected_visible > 0) {
-                state->selected_visible--;
-                state->selected_node = state->visible.node_indices[state->selected_visible];
-            }
             return;
         }
         case KEY_DOWN: {
-            if (state->selected_visible + 1 < state->visible.count) {
-                state->selected_visible++;
-                state->selected_node = state->visible.node_indices[state->selected_visible];
-            }
             return;
         }
         case KEY_ENTER: {
-            if (state->visible.count == 0) return;
-            size_t node_idx = state->visible.node_indices[state->selected_visible];
-            FileTree* tree = editor->file_system.active;
-            if (!tree) return;
-            Node* node = &tree->nodes[node_idx];
-
-            if (node->type == TYPE_DIR) {
-                EnsureFolderOpenCapacity(state, node_idx + 1);
-                state->folder_open[node_idx] = !state->folder_open[node_idx];
-                state->needs_rebuild = true;
-            } else {
-                printf("CLosing explorer with: %s\n", (void*)node->path);
-                modal->result_data = (void*)node->path;
-                CloseModal(&editor->modal_system, true);
-            }
-            return;
         }
         case KEY_ESCAPE: {
-            if (state->search_length > 0) {
-                FileExplorerSearchClear(state);
-            } else {
-                CloseModal(&editor->modal_system, false);
-            }
             return;
         }
         case KEY_BACKSPACE: {
             FileExplorerSearchBackspace(state);
-            return;
-        }
-        case KEY_LEFT: {
-            if (state->search_cursor > 0) {
-                state->search_cursor--;
-            }
-            return;
-        }
-        case KEY_RIGHT: {
-            if (state->search_cursor < state->search_length) {
-                state->search_cursor++;
-            }
             return;
         }
     }
@@ -2464,27 +2953,12 @@ void RegisterFileExplorerModal(Editor* editor) {
     FileExplorerState* state = calloc(1, sizeof(FileExplorerState));
     state->editor = editor;
 
-    state->search_capacity = 256;
-    state->search_buffer = calloc(state->search_capacity, sizeof(char));
-    state->search_length = 0;
-    state->search_cursor = 0;
-
-    state->selected_visible = 0;
-    state->selected_node = 0;
-    state->scroll_offset = 0;
-
-    state->folder_open = NULL;
-    state->folder_open_capacity = 0;
-
-    state->visible = (VisibleNodeList){0};
-    state->needs_rebuild = true;
-    state->last_tree = NULL;
-
     Modal* modal = CreateModal(
         &editor->modal_system,
         "File Explorer",
         (Position){600, 500},
         FileExplorerRender,
+        FileExplorerUpdate,
         FileExplorerInput,
         FileExplorerCleanup,
         state
@@ -2512,11 +2986,7 @@ void OpenFileExplorerModal(Editor* editor) {
     if (top) {
         FileExplorerState* state = (FileExplorerState*)top->state;
         // Reset search on open
-        state->search_length = 0;
-        state->search_cursor = 0;
-        state->search_buffer[0] = '\0';
-        state->scroll_offset = 0;
-        state->needs_rebuild = true;
+        
     }
 }
 
@@ -2570,9 +3040,12 @@ Editor CreateEditor(EditorSettings settings, char* path) {
         root_type = GetFileTypeFromPath(path);
     } 
 
+    printf("Root type: %d\n", root_type);
+
     editor.input_system = InitInputSystem();
     editor.modal_system = InitModalSystem();
-    editor.file_system = InitFileSystem(NULL);
+    editor.file_system = InitFileSystem();
+    editor.statistic_system = InitStatisticSystem();
 
     if (root_type == TYPE_FILE) {
         OpenFileFromPath(&editor, path);
@@ -2585,6 +3058,7 @@ Editor CreateEditor(EditorSettings settings, char* path) {
     
     RegisterBufferListModal(&editor);
     RegisterFileExplorerModal(&editor);
+    RegisterStatisticsModal(&editor);  
 
     return editor;
 }
@@ -2601,6 +3075,7 @@ void ClearEditor(Editor* editor) {
     ClearInputSystem(&editor->input_system);
     ClearModalSystem(&editor->modal_system);
     ClearFileSystem(&editor->file_system);
+    ClearStatisticsSystem(&editor->statistic_system);
 }
 
 bool ShouldEditorClose(Editor* editor) {
@@ -3221,6 +3696,9 @@ void DispatchInputTextMode(Editor* editor, Action action){
     case ACTION_OPEN_FILE_EXPLORER:
         OpenFileExplorerModal(editor);
         break;
+    case ACTION_OPEN_STATISTICS:
+        OpenStatisticsModal(editor);
+        break;
     default:
         TraceLog(LOG_INFO, "ActionType: %s is not implemented for Text Mode", ActionTypeToString(action.type));
     }
@@ -3253,6 +3731,42 @@ void DispatchInputCommandMode(Editor* editor, Action action) {
     default:
         TraceLog(LOG_INFO, "ActionType: %s is not implemented for Command Mode", ActionTypeToString(action.type));
     }
+}
+
+void FileSystemUpdate(Editor* editor) {
+    double current_time = GetTime();
+
+    FileSystem* file_system = &editor->file_system;
+    if (file_system->poll_state.in_progress) {
+        TimerStart(&editor->statistic_system, FILE_POLLING_STEP_TIMER);
+        if (FileSystemPollStep(file_system, INITIAL_DIRS_PER_FRAME)) {
+            TimerEnd(&editor->statistic_system, FILE_POLLING_TIMER);
+        }
+        TimerEnd(&editor->statistic_system, FILE_POLLING_STEP_TIMER);
+    } else if (strlen(file_system->root_path) > 0 &&
+               current_time - file_system->last_scan_time > file_system->scan_interval) {
+        file_system->last_scan_time = current_time;
+        TimerStart(&editor->statistic_system, FILE_POLLING_TIMER);
+        FileSystemPollBegin(file_system);
+    }
+}
+
+void EditorHandleUpdate(Editor* editor) {
+    FileSystemUpdate(editor);
+
+    TimerStart(&editor->statistic_system, MODAL_UPDATE);
+    ModalSystem* system = &editor->modal_system;
+
+    for (size_t i = 0; i < system->stack_count; i++) {
+        if (system->stack[i] && system->stack[i]->custom_update) {
+            Modal* modal = system->stack[i];
+            system->stack[i]->custom_update(modal);
+        }
+    }
+    TimerEnd(&editor->statistic_system, MODAL_UPDATE);
+
+    
+    editor->file_system.dirty = false;
 }
 
 void EditorHandleInput(Editor* editor) {
@@ -3553,14 +4067,25 @@ int main(int argc, char** argv) {
     }
 
     while (!WindowShouldClose() && !ShouldEditorClose(&editor)) {
-        UpdateFileCache(&editor.file_system);
+        TimerStart(&editor.statistic_system, FRAME_TIMER);
+        editor.statistic_system.frame_count++;
+
+        TimerStart(&editor.statistic_system, INPUT_TIMER);
+        EditorHandleInput(&editor);
+        TimerEnd(&editor.statistic_system, INPUT_TIMER);
+
+        TimerStart(&editor.statistic_system, UPDATE_TIMER);
+        EditorHandleUpdate(&editor);
+        TimerEnd(&editor.statistic_system, UPDATE_TIMER);
         
         BeginDrawing();
 
-        EditorHandleInput(&editor);
+        TimerStart(&editor.statistic_system, RENDER_TIMER);
         EditorRender(&editor);
+        TimerEnd(&editor.statistic_system, RENDER_TIMER);
         
         EndDrawing();
+        TimerEnd(&editor.statistic_system, FRAME_TIMER);
     }
 
     ClearEditor(&editor);
