@@ -1,0 +1,345 @@
+#else
+    #include <dirent.h>
+    #include <unistd.h>
+    #include <limits.h>
+#endif
+#include <cstdint>
+
+#ifndef _WIN32
+    #define min(a, b) ((a) < (b) ? (a) : (b))
+    #define max(a, b) ((a) > (b) ? (a) : (b))
+#endif
+
+#ifdef _WIN32
+    #define PATH_MAX_LEN MAX_PATH
+#else
+    #define PATH_MAX_LEN PATH_MAX
+#endif
+#define NAME_MAX_LEN 256
+
+#define BREAK_DOWN_RECT(rect) rect.position.x, rect.position.y, rect.size.x, rect.size.y
+#define ARRAY_LEN(arr) (sizeof(arr) / sizeof((arr)[0]))
+
+#define INITIAL_TEXT_BUFFER_CAPACITY 10
+#define INITIAL_ADD_BUFFER_CAPACITY 4096
+#define INITIAL_UNDO_STACK_CAPACITY 4096
+#define INITIAL_PIECE_BUFFER_CAPACITY 1024
+#define INITIAL_COMMAND_BUFFER_CAPACITY 1024
+#define INITIAL_COMMAND_BINDING_CAPACITY 1024
+#define INITIAL_TOKENIZER_BUFFER_CAPACITY 8
+#define INITIAL_MODAL_BUFFER_CAPACITY 8
+#define INITIAL_MODAL_CACHE_BUFFER_CAPACITY 8
+#define INITIAL_FILE_TREE_CAPACITY 256
+
+#define INITIAL_SCAN_INTERVAL 5.0
+#define INITIAL_DIRS_PER_FRAME 50
+
+typedef struct Editor Editor;
+
+typedef enum { ORIGINAL, ADD } BufferType;
+typedef enum { TYPE_DIR, TYPE_FILE, TYPE_ERROR } FileType;
+typedef enum { MODE_TEXT, MODE_COMMAND, MODE_COUNT } EditorMode;
+
+typedef struct {
+    int x;
+    int y;
+} Position;
+
+typedef struct {
+    Position position;
+    Position size;
+} Rect;
+
+typedef struct {
+    uint32_t index;
+    uint32_t generation;
+} CacheHandle;
+
+#define CACHE_HANDLE_INVALID ((CacheHandle){ UINT32_MAX, 0 })
+
+static inline bool cache_handle_eq(CacheHandle a, CacheHandle b) {
+    return a.index == b.index && a.generation == b.generation;
+}
+
+static inline bool cache_handle_is_invalid(CacheHandle h) {
+    return h.index == UINT32_MAX;
+}
+
+typedef struct {
+    CacheHandle* items;
+    uint32_t     count;
+    uint32_t     capacity;
+} ChildArray;
+
+typedef struct {
+    uint32_t generation;
+    bool     alive;
+
+    CacheHandle parent;
+    ChildArray  children;
+
+    char     name[NAME_MAX_LEN];
+    char     name_lower[NAME_MAX_LEN]; 
+    char     rel_path[PATH_MAX_LEN];
+    FileType type;
+
+    uint64_t mtime; 
+
+    bool is_open;
+} FileCacheEntry;
+
+typedef struct {
+    FileCacheEntry* entries;
+    size_t capacity;
+    size_t count;
+
+    uint32_t* free_list;
+    size_t free_capacity;
+    size_t free_count;
+
+    ChildArray root_children;
+
+    CacheHandle* all_handles;
+    size_t all_handles_capacity;
+    size_t all_handles_count;
+
+    uint64_t root_mtime;
+
+    bool dirty;
+} FileSystem;
+
+
+typedef struct {
+    char     name[NAME_MAX_LEN];
+    bool     is_dir;
+    uint64_t mtime;
+} FsEntry;
+
+typedef struct {
+    FsEntry* items;
+    size_t   count;
+    size_t   capacity;
+} FsEntryList;
+
+#ifdef _WIN32
+    static uint64_t PlatformGetMTime(const char* path) {
+        WIN32_FILE_ATTRIBUTE_DATA attr;
+        if (!GetFileAttributesExA(path, GetFileExInfoStandard, &attr)) return 0;
+        ULARGE_INTEGER uli;
+        uli.LowPart = attr.ftLastWriteTime.dwLowDateTime;
+        uli.HighPart = attr.ftLastWriteTime.dwHighDateTime;
+
+        return uli.QuadPart;
+    }
+
+    static bool PlatformReadDirectory(const char* dir_path, FsEntryList* out) {
+        out->count = 0;
+
+        char search_path[PATH_MAX_LEN];
+        snprintf(search_path, sizeof(search_path), "%s\\*", dir_path);
+
+        WIN32_FIND_DATAA fd;
+        HANDLE hFind = FindFirstFileA(search_path, &fd);
+        if (hFind == INVALID_HANDLE_VALUE) return false;
+        
+        do {
+            if (fd.cFileName[0] == '.' &&
+                (fd.cFileName[1] == '\0' ||
+                (fd.cFileName[1] == '.' && fd.cFileName[2] == '\0'))) {
+                continue; // Skip . and ..
+            }
+
+            if (out->count == out->capacity) {
+                out->capacity = out->capacity ? out->capacity * 2 : 64;
+                out->items = (FsEntry*)realloc(out->items, out->capacity * sizeof(FsEntry));
+            }
+
+            FsEntry* e = &out->items[out->count++];
+            strncpy(e->name, fd.cFileName, NAME_MAX_LEN - 1);
+            e->name[NAME_MAX_LEN - 1] = '\0';
+            e->is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+            ULARGE_INTEGER uli;
+            uli.LowPart  = fd.ftLastWriteTime.dwLowDateTime;
+            uli.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+            e->mtime = uli.QuadPart;
+        } while (FindNextFileA(hFind, &fd));
+
+        FindClose(hFind);
+        return true;
+    }
+
+    static void PlatformJoinPath(char* out, size_t out_size, const char* a, const char* b) {
+        snprintf(out, out_size, "%s\\%s", a, b);
+    }
+#else
+    static uint64_t PlatformGetMTime(const char* path) {
+        struct stat st;
+        if (stat(path, &st) != 0) return 0;
+        return (unint64_t)st.st_mtime;
+    }
+
+    static bool PlatformReadDirectory(const char* dir_path, FsEntryList* out) {
+        out->count = 0;
+
+        DIR* dir = opendir(dir_path);
+        if (!dir) return false;
+
+        struct dirent* de;
+        while ((de = readdir(dir)) != NULL) {
+            if (de->d_name[0] == '.' &&
+                (de->d_name[1] == '\0' ||
+                (de->d_name[1] == '.' && de->d_name[2] == '\0'))) {
+                continue;
+            }
+
+            if (out->count == out->capacity) {
+                out->capacity = out->capacity ? out->capacity * 2 : 64;
+                out->items = (FsEntry*)realloc(out->items, out->capacity * sizeof(FsEntry));
+            }
+
+            FsEntry* e = &out->items[out->count];
+            strncpy(e->name, de->d_name, NAME_MAX_LEN - 1);
+            e->name[NAME_MAX_LEN - 1] = '\0';
+
+            // Need full path for stat
+            char full[PATH_MAX_LEN];
+            snprintf(full, sizeof(full), "%s/%s", dir_path, de->d_name);
+
+            struct stat st;
+            if (stat(full, &st) != 0) continue; // skip entries we can't stat
+
+            e->is_dir = S_ISDIR(st.st_mode);
+            e->mtime  = (uint64_t)st.st_mtime;
+            out->count++;
+        }
+
+        closedir(dir);
+        return true;
+    }
+
+    static void PlatformJoinPath(char* out, size_t out_size,
+                                const char* a, const char* b) {
+        snprintf(out, out_size, "%s/%s", a, b);
+    }
+#endif
+
+static void StrToLower(const char* src, char* dst, size_t dst_size) {
+    size_t i = 0;
+    for (; src[i] && i < dst_size - 1; i++) {
+        dst[i] = (char)tolower((unsigned char)src[i]);
+    }
+    dst[i] = '\0';
+}
+
+static void InitFsEntryList(FsEntryList* list) {
+    list->items = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static void ClearFsEntryList(FsEntryList* list) {
+    free(list->items);
+    list->items = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static int CompareFsEntry(const void* a, const void* b) {
+    const FsEntry* ea = (const FsEntry*)a;
+    const FsEntry* eb = (const FsEntry*)b;
+
+    if (ea->is_dir != eb->is_dir) {
+        return ea->is_dir ? -1 : 1;
+    }
+
+    #ifdef _WIN32
+        return _stricmp(ea->name, eb->name);
+    #else
+        return strcasecmp(ea->name, eb->name);
+    #endif
+}
+
+static void SortFsEntry(FsEntryList* list) {
+    if (list->count > 1) {
+        qsort(list->items, list->count, sizeof(FsEntry), CompareFsEntry);
+    }
+}
+
+static void InitChildArrray(ChildArray* arr) {
+    arr->items = NULL;
+    arr->count = 0;
+    arr->capacity = 0;
+}
+
+static void ClearChildArray(ChildArray* arr) {
+    free(arr->items);
+    arr->items = NULL;
+    arr->count = 0;
+    arr->capacity = 0;
+}
+
+static void PushChildArray(ChildArray* arr, CacheHandle handle) {
+    if (arr->count == arr->capacity) {
+        arr->capacity = arr->capacity ? arr->capacity * 2 : 8;
+        arr->items = (CacheHandle*)realloc(arr->items, arr->capacity * sizeof(CacheHandle));
+    }
+    arr->items[arr->count++] = handle;
+}
+
+FileCacheEntry* FileSystemGetEntry(const FileSystem* system, CacheHandle handle) {
+    if (cache_handle_is_invalid(handle)) return NULL;
+    if (handle.index >= system->count) return NULL;
+
+    FileCacheEntry* e = &system->entries[handle.index];
+    if (e->generation != handle.generation) return NULL;
+    if (!e->alive) return NULL;
+    return e;
+}
+
+static uint32_t FindSortedPosChildArray(const FileSystem* system, const ChildArray* arr, const FileCacheEntry* new_entry) {
+    for (uint32_t i = 0; i < arr->count; i++) {
+        const FileCacheEntry* existing = FileSystemGetEntry(system, arr->items[i]);
+        if (!existing) continue;
+
+        if (new_entry->type == TYPE_DIR && existing->type == TYPE_FILE) {
+            return i;
+        }
+        if (new_entry->type == TYPE_FILE && existing->type == TYPE_DIR) {
+            continue;
+        }
+
+        #ifdef _WIN32
+            if (_stricmp(new_entry->name, existing->name) < 0) return i;
+        #else
+            if (strcasecmp(new_entry->name, existing->name) < 0) return i;
+        #endif
+    }
+    return arr->count;
+}
+
+static void InsertSortedChildArray(FileSystem* system, ChildArray* arr, CacheHandle handle) {
+    const FileCacheEntry* entry = FileSystemGetEntry(system, handle);
+    if (!entry) return;
+
+    uint32_t pos = FindSortedPosChildArray(system, arr, entry);
+
+    if (arr->count == arr->capacity) {
+        arr->capacity = arr->capacity ? arr->capacity * 2 : 8;
+        arr->items = (CacheHandle*)realloc(arr->items,
+                                           arr->capacity * sizeof(CacheHandle));
+    }
+
+    if (pos < arr->count) {
+        memmove(&arr->items[pos + 1], &arr->items[pos],
+                (arr->count - pos) * sizeof(CacheHandle));
+    }
+    arr->items[pos] = handle;
+    arr->count++;
+}
+
+static void FileSystemEnsureCapacity(FileSystem* system, size_t needed) {
+    if (needed <= system->capacity) return;
+
+    size_t new_cap = system->capacity ? system->capacity * 2 : 256;
+}
