@@ -25,6 +25,8 @@
     #include <unistd.h>
     #include <limits.h>
     #include <time.h>
+    #include <errno.h>
+    #include <fcntl.h>
 #endif
 
 #ifndef _WIN32
@@ -55,6 +57,24 @@
 
 #define INITIAL_SCAN_INTERVAL 5.0
 #define INITIAL_DIRS_PER_FRAME 50
+
+static const char* IGNORED_DIRS[] = {
+    ".git", "node_modules", ".vs", ".vscode", ".idea",
+    "__pycache__", ".cache", ".next", ".nuxt",
+    "dist", "build", ".svn", ".hg",
+};
+#define IGNORED_DIRS_COUNT (sizeof(IGNORED_DIRS) / sizeof(IGNORED_DIRS[0]))
+
+static bool IsIgnoredDir(const char* name) {
+    for (size_t i = 0; i < IGNORED_DIRS_COUNT; i++) {
+#ifdef _WIN32
+        if (_stricmp(name, IGNORED_DIRS[i]) == 0) return true;
+#else
+        if (strcmp(name, IGNORED_DIRS[i]) == 0) return true;
+#endif
+    }
+    return false;
+}
 
 typedef struct Editor Editor;
 typedef struct FileSystem FileSystem;
@@ -241,6 +261,7 @@ typedef struct {
     FsEntryList fs_list;
 
     bool in_progress;
+    bool request_validation;
     bool changed;
     size_t dirs_per_frame;
 } PollState;
@@ -327,6 +348,25 @@ struct FileSystem {
         }
         return true;
     }
+
+    static bool PlatformMakeDir(const char* abs_path) {
+        return CreateDirectoryA(abs_path, NULL) != 0 
+            || GetLastError() == ERROR_ALREADY_EXISTS;
+    }
+
+    static bool PlatformMakeFile(const char* abs_path) {
+        HANDLE h = CreateFileA(
+            abs_path,
+            GENERIC_WRITE,
+            0, NULL,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL
+        );
+        if (h == INVALID_HANDLE_VALUE) return false;
+        CloseHandle(h);
+        return true;
+    }
 #else
     static uint64_t PlatformGetMTime(const char* path) {
         struct stat st;
@@ -382,7 +422,80 @@ struct FileSystem {
         }
         return true;
     }
+
+    static bool PlatformMakeDir(const char* abs_path) {
+        return mkdir(abs_path, 0755) == 0 
+            || errno == EEXIST;
+    }
+
+    static bool PlatformMakeFile(const char* abs_path) {
+        int fd = open(abs_path, O_CREAT | O_EXCL | O_WRONLY, 0644);
+        if (fd < 0) return false;
+        close(fd);
+        return true;
+    }
 #endif
+
+static bool CreatePathUnderRoot(const char* root_path, const char* input) {
+    if (!input || input[0] == '\0') return false;
+
+    size_t input_len = strlen(input);
+    bool trailing_slash = (input[input_len - 1] == '/' || input[input_len - 1] == '\\');
+
+    char input_copy[PATH_MAX_LEN];
+    strncpy(input_copy, input, PATH_MAX_LEN - 1);
+    input_copy[PATH_MAX_LEN - 1] = '\0';
+
+    size_t copy_len = strlen(input_copy);
+    if (copy_len > 0 && (input_copy[copy_len - 1] == '/' || input_copy[copy_len - 1] == '\\')) {
+        input_copy[copy_len - 1] = '\0';
+    }
+
+    char* segments[256];
+    int segment_count = 0;
+
+    char* seg = strtok(input_copy, "/\\");
+    while (seg && segment_count < 256) {
+        segments[segment_count++] = seg;
+        seg = strtok(NULL, "/\\");
+    }
+
+    if (segment_count == 0) return false;
+
+    char current[PATH_MAX_LEN];
+    char next[PATH_MAX_LEN];
+    strncpy(current, root_path, PATH_MAX_LEN - 1);
+    current[PATH_MAX_LEN - 1] = '\0';
+
+    int dir_count = trailing_slash ? segment_count : segment_count - 1;
+
+    for (int i = 0; i < dir_count; i++) {
+        if (!PlatformJoinPath(next, sizeof(next), current, segments[i])) {
+            fprintf(stderr, "CreatePathUnderRoot: path too long at segment '%s'\n", segments[i]);
+            return false;
+        }
+
+        strncpy(current, next, PATH_MAX_LEN - 1);
+        current[PATH_MAX_LEN - 1] = '\0';
+        if (!PlatformMakeDir(current)) {
+            fprintf(stderr, "CreatePathUnderRoot: failed to create dir '%s'\n", current);
+            return false;
+        }
+    }
+
+    if (!trailing_slash) {
+        if (!PlatformJoinPath(next, sizeof(next), current, segments[segment_count - 1])) {
+            fprintf(stderr, "CreatePathUnderRoot: path too long for file '%s'\n", segments[segment_count - 1]);
+            return false;
+        }
+        if (!PlatformMakeFile(next)) {
+            fprintf(stderr, "CreatePathUnderRoot: failed to create file '%s'\n", next);
+            return false;
+        }
+    }
+
+    return true;
+}
 
 static void StrToLower(const char* src, char* dst, size_t dst_size) {
     size_t i = 0;
@@ -729,7 +842,6 @@ void ClearFileSystem(FileSystem* system) {
 }
 
 bool FileSystemBuild(FileSystem* system, const char* root_path) {
-    printf("Hello\n");
     ClearFileSystem(system);
 
     strncpy(system->root_path, root_path, PATH_MAX_LEN - 1);
@@ -748,11 +860,14 @@ bool FileSystemBuild(FileSystem* system, const char* root_path) {
 
     ScanFrame frame;
     while (PopScanStack(&stack, &frame)) {
+
         if (!PlatformReadDirectory(frame.abs_path, &fs_list)) continue;
         SortFsEntry(&fs_list);
 
         for (size_t i = 0; i < fs_list.count; i++) {
             FsEntry* fs = &fs_list.items[i];
+
+            if (fs->is_dir && IsIgnoredDir(fs->name)) continue;
 
             CacheHandle handle = FileSystemCreateEntry(system, frame.parent_handle, frame.rel_path, fs);
             if (cache_handle_is_invalid(handle)) continue;
@@ -782,14 +897,12 @@ bool FileSystemBuild(FileSystem* system, const char* root_path) {
             }
         }
     }
-    printf("Hello2");
 
     ClearFsEntryList(&fs_list);
     ClearScanStack(&stack);
 
     FileSystemRebuildAllHandles(system);
     system->dirty = true;
-    printf("End");
     
     return true;
 }
@@ -879,6 +992,9 @@ bool FileSystemPollStep(FileSystem* system, size_t max_dirs) {
                 // Add or update children from disk
                 for (size_t i = 0; i < ps->fs_list.count; i++) {
                     FsEntry* fs = &ps->fs_list.items[i];
+
+                    if (fs->is_dir && IsIgnoredDir(fs->name)) continue;
+
                     CacheHandle existing = FindChildByName(system, dir_children, fs->name);
 
                     if (cache_handle_is_invalid(existing)) {
@@ -957,6 +1073,7 @@ bool FileSystemPollStep(FileSystem* system, size_t max_dirs) {
                 CacheHandle child_h = dir_children->items[i];
                 FileCacheEntry* child = FileSystemGetEntry(system, child_h);
                 if (!child || child->type != TYPE_DIR) continue;
+                if (IsIgnoredDir(child->name)) continue;
 
                 if (ps->stack_count == ps->stack_capacity) {
                     ps->stack_capacity = ps->stack_capacity ? ps->stack_capacity * 2 : 32;
@@ -988,6 +1105,8 @@ bool FileSystemPollStep(FileSystem* system, size_t max_dirs) {
 
             for (size_t i = 0; i < ps->fs_list.count; i++) {
                 FsEntry* fs = &ps->fs_list.items[i];
+
+                if (fs->is_dir && IsIgnoredDir(fs->name)) continue;
 
                 CacheHandle handle = FileSystemCreateEntry(system, sf.parent_handle, sf.rel_path, fs);
                 if (cache_handle_is_invalid(handle)) continue;
@@ -1454,10 +1573,6 @@ void CloseModal(ModalSystem* system, bool confirmed) {
     }
 
     if (modal->is_cached) return;
-
-    if (modal->cleanup) {
-        modal->cleanup(modal->state);
-    }
 
     ClearModal(modal);
     free(modal);
@@ -2344,7 +2459,7 @@ typedef struct {
 } EditorState;
 
 EditorState InitEditorState(size_t capacity) {
-    EditorState state;
+    EditorState state = {0};
     state.root_dir = NULL;
     state.open_text_buffer_index = -1;
     state.text_buffers = calloc(capacity, sizeof(TextBuffer));
@@ -2989,6 +3104,150 @@ static void FlatEntryListPush(FlatEntryList* list, CacheHandle handle, int depth
 
 typedef struct {
     Editor* editor;
+    char buffer[512];
+    size_t cursor;
+    size_t length;
+} StringInputState;
+
+void StringInputRender(Modal* modal, Rect content) {
+    StringInputState* state = (StringInputState*)modal->state;
+    Editor* editor = state->editor;
+    Font font = editor->settings.editor_font;
+    int font_size = editor->settings.font_size;
+    int pad = modal->style.content_padding.x;
+
+    BeginScissorMode(content.position.x, content.position.y,
+                     content.size.x, content.size.y);
+
+    // Center the input box vertically in the content area
+    int input_height = font_size + 12;
+    int input_y = content.position.y + (content.size.y - input_height) / 2;
+    int input_x = content.position.x + pad;
+    int input_w = content.size.x - pad * 2;
+
+    DrawRectangle(input_x, input_y, input_w, input_height,
+                  modal->style.input_background);
+    DrawRectangleLinesEx(
+        (Rectangle){input_x, input_y, input_w, input_height},
+        modal->style.border_width,
+        modal->style.focused_border
+    );
+
+    // Measure text before cursor to find cursor draw position
+    char before_cursor[512];
+    strncpy(before_cursor, state->buffer, state->cursor);
+    before_cursor[state->cursor] = '\0';
+    Vector2 before_size = MeasureTextEx(font, before_cursor, font_size, 1);
+
+    int text_x = input_x + 6;
+    int text_y = input_y + 6;
+
+    DrawTextEx(font, state->buffer,
+               (Vector2){text_x, text_y},
+               font_size, 1, modal->style.text);
+
+    DrawRectangle(text_x + (int)before_size.x, text_y,
+                  2, font_size, modal->style.text);
+
+    EndScissorMode();
+}
+
+void StringInputInput(Modal* modal, RawInput input) {
+    StringInputState* state = (StringInputState*)modal->state;
+    Editor* editor = state->editor;
+
+    if (!input.is_char) {
+        switch (input.key) {
+            case KEY_ENTER: {
+                char* result = malloc(state->length + 1);
+                memcpy(result, state->buffer, state->length);
+                result[state->length] = '\0';
+                modal->result_data = result;
+                CloseModal(&editor->modal_system, true);
+                return;
+            }
+            case KEY_ESCAPE:
+                CloseModal(&editor->modal_system, false);
+                return;
+            case KEY_BACKSPACE:
+                if (state->cursor > 0) {
+                    memmove(&state->buffer[state->cursor - 1],
+                            &state->buffer[state->cursor],
+                            state->length - state->cursor);
+                    state->cursor--;
+                    state->length--;
+                    state->buffer[state->length] = '\0';
+                }
+                return;
+            case KEY_DELETE:
+                if (state->cursor < state->length) {
+                    memmove(&state->buffer[state->cursor],
+                            &state->buffer[state->cursor + 1],
+                            state->length - state->cursor - 1);
+                    state->length--;
+                    state->buffer[state->length] = '\0';
+                }
+                return;
+            case KEY_LEFT:
+                if (state->cursor > 0) state->cursor--;
+                return;
+            case KEY_RIGHT:
+                if (state->cursor < state->length) state->cursor++;
+                return;
+        }
+        return;
+    }
+
+    // Printable character
+    if (input.key >= 32 && input.key < 127 &&
+        !HasModifiers(input.modifiers, MODI_CTRL | MODI_ALT | MODI_SUPER) &&
+        state->length < sizeof(state->buffer) - 1) {
+        memmove(&state->buffer[state->cursor + 1],
+                &state->buffer[state->cursor],
+                state->length - state->cursor);
+        state->buffer[state->cursor] = (char)input.key;
+        state->cursor++;
+        state->length++;
+        state->buffer[state->length] = '\0';
+    }
+}
+
+void StringInputCleanup(void* raw_state) {
+    free(raw_state);
+}
+
+void PushStringInputModal(Editor* editor, const char* title,
+                          ModalResultCallback on_result, void* user_data) {
+    StringInputState* state = calloc(1, sizeof(StringInputState));
+    state->editor = editor;
+
+    Modal* modal = CreateModal(
+        &editor->modal_system,
+        title,
+        (Position){500, 120},
+        StringInputRender,
+        NULL,
+        StringInputInput,
+        StringInputCleanup,
+        state
+    );
+    modal->style.draw_title = true;
+    modal->style.title_padding = (Position){10, 10};
+    modal->on_result = on_result;
+    modal->on_result_user_data = user_data;
+    modal->margin = (Position){50, 50};
+
+    ModalAddLayout(modal, ApplyWantedSize);
+    ModalAddLayout(modal, ApplyMinSize);
+    ModalAddLayout(modal, ApplyMaxSize);
+    ModalAddLayout(modal, ApplyMargin);
+    ModalAddLayout(modal, CenterModal);
+
+    PushModal(&editor->modal_system, modal);
+}
+
+typedef struct {
+    Editor* editor;
 
     SearchBar search;
     OpenPathSet open_dirs;
@@ -3041,7 +3300,6 @@ typedef struct {
 } WalkFrame;
 
 static void RebuildAllEntries(FileSystem* system, FlatEntryList* all) {
-    printf("Needs rebuild all!\n");
     FlatEntryListReset(all);
 
     size_t stack_cap = 64;
@@ -3080,7 +3338,6 @@ static void RebuildAllEntries(FileSystem* system, FlatEntryList* all) {
 }
 
 static void RebuildVisibleEntries(FileSystem* system, FlatEntryList* all, FlatEntryList* visible, const OpenPathSet* open_dirs, const char* search, size_t search_len) {
-    printf("Visible entries rebuild!\n");
     FlatEntryListReset(visible);
     if (search_len == 0) {
         int skip_below = INT_MAX;
@@ -3325,12 +3582,71 @@ void FileExplorerUpdate(Modal* modal) {
     }
 }
 
+typedef struct {
+    Editor* editor;
+    char base_path[PATH_MAX_LEN];
+} CreateFileContext;
+
+void OnCreateFileOrDirConfirmed(Modal* modal, bool confirmed, void* result, void* user_data) {
+    CreateFileContext* ctx = (CreateFileContext*)user_data;
+    if (!confirmed) {
+        free(ctx);
+        return;
+    }
+
+    const char* input = (const char*)result;
+
+    CreatePathUnderRoot(ctx->base_path, input);
+    if (strlen(ctx->editor->file_system.root_path) > 0) {
+        ctx->editor->file_system.poll_state.request_validation = true;
+    }
+    free(result);
+    free(ctx);
+}
+
 void FileExplorerInput(Modal* modal, RawInput input) {
 FileExplorerState* state = (FileExplorerState*)modal->state;
     Editor* editor = state->editor;
     FileSystem* system = &editor->file_system;
 
     switch (input.key) {
+        case KEY_N: {
+            if (state->search.length == 0 && HasModifiers(input.modifiers, MODI_CTRL)) {
+                CreateFileContext* ctx = malloc(sizeof(CreateFileContext));
+                ctx->editor = editor;
+                strncpy(ctx->base_path, system->root_path, PATH_MAX_LEN - 1);
+                ctx->base_path[PATH_MAX_LEN - 1] = '\0';
+
+                if (state->visible.count > 0 && state->selected_index < state->visible.count) {
+                    FlatEntry* sel = &state->visible.items[state->selected_index];
+                    FileCacheEntry* sel_entry = FileSystemGetEntry(system, sel->handle);
+                    if (sel_entry) {
+                        char dir_rel[PATH_MAX_LEN];
+                        if (sel->is_dir) {
+                            strncpy(dir_rel, sel_entry->rel_path, PATH_MAX_LEN - 1);
+                            dir_rel[PATH_MAX_LEN - 1] = '\0';
+                        } else {
+                            strncpy(dir_rel, sel_entry->rel_path, PATH_MAX_LEN - 1);
+                            dir_rel[PATH_MAX_LEN - 1] = '\0';
+                            char* last_sep = strrchr(dir_rel, '/');
+                            #ifdef _WIN32
+                            char* last_bslash = strrchr(dir_rel, '\\');
+                            if (last_bslash && (!last_sep || last_bslash > last_sep))
+                                last_sep = last_bslash;
+                            #endif
+                            if (last_sep) *last_sep = '\0';
+                            else dir_rel[0] = '\0';
+                        }
+                        if (dir_rel[0] != '\0') {
+                            PlatformJoinPath(ctx->base_path, PATH_MAX_LEN, system->root_path, dir_rel);
+                        }
+                    }
+                }
+
+                PushStringInputModal(editor, "Create File/Dir", OnCreateFileOrDirConfirmed, ctx);
+            }
+            return;
+        }
         case KEY_UP: {
             if (state->selected_index > 0) {
                 state->selected_index--;
@@ -3489,7 +3805,6 @@ Editor CreateEditor(EditorSettings settings, char* path) {
         root_type = GetFileTypeFromPath(path);
     } 
 
-    printf("Root type: %d\n", root_type);
 
     editor.input_system = InitInputSystem();
     editor.modal_system = InitModalSystem();
@@ -3504,10 +3819,10 @@ Editor CreateEditor(EditorSettings settings, char* path) {
         OpenEmptyBuffer(&editor);
     }
 
-    
+
     RegisterBufferListModal(&editor);
     RegisterFileExplorerModal(&editor);
-    RegisterStatisticsModal(&editor);  
+    RegisterStatisticsModal(&editor);
 
     return editor;
 }
@@ -4194,6 +4509,11 @@ void FileSystemUpdate(Editor* editor) {
         TimerEnd(&editor->statistic_system, FILE_POLLING_STEP_TIMER);
     } else if (strlen(file_system->root_path) > 0 &&
                current_time - file_system->last_scan_time > file_system->scan_interval) {
+                file_system->poll_state.request_validation = true;
+    }
+
+    if (file_system->poll_state.request_validation && !file_system->poll_state.in_progress) {
+        file_system->poll_state.request_validation = false;
         file_system->last_scan_time = current_time;
         TimerStart(&editor->statistic_system, FILE_POLLING_TIMER);
         FileSystemPollBegin(file_system);
@@ -4477,7 +4797,7 @@ void SetupWindow() {
     InitWindow(1200, 700, "Fun Editor");
     MaximizeWindow();
     
-    SetTargetFPS(60); 
+    SetTargetFPS(0); 
     SetExitKey(KEY_NULL);
 }
 
@@ -4494,14 +4814,15 @@ int main(int argc, char** argv) {
 
     EditorSettings settings = {
         .scheme = scheme,
-        .font_size = 30,
+        .font_size = 25,
         .number_padding = 10,
         .pointer_padding = (Position){3, 3},
         .mode_padding = (Position){10, 10},
         .command_padding = (Position){10, 10},
         .pointer_width = 2,
-        .editor_font = LoadFontEx("Input.ttf", 30, NULL, 0),
+        .editor_font = LoadFontEx("Input.ttf", 80, NULL, 0),
     };
+    SetTextureFilter(settings.editor_font.texture, TEXTURE_FILTER_BILINEAR);
 
     char* path = NULL;
     if (argc >= 2) {
@@ -4510,7 +4831,7 @@ int main(int argc, char** argv) {
 
     Editor editor = CreateEditor(settings, path);
     RegisterDefaultCommandBinding(&editor.input_system.command_system);
-    
+
     if (path) {
         free(path);
         path = NULL;
@@ -4527,13 +4848,13 @@ int main(int argc, char** argv) {
         TimerStart(&editor.statistic_system, UPDATE_TIMER);
         EditorHandleUpdate(&editor);
         TimerEnd(&editor.statistic_system, UPDATE_TIMER);
-        
+
         BeginDrawing();
 
         TimerStart(&editor.statistic_system, RENDER_TIMER);
         EditorRender(&editor);
         TimerEnd(&editor.statistic_system, RENDER_TIMER);
-        
+
         EndDrawing();
         TimerEnd(&editor.statistic_system, FRAME_TIMER);
     }
