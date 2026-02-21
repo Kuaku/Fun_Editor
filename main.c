@@ -1201,7 +1201,9 @@ typedef enum {
     ACTION_OPEN_FILE_EXPLORER,
     ACTION_OPEN_STATISTICS,
 
-    ACTION_EXECUTE_COMMAND
+    ACTION_EXECUTE_COMMAND,
+
+    ACTION_SAVE,
 } ActionType;
 
 
@@ -1241,6 +1243,7 @@ const char* ActionTypeToString(ActionType type) {
         case ACTION_OPEN_FILE: return "ACTION_OPEN_FILE";
         case ACTION_OPEN_FILE_EXPLORER: return "ACTION_OPEN_FILE_EXPLORER";
         case ACTION_OPEN_STATISTICS: return "ACTION_OPEN_STATISTICS";
+        case ACTION_SAVE: return "ACTION_SAVE";
         default: return "UNKNOWN_ACTION";
     }
 }
@@ -1335,6 +1338,8 @@ static KeyBinding default_normal_bindings[] = {
     { KEY_O, MODI_CTRL, ACTION_OPEN_FILE },
     { KEY_E, MODI_CTRL, ACTION_OPEN_FILE_EXPLORER },
     { KEY_D, MODI_CTRL, ACTION_OPEN_STATISTICS },
+
+    { KEY_S, MODI_CTRL, ACTION_SAVE},
 };
 
 static KeyBinding default_command_bindings[] = {
@@ -4373,6 +4378,71 @@ void EnterCommandModeWithCommand(Editor* editor, const char* command, size_t poi
     editor->input_system.current_mode = MODE_COMMAND;
 }
 
+char* FlattenTextBuffer(TextBuffer* buffer, size_t* out_len) {
+    size_t total = GetTextSize(buffer);
+    char* result = malloc(total + 1);
+    if (!result) return NULL;
+
+    size_t written = 0;
+    for (size_t i = 0; i < buffer->piece_count; i++) {
+        char* src = buffer->pieces[i].source == ORIGINAL ? buffer->org_buffer : buffer->add_buffer;
+
+        memcpy(result + written, src + buffer->pieces[i].start, buffer->pieces[i].length);
+        written += buffer->pieces[i].length;
+    }
+
+    result[written] = '\0';
+    if (out_len) *out_len = written;
+    return result;
+}
+
+bool SaveActiveTextBuffer(Editor* editor) {
+    TextBuffer* active_buffer = GetActiveBuffer(editor);
+    if (!active_buffer->file_path) return false; // TODO: Add path input method on save
+
+    size_t len;
+    char* text = FlattenTextBuffer(active_buffer, &len);
+    
+    if (!text) return false;
+
+    char tmp_path[PATH_MAX_LEN];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", active_buffer->file_path);
+
+    FILE* f = fopen(tmp_path, "wb");
+    if (!f) {
+        free(text);
+        return false;
+    }
+
+    size_t written = fwrite(text, 1, len, f);
+    fclose(f);
+    free(text);
+
+    if (written != len) {
+        remove(tmp_path);
+        return false;
+    }
+
+    #ifdef _WIN32
+        if (!MoveFileExA(tmp_path, active_buffer->file_path, MOVEFILE_REPLACE_EXISTING)) {
+            remove(tmp_path);
+            return false;
+        }
+    #else
+        if (rename(tmp_path, active_buffer->file_path) != 0) {
+            remove(tmp_path);
+            return false;
+        }
+    #endif
+    return true;
+}
+
+void SaveAction(Editor* editor) {
+    bool is_saved = SaveActiveTextBuffer(editor);
+
+    // TODO: Show is saved failed
+}
+
 void DispatchInputTextMode(Editor* editor, Action action){
     switch (action.type)
     {
@@ -4462,6 +4532,9 @@ void DispatchInputTextMode(Editor* editor, Action action){
         break;
     case ACTION_OPEN_STATISTICS:
         OpenStatisticsModal(editor);
+        break;
+    case ACTION_SAVE:
+        SaveAction(editor);
         break;
     default:
         TraceLog(LOG_INFO, "ActionType: %s is not implemented for Text Mode", ActionTypeToString(action.type));
