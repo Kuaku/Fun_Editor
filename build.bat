@@ -18,6 +18,7 @@ set SRC=^
  src\modal\modals\string_input.c^
  src\modal\modals\file_explorer.c^
  src\editor\editor.c^
- src\render\render.c
+ src\render\render.c^
+ src\utils\utf8.c
 
 %CC% %CFLAGS% %SRC% libraylib.a -o main.exe %LDFLAGS%
