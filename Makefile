@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -I./include -I./src -Wall -std=c99
-LDFLAGS = -lraylib -lm -ldl -lpthread -lGL -lrt -lX11 -lXrandr -lXi -lXcursor
+BUILDDIR = build
 
 SRC = src/main.c \
       src/platform/platform.c \
@@ -18,16 +18,29 @@ SRC = src/main.c \
       src/render/render.c \
       src/utils/utf8.c
 
-OBJ = $(SRC:.c=.o)
-OUT = main
+OBJ = $(patsubst src/%.c,$(BUILDDIR)/%.o,$(SRC))
+
+ifeq ($(OS),Windows_NT)
+    OUT = main.exe
+    LDFLAGS = libraylib.a -lopengl32 -lgdi32 -lwinmm
+    MKDIR = if not exist $(subst /,\,$1) mkdir $(subst /,\,$1)
+    RM = if exist $(subst /,\,$(BUILDDIR)) rmdir /S /Q $(subst /,\,$(BUILDDIR))
+else
+    OUT = main
+    LDFLAGS = -lraylib -lm -ldl -lpthread -lGL -lrt -lX11 -lXrandr -lXi -lXcursor
+    MKDIR = mkdir -p $1
+    RM = rm -rf $(BUILDDIR)
+endif
 
 all: $(OUT)
 
 $(OUT): $(OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-%.o: %.c
+$(BUILDDIR)/%.o: src/%.c
+	$(call MKDIR,$(dir $@))
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJ) $(OUT)
+	$(RM)
+	$(RM) $(OUT)
