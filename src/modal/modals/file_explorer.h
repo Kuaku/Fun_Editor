@@ -67,7 +67,7 @@ void EnsurePathVisible(FileSystem* system, OpenPathSet* open_dirs, const char* t
 void RebuildAllEntries(FileSystem* system, FlatEntryList* all);
 void RebuildVisibleEntries(FileSystem* system, FlatEntryList* all, FlatEntryList* visible, const OpenPathSet* open_dirs, const char* search, size_t search_len);
 
-void FileExplorerSearchInsertChar(FileExplorerState* state, char ch);
+void FileExplorerSearchInsertChar(FileExplorerState* state, uint32_t codepoint);
 void FileExplorerSearchBackspace(FileExplorerState* state);
 void FileExplorerSearchClear(FileExplorerState* state);
 

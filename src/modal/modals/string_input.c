@@ -1,5 +1,6 @@
 #include "string_input.h"
 #include "../../editor/editor.h"
+#include "../../utils/utf8.h"
 
 void StringInputRender(Modal* modal, Rect content) {
     StringInputState* state = (StringInputState*)modal->state;
@@ -25,8 +26,9 @@ void StringInputRender(Modal* modal, Rect content) {
     );
 
     char before_cursor[512];
-    strncpy(before_cursor, state->buffer, state->cursor);
-    before_cursor[state->cursor] = '\0';
+    size_t cursor_byte = utf8_codepoint_to_offset(state->buffer, state->cursor);
+    strncpy(before_cursor, state->buffer, cursor_byte);
+    before_cursor[cursor_byte] = '\0';
     Vector2 before_size = MeasureTextEx(font, before_cursor, font_size, 1);
 
     int text_x = input_x + 6;
@@ -61,20 +63,28 @@ void StringInputInput(Modal* modal, RawInput input) {
                 return;
             case KEY_BACKSPACE:
                 if (state->cursor > 0) {
-                    memmove(&state->buffer[state->cursor - 1],
-                            &state->buffer[state->cursor],
-                            state->length - state->cursor);
+                    size_t cursor_byte = utf8_codepoint_to_offset(state->buffer, state->cursor);
+                    size_t utf8_length = utf8_prev(state->buffer, state->buffer + cursor_byte);
+                    memmove(&state->buffer[cursor_byte - utf8_length],
+                            &state->buffer[cursor_byte],
+                            state->length - cursor_byte);
                     state->cursor--;
-                    state->length--;
+                    state->length -= utf8_length;
+                    state->codepoint_count--;
                     state->buffer[state->length] = '\0';
                 }
                 return;
             case KEY_DELETE:
-                if (state->cursor < state->length) {
-                    memmove(&state->buffer[state->cursor],
-                            &state->buffer[state->cursor + 1],
-                            state->length - state->cursor - 1);
-                    state->length--;
+                if (state->cursor < state->codepoint_count) {
+                    size_t cursor_byte = utf8_codepoint_to_offset(state->buffer, state->cursor);
+                    uint32_t codepoint;
+                    size_t utf8_length = utf8_decode(state->buffer + cursor_byte, &codepoint);
+                    
+                    memmove(&state->buffer[cursor_byte],
+                            &state->buffer[cursor_byte + utf8_length],
+                            state->length - cursor_byte - utf8_length);
+                    state->length -= utf8_length;
+                    state->codepoint_count--;
                     state->buffer[state->length] = '\0';
                 }
                 return;
@@ -82,21 +92,29 @@ void StringInputInput(Modal* modal, RawInput input) {
                 if (state->cursor > 0) state->cursor--;
                 return;
             case KEY_RIGHT:
-                if (state->cursor < state->length) state->cursor++;
+                if (state->cursor < state->codepoint_count) state->cursor++;
                 return;
         }
         return;
     }
 
-    if (input.key >= 32 && input.key < 127 &&
+    if (input.key >= 32 &&
         !HasModifiers(input.modifiers, MODI_CTRL | MODI_ALT | MODI_SUPER) &&
         state->length < sizeof(state->buffer) - 1) {
-        memmove(&state->buffer[state->cursor + 1],
-                &state->buffer[state->cursor],
-                state->length - state->cursor);
-        state->buffer[state->cursor] = (char)input.key;
+        char utf8_text_buffer[4];
+        size_t utf8_length = utf8_encode(input.key, utf8_text_buffer);
+        // TODO: Catch length = 0
+        size_t cursor_byte = utf8_codepoint_to_offset(state->buffer, state->cursor);
+        
+        memmove(&state->buffer[cursor_byte + utf8_length],
+                &state->buffer[cursor_byte],
+                state->length - cursor_byte);
+        memmove(&state->buffer[cursor_byte],
+                utf8_text_buffer,
+                utf8_length);
         state->cursor++;
-        state->length++;
+        state->length += utf8_length;
+        state->codepoint_count++;
         state->buffer[state->length] = '\0';
     }
 }

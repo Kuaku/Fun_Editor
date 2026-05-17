@@ -6,3 +6,4 @@ main.exe
 main.o
 libraylib.a
 
+*.o

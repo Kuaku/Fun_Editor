@@ -101,3 +101,18 @@ size_t utf8_codepoint_to_offset(const char* s, size_t code_offset) {
 
     return bytes_consumed;
 }
+
+size_t utf8_get_length(const char* p) {
+    for (size_t i = 0; i < 4; i++) {
+        Utf8_length_entry entry = UTF8_LENGTH_LOOKUP_TABLE[i];
+        if ((p[0] & entry.mask) == entry.comparator) {
+            return entry.length;
+        }
+    }
+
+    return 0;
+}
+
+bool utf8_is_continuation(char p) {
+    return (p & UTF8_CONTINUATION_MASK) == UTF8_CONTINUATION_COMPARATOR;
+}

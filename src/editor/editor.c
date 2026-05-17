@@ -1,8 +1,8 @@
 #include "editor.h"
 #include "../render/render.h"
-#include "../modal/modals/buffer_list.h"
-#include "../modal/modals/file_explorer.h"
-#include "../modal/modals/statistics_modal.h"
+#include "./modal/modals/buffer_list.h"
+#include "./modal/modals/file_explorer.h"
+#include "./modal/modals/statistics_modal.h"
 
 EditorState InitEditorState(size_t capacity) {
     EditorState state = {0};
@@ -72,10 +72,6 @@ Editor CreateEditor(EditorSettings settings, char* path) {
     } else {
         OpenEmptyBuffer(&editor);
     }
-
-    RegisterBufferListModal(&editor);
-    RegisterFileExplorerModal(&editor);
-    RegisterStatisticsModal(&editor);
 
     return editor;
 }
@@ -149,38 +145,71 @@ void OpenOrSwitchToFile(Editor* editor, const char* path) {
 void MovePointerLeft(TextBuffer* buffer) {
     if (buffer->pointer_position > 0) {
         buffer->pointer_position--;
+        while (buffer->pointer_position > 0 && IsContinuationByte(buffer, buffer->pointer_position)) {
+            buffer->pointer_position--;
+        }
         buffer->request_revalidate_pointer_cache = true;
     }
 }
 
 void MovePointerRight(TextBuffer* buffer) {
-    if (buffer->pointer_position <= GetTextSize(buffer)) {
+    size_t text_buffer_size = GetTextSize(buffer);
+    if (buffer->pointer_position <= text_buffer_size) {
         buffer->pointer_position++;
+        while (buffer->pointer_position <= text_buffer_size && IsContinuationByte(buffer, buffer->pointer_position)) {
+            buffer->pointer_position++;
+        }
         buffer->request_revalidate_pointer_cache = true;
     }
 }
 
 void MovePointerUp(TextBuffer* buffer) {
-    Position pointer = GetPointerPosition(buffer);
+    Position pointer = GetPointerCodepointPosition(buffer);
     if (pointer.y == 0) {
         return;
     }
     Position nextLine = GetLineByIndex(buffer, pointer.y - 1);
-    if (buffer->pointer_position != nextLine.x + min(nextLine.y, pointer.x)) {
-        buffer->pointer_position = nextLine.x + min(nextLine.y, pointer.x);
+
+    size_t target_col = pointer.x;
+    size_t byte_offset = 0;
+    size_t col = 0;
+    while (col < target_col && byte_offset < nextLine.y) {
+        uint32_t cp;
+        size_t cp_len = GetCodepointAt(buffer, nextLine.x + byte_offset, &cp);
+        if (cp == '\n' || cp_len == 0) break;
+        byte_offset += cp_len;
+        col++;
+    }
+
+    size_t new_pos = nextLine.x + byte_offset;
+    if (buffer->pointer_position != new_pos) {
+        buffer->pointer_position = new_pos;
         buffer->request_revalidate_pointer_cache = true;
     }
 }
 
 void MovePointerDown(TextBuffer* buffer) {
-    Position pointer = GetPointerPosition(buffer);
+    Position pointer = GetPointerCodepointPosition(buffer);
     size_t max_lines = GetLineCount(buffer);
     if (pointer.y >= max_lines - 1) {
         return;
     }
     Position nextLine = GetLineByIndex(buffer, pointer.y + 1);
-    if (buffer->pointer_position != nextLine.x + min(nextLine.y, pointer.x)) {
-        buffer->pointer_position = nextLine.x + min(nextLine.y, pointer.x);
+
+    size_t target_col = pointer.x;
+    size_t byte_offset = 0;
+    size_t col = 0;
+    while (col < target_col && byte_offset < nextLine.y) {
+        uint32_t cp;
+        size_t cp_len = GetCodepointAt(buffer, nextLine.x + byte_offset, &cp);
+        if (cp == '\n' || cp_len == 0) break;
+        byte_offset += cp_len;
+        col++;
+    }
+
+    size_t new_pos = nextLine.x + byte_offset;
+    if (buffer->pointer_position != new_pos) {
+        buffer->pointer_position = new_pos;
         buffer->request_revalidate_pointer_cache = true;
     }
 }
@@ -188,42 +217,86 @@ void MovePointerDown(TextBuffer* buffer) {
 void MovePointerWordRight(TextBuffer* buffer) {
     size_t size = GetTextSize(buffer);
     if (buffer->pointer_position >= size) return;
-    char c = GetCharAt(buffer, buffer->pointer_position);
+    uint32_t codepoint;
+    size_t utf8_length = GetCodepointAt(buffer, buffer->pointer_position, &codepoint);
 
-    if (c == '\n') {
-        buffer->pointer_position++;
+    if (codepoint == '\n') {
+        buffer->pointer_position += utf8_length;
         return;
     }
 
-    if (IsWordChar(c)) {
-        while (buffer->pointer_position < size && IsWordChar(GetCharAt(buffer, buffer->pointer_position))) buffer->pointer_position++;
-    } else if (IsPunct(c)) {
-        while (buffer->pointer_position < size && IsPunct(GetCharAt(buffer, buffer->pointer_position))) buffer->pointer_position++;
+    if (IsWordChar(codepoint)) {
+        while (buffer->pointer_position < size) {
+            utf8_length = GetCodepointAt(buffer, buffer->pointer_position, &codepoint);
+            if (!IsWordChar(codepoint)) break;
+            buffer->pointer_position += utf8_length;
+        }
+    } else if (IsPunct(codepoint)) {
+        while (buffer->pointer_position < size) {
+            utf8_length = GetCodepointAt(buffer, buffer->pointer_position, &codepoint);
+            if (!IsPunct(codepoint)) break;
+            buffer->pointer_position += utf8_length;
+        }
     } else {
-        while (buffer->pointer_position < size && (c = GetCharAt(buffer, buffer->pointer_position), c == ' ' || c == '\t')) buffer->pointer_position++;
-        if (buffer->pointer_position < size && GetCharAt(buffer, buffer->pointer_position) == '\n') return;
-        while (buffer->pointer_position < size && IsPunct(GetCharAt(buffer, buffer->pointer_position))) buffer->pointer_position++;
+        while (buffer->pointer_position < size) {
+            utf8_length = GetCodepointAt(buffer, buffer->pointer_position, &codepoint);
+            if (!(codepoint == ' ' || codepoint == '\t')) break;
+            buffer->pointer_position += utf8_length;
+        }
+        if (buffer->pointer_position < size) return;
+        utf8_length = GetCodepointAt(buffer, buffer->pointer_position, &codepoint);
+        if (codepoint == '\n') return;
+        
+        while (buffer->pointer_position < size) {
+            utf8_length = GetCodepointAt(buffer, buffer->pointer_position, &codepoint);
+            if (!IsPunct(codepoint)) break;
+            buffer->pointer_position += utf8_length;
+        }
     }
 }
 
 void MovePointerWordLeft(TextBuffer* buffer) {
-    size_t size = GetTextSize(buffer);
     if (buffer->pointer_position == 0) return;
-    buffer->pointer_position--;
 
-    char c = GetCharAt(buffer, buffer->pointer_position);
-    if (c == '\n') return;
+    MovePointerLeft(buffer);
 
-    while (buffer->pointer_position > 0 && (c = GetCharAt(buffer, buffer->pointer_position), c == ' ' || c == '\t')) {
-        if (GetCharAt(buffer, buffer->pointer_position - 1) == '\n') return;
-        buffer->pointer_position--;
+    uint32_t codepoint;
+    GetCodepointAt(buffer, buffer->pointer_position, &codepoint);
+    if (codepoint == '\n') return;
+
+    while (buffer->pointer_position > 0) {
+        GetCodepointAt(buffer, buffer->pointer_position, &codepoint);
+        if (!(codepoint == ' ' || codepoint == '\t')) break;
+        size_t prev = buffer->pointer_position;
+        MovePointerLeft(buffer);
+        GetCodepointAt(buffer, buffer->pointer_position, &codepoint);
+        if (codepoint == '\n') {
+            buffer->pointer_position = prev;
+            return;
+        }
     }
 
-    c = GetCharAt(buffer, buffer->pointer_position);
-    if (IsWordChar(c)) {
-        while (buffer->pointer_position > 0 && IsWordChar(GetCharAt(buffer, buffer->pointer_position - 1))) buffer->pointer_position--;
-    } else if (IsPunct(c)) {
-        while (buffer->pointer_position > 0 && IsPunct(GetCharAt(buffer, buffer->pointer_position - 1))) buffer->pointer_position--;
+    GetCodepointAt(buffer, buffer->pointer_position, &codepoint);
+    if (IsWordChar(codepoint)) {
+        while (buffer->pointer_position > 0) {
+            size_t prev = buffer->pointer_position;
+            MovePointerLeft(buffer);
+            GetCodepointAt(buffer, buffer->pointer_position, &codepoint);
+            if (!IsWordChar(codepoint)) {
+                buffer->pointer_position = prev;
+                break;
+            }
+        }
+    } else if (IsPunct(codepoint)) {
+        while (buffer->pointer_position > 0) {
+            size_t prev = buffer->pointer_position;
+            MovePointerLeft(buffer);
+            GetCodepointAt(buffer, buffer->pointer_position, &codepoint);
+            if (!IsPunct(codepoint)) {
+                buffer->pointer_position = prev;
+                break;
+            }
+        }
     }
 }
 
@@ -276,14 +349,18 @@ void RemoveBackwardsAction(Editor* editor) {
 
         double current_time = GetTime();
 
-        if (!TryToMergeCharacterRemove(buffer, current_time)) {
-            char deleted_char = GetCharAt(buffer, buffer->pointer_position - 1);
-            PushCommand(buffer, EDIT_DELETE, buffer->pointer_position - 1, &deleted_char, 1);
+        size_t start_byte_position = buffer->pointer_position - 1;
+        while (start_byte_position > 0 && IsContinuationByte(buffer, start_byte_position)) {
+            start_byte_position--;
         }
 
-        if (RemoveCharacter(buffer, buffer->pointer_position)) {
-            buffer->pointer_position--;
+        if (!TryToMergeCharacterRemove(buffer, current_time)) {
+            char* utf8_buffer = GetTextRangeRaw(buffer, start_byte_position, buffer->pointer_position);
+            PushCommand(buffer, EDIT_DELETE, start_byte_position, utf8_buffer, buffer->pointer_position - start_byte_position);
+            free(utf8_buffer);
         }
+
+        ExecuteDelete(buffer, start_byte_position, buffer->pointer_position - start_byte_position);
         buffer->time_since_last_edit = current_time;
     }
 }

@@ -1,5 +1,8 @@
 #include "editor/editor.h"
 #include "render/render.h"
+#include "./modal/modals/buffer_list.h"
+#include "./modal/modals/file_explorer.h"
+#include "./modal/modals/statistics_modal.h"
 
 Vector2 PositionToVector(Position position) {
     return (Vector2){position.x, position.y};
@@ -10,7 +13,7 @@ void SetupWindow() {
     InitWindow(1200, 700, "Fun Editor");
     MaximizeWindow();
 
-    SetTargetFPS(0);
+    SetTargetFPS(60);
     SetExitKey(KEY_NULL);
 }
 
@@ -33,8 +36,20 @@ int main(int argc, char** argv) {
         .mode_padding = (Position){10, 10},
         .command_padding = (Position){10, 10},
         .pointer_width = 2,
-        .editor_font = LoadFontEx("Input.ttf", 80, NULL, 0),
     };
+    
+    int idx = 0;
+    int count = 992 + 96; // ASCII/Latin + Geometric Shapes
+    int* codepoints = malloc(count * sizeof(int));
+
+    // ASCII + Latin (32-1023)
+    for (int i = 32; i <= 1023; i++) codepoints[idx++] = i;
+    // Geometric Shapes (0x25A0-0x25FF)
+    for (int i = 0x25A0; i <= 0x25FF; i++) codepoints[idx++] = i;
+
+    settings.editor_font = LoadFontEx("NotoSansJP-Regular.ttf", 60, codepoints, idx);
+    free(codepoints);
+
     SetTextureFilter(settings.editor_font.texture, TEXTURE_FILTER_BILINEAR);
 
     char* path = NULL;
@@ -43,6 +58,9 @@ int main(int argc, char** argv) {
     }
 
     Editor editor = CreateEditor(settings, path);
+    RegisterBufferListModal(&editor);
+    RegisterFileExplorerModal(&editor);
+    RegisterStatisticsModal(&editor);
     RegisterDefaultCommandBinding(&editor.input_system.command_system);
 
     if (path) {

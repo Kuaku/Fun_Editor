@@ -89,11 +89,13 @@ void ClearTextBuffer(TextBuffer* buffer);
 
 size_t GetTextSize(TextBuffer* buffer);
 char GetCharAt(TextBuffer* buffer, size_t position);
+size_t GetCodepointAt(TextBuffer* buffer, size_t position, uint32_t* codepoint);
+bool IsContinuationByte(TextBuffer* buffer, size_t position);
+char* GetTextRangeRaw(TextBuffer* buffer, size_t start, size_t end);
 char* GetTextRange(TextBuffer* buffer, size_t start, size_t end);
 
 size_t AppendAddBuffer(TextBuffer* buffer, char* value, size_t len);
 void InsertString(TextBuffer* buffer, size_t position, char* value, size_t len);
-bool RemoveCharacter(TextBuffer* buffer, size_t position);
 void ExecuteDelete(TextBuffer* buffer, size_t position, size_t length);
 void RemoveArea(TextBuffer* buffer, size_t position, size_t length);
 void RemoveSelection(TextBuffer* buffer);
@@ -106,10 +108,12 @@ size_t GetLineCount(TextBuffer* buffer);
 char* GenerateLine(TextBuffer* buffer, size_t index);
 
 Position IndexToPosition(TextBuffer* buffer, size_t index);
+Position IndexToPositionCodepoint(TextBuffer* buffer, size_t index);
 size_t PositionToIndex(TextBuffer* buffer, Position in);
 Position GetPointerPosition(TextBuffer* buffer);
+Position GetPointerCodepointPosition(TextBuffer* buffer);
 
-bool IsWordChar(char c);
-bool IsPunct(char c);
+bool IsWordChar(uint32_t c);
+bool IsPunct(uint32_t c);
 
 #endif

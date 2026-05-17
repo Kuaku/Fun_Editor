@@ -1,4 +1,5 @@
 #include "input.h"
+#include "../utils/utf8.h"
 
 static KeyBinding default_normal_bindings[] = {
     { KEY_LEFT,  MODI_NONE,  ACTION_CURSOR_LEFT },
@@ -189,10 +190,11 @@ Action InputSystemPoll(InputSystem* sys) {
         int ch = GetCharPressed();
         if (ch != 0) {
             action.type = ACTION_INSERT_CHAR;
-            action.text_buffer = malloc(2);
-            action.text_buffer[0] = (char)ch;
-            action.text_buffer[1] = '\0';
-            action.length = 1;
+            action.text_buffer = malloc(5);
+            size_t utf8_length = utf8_encode(ch, action.text_buffer);
+            // TODO: Catch length = 0
+            action.text_buffer[4] = '\0';
+            action.length = utf8_length;
             return action;
         }
     }

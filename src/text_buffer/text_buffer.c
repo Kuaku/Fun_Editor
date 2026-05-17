@@ -1,5 +1,6 @@
 #include "text_buffer.h"
 #include "../platform/platform.h"
+#include "../utils/utf8.h"
 
 LineCache InitLineCache() {
     LineCache cache;
@@ -152,6 +153,30 @@ char GetCharAt(TextBuffer* buffer, size_t position) {
     return '\0';
 }
 
+size_t GetCodepointAt(TextBuffer* buffer, size_t position, uint32_t* codepoint) {
+    char utf8_buffer[4];
+    utf8_buffer[0] = GetCharAt(buffer, position);
+    size_t utf8_length = utf8_get_length(utf8_buffer);
+    for (size_t i = 1; i < utf8_length; i++) {
+        utf8_buffer[i] = GetCharAt(buffer, position + i);
+    }
+    size_t result = utf8_decode(utf8_buffer, codepoint);
+    return result;
+}
+
+bool IsContinuationByte(TextBuffer* buffer, size_t position) {
+    return utf8_is_continuation(GetCharAt(buffer, position));
+}
+
+char* GetTextRangeRaw(TextBuffer* buffer, size_t start, size_t end) {
+    size_t length = end - start;
+    char* result = malloc(length);
+    for (size_t i = 0; i < length; i++) {
+        result[i] = GetCharAt(buffer, start + i);
+    }
+    return result;
+}
+
 char* GetTextRange(TextBuffer* buffer, size_t start, size_t end) {
     size_t length = end - start;
     char* result = malloc(length + 1);
@@ -167,18 +192,25 @@ bool TryToMergeCharacterRemove(TextBuffer* buffer, float current_time) {
     if (stack->current > 0 && current_time - buffer->time_since_last_edit < 1.0) {
         EditEntry* prev = &stack->entries[stack->current - 1];
         if (prev->type == EDIT_DELETE && prev->position == buffer->pointer_position) {
-            char deleted = GetCharAt(buffer, buffer->pointer_position - 1);
+            size_t start_byte_position = buffer->pointer_position - 1;
+            while (start_byte_position > 0 && IsContinuationByte(buffer, start_byte_position)) {
+                start_byte_position--;
+            }
+            char* utf8_buffer = GetTextRange(buffer, start_byte_position, buffer->pointer_position);
+            size_t utf8_length = buffer->pointer_position - start_byte_position;
+            
 
-            char* new_text = malloc(prev->length + 2);
-            new_text[0] = deleted;
-            memcpy(new_text + 1, prev->text, prev->length);
-            new_text[prev->length + 1] = '\0';
+            char* new_text = malloc(prev->length + utf8_length + 1);
+            memcpy(new_text, utf8_buffer, utf8_length);
+            memcpy(new_text + utf8_length, prev->text, prev->length);
+            new_text[utf8_length + prev->length] = '\0';
 
+            free(utf8_buffer);
             free(prev->text);
             prev->text = new_text;
-            prev->length++;
-            prev->position--;
-            prev->cursor_after = buffer->pointer_position - 1;
+            prev->length += utf8_length;
+            prev->position -= utf8_length;
+            prev->cursor_after = buffer->pointer_position - utf8_length;
 
             return true;
         }
@@ -378,62 +410,49 @@ void InsertString(TextBuffer* buffer, size_t position, char* value, size_t len) 
     buffer->line_cache.is_valid = false;
 }
 
-bool RemoveCharacter(TextBuffer* buffer, size_t position) {
-    if (position > 0) {
-        Piece* new_pieces = malloc((buffer->piece_count + 1) * sizeof(Piece));
-        int new_count = 0;
-        size_t current_pos = 0;
+void ExecuteDelete(TextBuffer* buffer, size_t position, size_t length) {
+    size_t del_start = position;
+    size_t del_end = position + length;
 
-        position--;
+    Piece* new_pieces = malloc((buffer->piece_count + 2) * sizeof(Piece));
+    int new_count = 0;
+    size_t current_pos = 0;
 
-        for (size_t i = 0; i < buffer->piece_count; ++i) {
-            Piece p = buffer->pieces[i];
+    for (size_t i = 0; i < buffer->piece_count; ++i) {
+        Piece p = buffer->pieces[i];
+        size_t piece_start = current_pos;
+        size_t piece_end = current_pos + p.length;
 
-            if (current_pos + p.length <= position) {
-                new_pieces[new_count++] = p;
-                current_pos += p.length;
-            } else if (position >= current_pos && position < current_pos + p.length) {
-                size_t local_offset = position - current_pos;
-
-                if (local_offset > 0) {
-                    Piece left = p;
-                    left.length = local_offset;
-                    new_pieces[new_count++] = left;
-                }
-
-                if (local_offset + 1 < p.length) {
-                    Piece right = p;
-                    right.start += local_offset + 1;
-                    right.length -= local_offset + 1;
-                    new_pieces[new_count++] = right;
-                }
-
-                current_pos += p.length;
-            } else {
-                new_pieces[new_count++] = p;
-                current_pos += p.length;
+        if (piece_end <= del_start || piece_start >= del_end) {
+            new_pieces[new_count++] = p;
+        } else {
+            if (piece_start < del_start) {
+                Piece left = p;
+                left.length = del_start - piece_start;
+                new_pieces[new_count++] = left;
+            }
+            if (piece_end > del_end) {
+                Piece right = p;
+                size_t skip = del_end - piece_start;
+                right.start += skip;
+                right.length -= skip;
+                new_pieces[new_count++] = right;
             }
         }
 
-        while (new_count > buffer->piece_capacity) {
-            buffer->piece_capacity = new_count * 2;
-            buffer->pieces = realloc(buffer->pieces, buffer->piece_capacity * sizeof(Piece));
-        }
-        memcpy(buffer->pieces, new_pieces, sizeof(Piece) * new_count);
-        buffer->piece_count = new_count;
-        buffer->line_cache.is_valid = false;
-        return true;
+        current_pos += p.length;
     }
-    return false;
-}
 
-void ExecuteDelete(TextBuffer* buffer, size_t position, size_t length) {
-    for (size_t i = 0; i < length; ++i) {
-        RemoveCharacter(buffer, position + 1);
+    while (new_count > buffer->piece_capacity) {
+        buffer->piece_capacity = new_count * 2;
+        buffer->pieces = realloc(buffer->pieces, buffer->piece_capacity * sizeof(Piece));
     }
+    memcpy(buffer->pieces, new_pieces, sizeof(Piece) * new_count);
+    buffer->piece_count = new_count;
+    free(new_pieces);
+    buffer->line_cache.is_valid = false;
     buffer->pointer_position = position;
 }
-
 void RemoveArea(TextBuffer* buffer, size_t position, size_t length) {
     char* deleted_text = GetTextRange(buffer, position, position + length);
     PushCommand(buffer, EDIT_DELETE, position, deleted_text, length);
@@ -539,6 +558,28 @@ Position IndexToPosition(TextBuffer* buffer, size_t index) {
     return out;
 }
 
+Position IndexToPositionCodepoint(TextBuffer* buffer, size_t index) {
+    Position out = {0, 0};
+    size_t traversed = 0;
+    char* work_buffer;
+    for (size_t i = 0; i < buffer->piece_count && traversed < index; ++i) {
+        work_buffer = buffer->pieces[i].source == ORIGINAL ? buffer->org_buffer : buffer->add_buffer;
+
+        size_t to_read = index - traversed;
+        if (to_read > buffer->pieces[i].length) to_read = buffer->pieces[i].length;
+        for (size_t j = 0; j < to_read; ++j) {
+            if (work_buffer[buffer->pieces[i].start + j] == '\n') {
+                out.y++;
+                out.x = 0;
+            } else if (!utf8_is_continuation(work_buffer[buffer->pieces[i].start + j])) {
+                out.x++;
+            }
+        }
+        traversed += to_read;
+    }
+    return out;
+}
+
 size_t PositionToIndex(TextBuffer* buffer, Position in) {
     if (!buffer->line_cache.is_valid) {
         RebuildLineCache(buffer);
@@ -565,10 +606,24 @@ Position GetPointerPosition(TextBuffer* buffer) {
     return out;
 }
 
-bool IsWordChar(char c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+Position GetPointerCodepointPosition(TextBuffer* buffer) {
+    Position pointer = GetPointerPosition(buffer);
+    Position line = GetLineByIndex(buffer, pointer.y);
+
+    size_t codepoint_x = 0;
+    for (size_t i = 0; i < pointer.x; i++) {
+        if (!IsContinuationByte(buffer, line.x + i)) {
+            codepoint_x++;
+        }
+    }
+
+    return (Position){codepoint_x, pointer.y};
 }
 
-bool IsPunct(char c) {
+bool IsWordChar(uint32_t c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c > 127;
+}
+
+bool IsPunct(uint32_t c) {
     return c && !IsWordChar(c) && c != ' ' && c != '\t' && c != '\n';
 }

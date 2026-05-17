@@ -1,6 +1,7 @@
 #include "file_explorer.h"
 #include "string_input.h"
 #include "../../editor/editor.h"
+#include "../../utils/utf8.h"
 
 void InitOpenPathSet(OpenPathSet* set) {
     set->paths = NULL;
@@ -233,16 +234,19 @@ void EnsurePathVisible(FileSystem* system, OpenPathSet* open_dirs, const char* t
     }
 }
 
-void FileExplorerSearchInsertChar(FileExplorerState* state, char ch) {
-    if (state->search.length >= sizeof(state->search.buffer) - 1) return;
+void FileExplorerSearchInsertChar(FileExplorerState* state, uint32_t codepoint) {
+    char utf8_buffer[4];
+    size_t utf8_length = utf8_encode(codepoint, utf8_buffer);
 
-    memmove(&state->search.buffer[state->search.cursor + 1],
-            &state->search.buffer[state->search.cursor],
-            state->search.length - state->search.cursor);
+    if (state->search.length >= sizeof(state->search.buffer) - utf8_length) return;
 
-    state->search.buffer[state->search.cursor] = ch;
+    size_t cursor_byte = utf8_codepoint_to_offset(state->search.buffer, state->search.cursor);
+    memmove(&state->search.buffer[cursor_byte + utf8_length],
+            &state->search.buffer[cursor_byte],
+            state->search.length - cursor_byte);
+    memcpy(&state->search.buffer[cursor_byte], utf8_buffer, utf8_length);
     state->search.cursor++;
-    state->search.length++;
+    state->search.length += utf8_length;
     state->search.buffer[state->search.length] = '\0';
 
     state->needs_rebuild_visible = true;
@@ -251,12 +255,13 @@ void FileExplorerSearchInsertChar(FileExplorerState* state, char ch) {
 void FileExplorerSearchBackspace(FileExplorerState* state) {
     if (state->search.cursor == 0) return;
 
-    memmove(&state->search.buffer[state->search.cursor - 1],
-            &state->search.buffer[state->search.cursor],
-            state->search.length - state->search.cursor);
-
+    size_t cursor_byte = utf8_codepoint_to_offset(state->search.buffer, state->search.cursor);
+    size_t utf8_length = utf8_prev(state->search.buffer, state->search.buffer + cursor_byte);
+    memmove(&state->search.buffer[cursor_byte - utf8_length],
+            &state->search.buffer[cursor_byte],
+            state->search.length - cursor_byte);
     state->search.cursor--;
-    state->search.length--;
+    state->search.length -= utf8_length;
     state->search.buffer[state->search.length] = '\0';
 
     state->needs_rebuild_visible = true;
@@ -516,9 +521,9 @@ void FileExplorerInput(Modal* modal, RawInput input) {
         }
     }
 
-    if (input.is_char && input.key >= 32 && input.key < 127 &&
+    if (input.is_char && input.key >= 32 &&
         !HasModifiers(input.modifiers, MODI_CTRL | MODI_ALT | MODI_SUPER)) {
-        FileExplorerSearchInsertChar(state, (char)input.key);
+        FileExplorerSearchInsertChar(state, input.key);
         return;
     }
 }

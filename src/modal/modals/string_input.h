@@ -8,6 +8,7 @@ typedef struct {
     char buffer[512];
     size_t cursor;
     size_t length;
+    size_t codepoint_count;
 } StringInputState;
 
 void StringInputRender(Modal* modal, Rect content);
