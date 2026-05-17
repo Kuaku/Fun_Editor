@@ -60,8 +60,9 @@ Dependencies: F.1
 When an action key is held it repeats with a configurable attack delay and repeat interval. Characters already repeat at the OS level but movement and delete keys do not.
 Dependencies: -
 
-**F.4. Saving**
+**F.4. Saving** ✅ (partial)
 `ACTION_SAVE` (Ctrl+S) writes the active buffer to disk. `ACTION_SAVE_AS` (Ctrl+Shift+S) prompts for a path if none is set. Uses atomic write (temp file + rename) to avoid corruption on crash.
+`ACTION_SAVE` with atomic write implemented. `ACTION_SAVE_AS` not yet added.
 Dependencies: -
 
 **F.5. Syntax highlighting**
@@ -204,13 +205,14 @@ Dependencies: F.4
 
 ## Non-functional
 
-**Nf.1. Restructure project**
+**Nf.1. Restructure project** ✅
 Split the single `main.c` into the planned module structure:
 `common.h`, `platform`, `statistics`, `filesystem`, `text_buffer`, `input`, `command`, `modal`, `editor`, `render`, and a `modals/` subfolder.
 Dependencies: -
 
-**Nf.2. Build system**
+**Nf.2. Build system** ✅ (partial)
 A proper `CMakeLists.txt` or `Makefile` with debug/release targets and cross-platform handling.
+`build.bat` (Windows) and `Makefile` (Linux) updated for new structure. Debug/release targets not yet added.
 Dependencies: Nf.1
 
 **Nf.3. Basic test harness**
