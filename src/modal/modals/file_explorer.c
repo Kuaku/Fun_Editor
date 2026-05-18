@@ -469,8 +469,11 @@ void FileExplorerInput(Modal* modal, RawInput input) {
                         }
                     }
                 }
-
-                PushStringInputModal(editor, "Create File/Dir", OnCreateFileOrDirConfirmed, ctx);
+                char display_prefix[PATH_MAX_LEN];
+                snprintf(display_prefix, sizeof(display_prefix), "%s%c",
+                        ctx->base_path, FILE_SYSTEM_SEPERATER);
+                PushStringInputModal(editor, "Create File/Dir",
+                                    OnCreateFileOrDirConfirmed, ctx, display_prefix);
             }
             return;
         }
@@ -521,8 +524,7 @@ void FileExplorerInput(Modal* modal, RawInput input) {
         }
     }
 
-    if (input.is_char && input.key >= 32 &&
-        !HasModifiers(input.modifiers, MODI_CTRL | MODI_ALT | MODI_SUPER)) {
+    if (input.is_char && input.key >= 32) {
         FileExplorerSearchInsertChar(state, input.key);
         return;
     }

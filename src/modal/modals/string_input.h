@@ -5,6 +5,7 @@
 
 typedef struct {
     Editor* editor;
+    char* prefix;
     char buffer[512];
     size_t cursor;
     size_t length;
@@ -15,6 +16,6 @@ void StringInputRender(Modal* modal, Rect content);
 void StringInputInput(Modal* modal, RawInput input);
 void StringInputCleanup(void* raw_state);
 
-void PushStringInputModal(Editor* editor, const char* title, ModalResultCallback on_result, void* user_data);
+void PushStringInputModal(Editor* editor, const char* title, ModalResultCallback on_result, void* user_data, const char* prefix);
 
 #endif

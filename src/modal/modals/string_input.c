@@ -25,19 +25,27 @@ void StringInputRender(Modal* modal, Rect content) {
         modal->style.focused_border
     );
 
+    int text_x = input_x + 6;
+    int text_y = input_y + 6;
+
+    // Prefix: drawn muted, not editable, just shifts where the buffer starts.
+    if (state->prefix) {
+        Vector2 prefix_size = MeasureTextEx(font, state->prefix, font_size, 1);
+        DrawTextEx(font, state->prefix,
+                   (Vector2){text_x, text_y},
+                   font_size, 1, modal->style.text_muted);
+        text_x += (int)prefix_size.x;
+    }
+
     char before_cursor[512];
     size_t cursor_byte = utf8_codepoint_to_offset(state->buffer, state->cursor);
     strncpy(before_cursor, state->buffer, cursor_byte);
     before_cursor[cursor_byte] = '\0';
     Vector2 before_size = MeasureTextEx(font, before_cursor, font_size, 1);
 
-    int text_x = input_x + 6;
-    int text_y = input_y + 6;
-
     DrawTextEx(font, state->buffer,
                (Vector2){text_x, text_y},
                font_size, 1, modal->style.text);
-
     DrawRectangle(text_x + (int)before_size.x, text_y,
                   2, font_size, modal->style.text);
 
@@ -99,7 +107,6 @@ void StringInputInput(Modal* modal, RawInput input) {
     }
 
     if (input.key >= 32 &&
-        !HasModifiers(input.modifiers, MODI_CTRL | MODI_ALT | MODI_SUPER) &&
         state->length < sizeof(state->buffer) - 1) {
         char utf8_text_buffer[4];
         size_t utf8_length = utf8_encode(input.key, utf8_text_buffer);
@@ -120,12 +127,18 @@ void StringInputInput(Modal* modal, RawInput input) {
 }
 
 void StringInputCleanup(void* raw_state) {
+    StringInputState* state = (StringInputState*)raw_state;
+    if (state->prefix != NULL) {
+        free(state->prefix);
+    }
     free(raw_state);
 }
 
 void PushStringInputModal(Editor* editor, const char* title,
-                          ModalResultCallback on_result, void* user_data) {
+                          ModalResultCallback on_result, void* user_data, const char* prefix) {
     StringInputState* state = calloc(1, sizeof(StringInputState));
+    state->prefix = prefix ? strdup(prefix) : NULL;
+
     state->editor = editor;
 
     Modal* modal = CreateModal(

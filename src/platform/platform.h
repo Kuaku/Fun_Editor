@@ -3,6 +3,14 @@
 
 #include "../common.h"
 
+static char FILE_SYSTEM_SEPERATER = 
+                #ifdef _WIN32
+                        '\\'
+                #else
+                        '/'
+                #endif
+                ;
+
 typedef struct {
     char     name[NAME_MAX_LEN];
     bool     is_dir;
