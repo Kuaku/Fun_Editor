@@ -186,17 +186,15 @@ Action InputSystemPoll(InputSystem* sys) {
     Action action = { .type = ACTION_NONE };
     ModifierFlags mods = GetCurrentModifiers();
 
-    if (!(mods & (MODI_CTRL | MODI_ALT | MODI_SUPER))) {
-        int ch = GetCharPressed();
-        if (ch != 0) {
-            action.type = ACTION_INSERT_CHAR;
-            action.text_buffer = malloc(5);
-            size_t utf8_length = utf8_encode(ch, action.text_buffer);
-            // TODO: Catch length = 0
-            action.text_buffer[4] = '\0';
-            action.length = utf8_length;
-            return action;
-        }
+    int ch = GetCharPressed();
+    if (ch != 0) {
+        action.type = ACTION_INSERT_CHAR;
+        action.text_buffer = malloc(5);
+        size_t utf8_length = utf8_encode(ch, action.text_buffer);
+        // TODO: Catch length = 0
+        action.text_buffer[4] = '\0';
+        action.length = utf8_length;
+        return action;
     }
 
     int key = GetKeyPressed();
@@ -213,12 +211,10 @@ RawInput InputSystemPollRawInput() {
     RawInput input = {0};
     input.is_char = true;
     input.modifiers = GetCurrentModifiers();
-    if (!HasModifiers(input.modifiers, MODI_CTRL | MODI_ALT | MODI_SUPER)) {
-        int ch = GetCharPressed();
-        if (ch != 0) {
-            input.key = ch;
-            return input;
-        }
+    int ch = GetCharPressed();
+    if (ch != 0) {
+        input.key = ch;
+        return input;
     }
     input.is_char = false;
     input.key = GetKeyPressed();
