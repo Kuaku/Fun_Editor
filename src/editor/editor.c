@@ -365,6 +365,15 @@ void RemoveBackwardsAction(Editor* editor) {
     }
 }
 
+void RemoveForwardAction(Editor* editor) {
+    TextBuffer* buffer = GetActiveBuffer(editor);
+    if (buffer->has_selection) { RemoveSelection(buffer); return; }
+    if (buffer->pointer_position >= GetTextSize(buffer)) return;
+    size_t end = buffer->pointer_position + 1;
+    while (end < GetTextSize(buffer) && IsContinuationByte(buffer, end)) end++;
+    RemoveArea(buffer, buffer->pointer_position, end - buffer->pointer_position);
+}
+
 void InsertNewLineAction(Editor* editor) {
     char new_line_buffer[1];
     new_line_buffer[0] = '\n';
@@ -471,6 +480,14 @@ void CutAction(Editor* editor) {
     RemoveSelection(buffer);
 }
 
+void SelectAllAction(Editor* editor) {
+    TextBuffer* buffer = GetActiveBuffer(editor);
+    buffer->selection_start = 0;
+    buffer->selection_end = GetTextSize(buffer);
+    buffer->pointer_position = buffer->selection_end;
+    buffer->has_selection = true;
+}
+
 void ToggleCommandModeAction(Editor* editor) {
     if (editor->input_system.current_mode == MODE_COMMAND) {
         editor->input_system.current_mode = MODE_TEXT;
@@ -569,6 +586,9 @@ void DispatchInputTextMode(Editor* editor, Action action) {
     case ACTION_DELETE_BACKWARD:
         RemoveBackwardsAction(editor);
         break;
+    case ACTION_DELETE_FORWARD:
+        RemoveForwardAction(editor);
+        break;
     case ACTION_INSERT_NEWLINE:
         InsertNewLineAction(editor);
         break;
@@ -589,6 +609,9 @@ void DispatchInputTextMode(Editor* editor, Action action) {
         break;
     case ACTION_CUT:
         CutAction(editor);
+        break;
+    case ACTION_SELECT_ALL:
+        SelectAllAction(editor);
         break;
     case ACTION_OPEN_COMMAND_PALETTE:
         ToggleCommandModeAction(editor);

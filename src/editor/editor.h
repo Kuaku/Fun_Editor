@@ -86,6 +86,7 @@ void RedoAction(Editor* editor);
 
 void CopyAction(Editor* editor);
 void CutAction(Editor* editor);
+void SelectAllAction(Editor* editor);
 void PasteAction(Editor* editor);
 
 void ToggleCommandModeAction(Editor* editor);
