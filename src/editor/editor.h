@@ -78,6 +78,7 @@ void MovePointerSelectionAction(Editor* editor, void(*move_function)(TextBuffer*
 
 void InsertStringAction(Editor* editor, char* value, size_t len);
 void RemoveBackwardsAction(Editor* editor);
+void RemoveForwardAction(Editor* editor);
 void InsertNewLineAction(Editor* editor);
 void InsertTabAction(Editor* editor);
 
