@@ -1,6 +1,7 @@
 #include "command.h"
 #include "../editor/editor.h"
 #include "../input/input.h"
+#include "../utils/utf8.h"
 
 void ClearCommandToken(CommandToken* token) {
     if (token->char_value) {
@@ -151,30 +152,39 @@ void CommandSystemRemoveChar(CommandSystem* system) {
     if (system->pointer_position >= command_buffer_length) {
         return;
     }
+    uint32_t codepoint;
+    size_t length = utf8_decode(system->command_buffer + system->pointer_position, &codepoint);
 
     memmove(system->command_buffer + system->pointer_position,
-            system->command_buffer + system->pointer_position + 1,
-            command_buffer_length - system->pointer_position);
+            system->command_buffer + system->pointer_position + length,
+            command_buffer_length - system->pointer_position - length + 1);
 }
 
 void CommandSystemBackspace(CommandSystem* system) {
     if (system->pointer_position == 0) {
         return;
     }
+    int start_position = system->pointer_position;
+    do {
+        system->pointer_position--;
+    } while (system->pointer_position > 0 && utf8_is_continuation(system->command_buffer[system->pointer_position]));
 
-    system->pointer_position--;
     CommandSystemRemoveChar(system);
 }
 
 void MoveCommandPointerLeft(CommandSystem* system) {
     if (system->pointer_position <= 0) return;
-    system->pointer_position--;
+    do {
+        system->pointer_position--;
+    } while (system->pointer_position > 0 && utf8_is_continuation(system->command_buffer[system->pointer_position]));
 }
 
 void MoveCommandPointerRight(CommandSystem* system) {
     size_t command_buffer_length = strlen(system->command_buffer);
     if (system->pointer_position >= command_buffer_length) return;
-    system->pointer_position++;
+    do {
+        system->pointer_position++;
+    } while(system->pointer_position <= command_buffer_length - 1 && utf8_is_continuation(system->command_buffer[system->pointer_position]));
 }
 
 void AddCommandBinding(CommandSystem* system, CommandBinding binding) {
@@ -248,6 +258,9 @@ void EnterCommandModeWithCommand(Editor* editor, const char* command, size_t poi
 
 void GotoCommand(Editor* editor, CommandToken* tokens, size_t token_count) {
     TextBuffer* buffer = GetActiveBuffer(editor);
+    if (tokens[0].numb_value == 0) {
+        return;
+    }
     size_t line = tokens[0].numb_value - 1;
     if (line >= 0 && line < GetLineCount(buffer)) {
         buffer->pointer_position = GetLineByIndex(buffer, line).x;
@@ -261,6 +274,10 @@ void FindCommand(Editor* editor, CommandToken* tokens, size_t token_count) {
     size_t line_counter = GetPointerPosition(buffer).y + 1;
     size_t line_count = GetLineCount(buffer);
     size_t search_length = strlen(tokens[0].char_value);
+
+    if (line_count == 0) return;
+    if (search_length == 0) return;
+
     Position found = {-1, -1};
     for (size_t i = 0; i < line_count; ++i) {
         size_t working_line = (line_counter + i) % line_count;
@@ -272,7 +289,7 @@ void FindCommand(Editor* editor, CommandToken* tokens, size_t token_count) {
             continue;
         }
 
-        for (size_t j = 0; j < line_length - search_length; ++j) {
+        for (size_t j = 0; j <= line_length - search_length; ++j) {
             if (strncmp(line + j, tokens[0].char_value, search_length) == 0) {
                 found.x = j;
                 found.y = working_line;

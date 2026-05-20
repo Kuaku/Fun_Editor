@@ -94,7 +94,7 @@ void PushModal(ModalSystem* system, Modal* modal);
 void CloseModal(ModalSystem* system, bool confirmed);
 Modal* GetTopModal(ModalSystem* system);
 
-void PushModalFromCache(ModalSystem* system, char* key);
+void PushModalFromCache(ModalSystem* system, const char* key);
 void RegisterModalToQuickCatch(ModalSystem* system, const char* key, Modal* modal);
 
 bool ModalSystemHasActive(ModalSystem* system);

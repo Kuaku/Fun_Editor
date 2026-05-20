@@ -154,7 +154,7 @@ void MovePointerLeft(TextBuffer* buffer) {
 
 void MovePointerRight(TextBuffer* buffer) {
     size_t text_buffer_size = GetTextSize(buffer);
-    if (buffer->pointer_position <= text_buffer_size) {
+    if (buffer->pointer_position < text_buffer_size) {
         buffer->pointer_position++;
         while (buffer->pointer_position <= text_buffer_size && IsContinuationByte(buffer, buffer->pointer_position)) {
             buffer->pointer_position++;

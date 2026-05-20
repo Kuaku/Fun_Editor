@@ -116,10 +116,11 @@ void PushModal(ModalSystem* system, Modal* modal) {
     system->stack[system->stack_count++] = modal;
 }
 
-void PushModalFromCache(ModalSystem* system, char* key) {
+void PushModalFromCache(ModalSystem* system, const char* key) {
     for (int i = 0; i < system->cache_count; i++) {
         if (strcmp(key, system->modal_keys[i]) == 0) {
           PushModal(system, system->modal_cache[i]);
+          return;
         }
     }
 }
