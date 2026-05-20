@@ -1,9 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <math.h>
 #include "raylib.h"
-#include <time.h>
+#include <string.h>
+#include <stdint.h>
 #include <sys/stat.h>
 
 #ifdef _WIN32
@@ -24,6 +23,10 @@
 #else
     #include <dirent.h>
     #include <unistd.h>
+    #include <limits.h>
+    #include <time.h>
+    #include <errno.h>
+    #include <fcntl.h>
 #endif
 
 #ifndef _WIN32
@@ -31,31 +34,1969 @@
     #define max(a, b) ((a) > (b) ? (a) : (b))
 #endif
 
+#ifdef _WIN32
+    #define PATH_MAX_LEN MAX_PATH
+#else
+    #define PATH_MAX_LEN PATH_MAX
+#endif
+#define NAME_MAX_LEN 256
+
+#define BREAK_DOWN_RECT(rect) rect.position.x, rect.position.y, rect.size.x, rect.size.y
+#define ARRAY_LEN(arr) (sizeof(arr) / sizeof((arr)[0]))
+
+#define INITIAL_TEXT_BUFFER_CAPACITY 10
+#define INITIAL_ADD_BUFFER_CAPACITY 4096
+#define INITIAL_UNDO_STACK_CAPACITY 4096
+#define INITIAL_PIECE_BUFFER_CAPACITY 1024
+#define INITIAL_COMMAND_BUFFER_CAPACITY 1024
+#define INITIAL_COMMAND_BINDING_CAPACITY 1024
+#define INITIAL_TOKENIZER_BUFFER_CAPACITY 8
+#define INITIAL_MODAL_BUFFER_CAPACITY 8
+#define INITIAL_MODAL_CACHE_BUFFER_CAPACITY 8
+#define INITIAL_FILE_TREE_CAPACITY 256
+
+#define INITIAL_SCAN_INTERVAL 5.0
+#define INITIAL_DIRS_PER_FRAME 50
+
+static const char* IGNORED_DIRS[] = {
+    ".git", "node_modules", ".vs", ".vscode", ".idea",
+    "__pycache__", ".cache", ".next", ".nuxt",
+    "dist", "build", ".svn", ".hg",
+};
+#define IGNORED_DIRS_COUNT (sizeof(IGNORED_DIRS) / sizeof(IGNORED_DIRS[0]))
+
+static bool IsIgnoredDir(const char* name) {
+    for (size_t i = 0; i < IGNORED_DIRS_COUNT; i++) {
+#ifdef _WIN32
+        if (_stricmp(name, IGNORED_DIRS[i]) == 0) return true;
+#else
+        if (strcmp(name, IGNORED_DIRS[i]) == 0) return true;
+#endif
+    }
+    return false;
+}
+
+typedef struct Editor Editor;
+typedef struct FileSystem FileSystem;
+
 typedef enum { ORIGINAL, ADD } BufferType;
-typedef enum { TOP, BOTTOM } AnchorType;
+typedef enum { TYPE_DIR, TYPE_FILE, TYPE_ERROR } FileType;
+typedef enum { MODE_TEXT, MODE_COMMAND, MODE_COUNT } EditorMode;
+
+typedef enum {
+    FRAME_TIMER = 0,
+    RENDER_TIMER,
+    UPDATE_TIMER,
+    FILE_POLLING_TIMER,
+    FILE_POLLING_STEP_TIMER,
+    MODAL_UPDATE,
+    INPUT_TIMER,
+    EDITOR_TIMER_COUNT
+} EditorTimer;
 
 typedef struct {
-    BufferType source;
-    size_t start;
-    size_t length;
-} Piece;
-
-typedef struct {
-    size_t x;
-    size_t y;
+    int x;
+    int y;
 } Position;
 
 typedef struct {
-    char** args;
-    size_t count;
-} CommandArgs;
+    Position position;
+    Position size;
+} Rect;
 
 typedef struct {
-    Position* line_positions;
-    size_t line_count;
+    uint64_t start_ns;
+    uint64_t total_ns;
+    uint64_t count;
+    uint64_t min_ns;
+    uint64_t max_ns;
+} StatisticTimer;
+
+typedef struct {
+    StatisticTimer* timers;
+    size_t count;
     size_t capacity;
-    bool is_valid;
-} LineCache;
+    uint64_t frame_count;
+} StatisticSystem;
+
+StatisticSystem InitStatisticSystem() {
+    StatisticSystem system = {0};
+
+    system.capacity = EDITOR_TIMER_COUNT;
+    system.timers = calloc(system.capacity, sizeof(StatisticTimer));
+
+    return system;
+}
+
+void ClearStatisticsSystem(StatisticSystem* system) {
+    free(system->timers);
+    system->timers = NULL;
+    system->count = 0;
+    system->capacity = 0;
+    system->frame_count = 0;
+}
+
+static inline uint64_t GetTimeNs() {
+#ifdef _WIN32
+    static LARGE_INTEGER frequency;
+    static int initialized = 0;
+    
+    if (!initialized) {
+        QueryPerformanceFrequency(&frequency);
+        initialized = 1;
+    }
+    
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    
+    return (uint64_t)(counter.QuadPart * 1000000000 / frequency.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+#endif
+}
+
+void TimerStart(StatisticSystem* system, uint32_t index) {
+    system->timers[index].start_ns = GetTimeNs();
+}
+
+void TimerEnd(StatisticSystem* system, uint32_t index) {
+    StatisticTimer* timer = &system->timers[index];
+    uint64_t elapsed = GetTimeNs() - timer->start_ns;
+    timer->total_ns += elapsed;
+    timer->count++;
+    
+    if (timer->count == 1 || elapsed < timer->min_ns) {
+        timer->min_ns = elapsed;
+    }
+    if (elapsed > timer->max_ns) {
+        timer->max_ns = elapsed;
+    }
+}
+
+double TimerAverage(StatisticSystem* system, uint32_t index) {
+    StatisticTimer* timer = &system->timers[index];
+    if (timer->count == 0) return 0.0;
+    return (timer->total_ns / timer->count) / 1000000.0;
+}
+
+typedef struct {
+    uint32_t index;
+    uint32_t generation;
+} CacheHandle;
+
+#define CACHE_HANDLE_INVALID ((CacheHandle){ UINT32_MAX, 0 })
+
+static inline bool cache_handle_eq(CacheHandle a, CacheHandle b) {
+    return a.index == b.index && a.generation == b.generation;
+}
+
+static inline bool cache_handle_is_invalid(CacheHandle h) {
+    return h.index == UINT32_MAX;
+}
+
+typedef struct {
+    CacheHandle* items;
+    uint32_t     count;
+    uint32_t     capacity;
+} ChildArray;
+
+typedef struct {
+    uint32_t generation;
+    bool     alive;
+
+    CacheHandle parent;
+    ChildArray  children;
+
+    char     name[NAME_MAX_LEN];
+    char     name_lower[NAME_MAX_LEN]; 
+    char     rel_path[PATH_MAX_LEN];
+    FileType type;
+
+    uint64_t mtime; 
+
+    bool is_open;
+} FileCacheEntry;
+
+typedef struct {
+    CacheHandle parent_handle;
+    char abs_path[PATH_MAX_LEN];
+    char rel_path[PATH_MAX_LEN];
+} ScanFrame;
+
+typedef struct {
+    ScanFrame* items;
+    size_t count;
+    size_t capacity;
+} ScanStack;
+
+
+typedef struct {
+        CacheHandle  dir_handle;
+        char         abs_path[PATH_MAX_LEN];
+        char         rel_path[PATH_MAX_LEN];
+        uint64_t cached_mtime;
+} PollFrame;
+
+typedef struct {
+    char     name[NAME_MAX_LEN];
+    bool     is_dir;
+    uint64_t mtime;
+} FsEntry;
+
+typedef struct {
+    FsEntry* items;
+    size_t   count;
+    size_t   capacity;
+} FsEntryList;
+
+typedef struct {
+    FileSystem* fs;         
+    PollFrame* stack;
+    size_t stack_count;
+    size_t stack_capacity;
+
+    ScanStack scan_stack;     
+    FsEntryList fs_list;
+
+    bool in_progress;
+    bool request_validation;
+    bool changed;
+    size_t dirs_per_frame;
+} PollState;
+
+struct FileSystem {
+    FileCacheEntry* entries;
+    size_t capacity;
+    size_t count;
+
+    uint32_t* free_list;
+    size_t free_capacity;
+    size_t free_count;
+
+    ChildArray root_children;
+
+    CacheHandle* all_handles;
+    size_t all_handles_capacity;
+    size_t all_handles_count;
+
+    char root_path[PATH_MAX_LEN];
+    uint64_t root_mtime;
+
+    double last_scan_time;
+    double scan_interval;
+
+    PollState poll_state;
+
+    bool dirty;
+};
+
+#ifdef _WIN32
+    static uint64_t PlatformGetMTime(const char* path) {
+        WIN32_FILE_ATTRIBUTE_DATA attr;
+        if (!GetFileAttributesExA(path, GetFileExInfoStandard, &attr)) return 0;
+        ULARGE_INTEGER uli;
+        uli.LowPart = attr.ftLastWriteTime.dwLowDateTime;
+        uli.HighPart = attr.ftLastWriteTime.dwHighDateTime;
+
+        return uli.QuadPart;
+    }
+
+    static bool PlatformReadDirectory(const char* dir_path, FsEntryList* out) {
+        out->count = 0;
+
+        char search_path[PATH_MAX_LEN];
+        snprintf(search_path, sizeof(search_path), "%s\\*", dir_path);
+
+        WIN32_FIND_DATAA fd;
+        HANDLE hFind = FindFirstFileA(search_path, &fd);
+        if (hFind == INVALID_HANDLE_VALUE) return false;
+        
+        do {
+            if (fd.cFileName[0] == '.' &&
+                (fd.cFileName[1] == '\0' ||
+                (fd.cFileName[1] == '.' && fd.cFileName[2] == '\0'))) {
+                continue; // Skip . and ..
+            }
+
+            if (out->count == out->capacity) {
+                out->capacity = out->capacity ? out->capacity * 2 : 64;
+                out->items = (FsEntry*)realloc(out->items, out->capacity * sizeof(FsEntry));
+            }
+
+            FsEntry* e = &out->items[out->count++];
+            strncpy(e->name, fd.cFileName, NAME_MAX_LEN - 1);
+            e->name[NAME_MAX_LEN - 1] = '\0';
+            e->is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+            ULARGE_INTEGER uli;
+            uli.LowPart  = fd.ftLastWriteTime.dwLowDateTime;
+            uli.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+            e->mtime = uli.QuadPart;
+        } while (FindNextFileA(hFind, &fd));
+
+        FindClose(hFind);
+        return true;
+    }
+
+    static bool PlatformJoinPath(char* out, size_t out_size, const char* a, const char* b) {
+        int written = snprintf(out, out_size, "%s\\%s", a, b);
+        if (written < 0 || written >= out_size) {
+            fprintf(stderr, "Warning: Path too long, skipping: %s\\%s\n", a, b);
+            return false;
+        }
+        return true;
+    }
+
+    static bool PlatformMakeDir(const char* abs_path) {
+        return CreateDirectoryA(abs_path, NULL) != 0 
+            || GetLastError() == ERROR_ALREADY_EXISTS;
+    }
+
+    static bool PlatformMakeFile(const char* abs_path) {
+        HANDLE h = CreateFileA(
+            abs_path,
+            GENERIC_WRITE,
+            0, NULL,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL
+        );
+        if (h == INVALID_HANDLE_VALUE) return false;
+        CloseHandle(h);
+        return true;
+    }
+#else
+    static uint64_t PlatformGetMTime(const char* path) {
+        struct stat st;
+        if (stat(path, &st) != 0) return 0;
+        return (uint64_t)st.st_mtime;
+    }
+
+    static bool PlatformReadDirectory(const char* dir_path, FsEntryList* out) {
+        out->count = 0;
+
+        DIR* dir = opendir(dir_path);
+        if (!dir) return false;
+
+        struct dirent* de;
+        while ((de = readdir(dir)) != NULL) {
+            if (de->d_name[0] == '.' &&
+                (de->d_name[1] == '\0' ||
+                (de->d_name[1] == '.' && de->d_name[2] == '\0'))) {
+                continue;
+            }
+
+            if (out->count == out->capacity) {
+                out->capacity = out->capacity ? out->capacity * 2 : 64;
+                out->items = (FsEntry*)realloc(out->items, out->capacity * sizeof(FsEntry));
+            }
+
+            FsEntry* e = &out->items[out->count];
+            strncpy(e->name, de->d_name, NAME_MAX_LEN - 1);
+            e->name[NAME_MAX_LEN - 1] = '\0';
+
+            // Need full path for stat
+            char full[PATH_MAX_LEN];
+            snprintf(full, sizeof(full), "%s/%s", dir_path, de->d_name);
+
+            struct stat st;
+            if (stat(full, &st) != 0) continue; // skip entries we can't stat
+
+            e->is_dir = S_ISDIR(st.st_mode);
+            e->mtime  = (uint64_t)st.st_mtime;
+            out->count++;
+        }
+
+        closedir(dir);
+        return true;
+    }
+
+    static bool PlatformJoinPath(char* out, size_t out_size, const char* a, const char* b) {
+        int written = snprintf(out, out_size, "%s/%s", a, b);
+        if (written < 0 || written >= out_size) {
+            // Path too long - truncation occurred
+            fprintf(stderr, "Warning: Path too long, skipping: %s/%s\n", a, b);
+            return false;
+        }
+        return true;
+    }
+
+    static bool PlatformMakeDir(const char* abs_path) {
+        return mkdir(abs_path, 0755) == 0 
+            || errno == EEXIST;
+    }
+
+    static bool PlatformMakeFile(const char* abs_path) {
+        int fd = open(abs_path, O_CREAT | O_EXCL | O_WRONLY, 0644);
+        if (fd < 0) return false;
+        close(fd);
+        return true;
+    }
+#endif
+
+static bool CreatePathUnderRoot(const char* root_path, const char* input) {
+    if (!input || input[0] == '\0') return false;
+
+    size_t input_len = strlen(input);
+    bool trailing_slash = (input[input_len - 1] == '/' || input[input_len - 1] == '\\');
+
+    char input_copy[PATH_MAX_LEN];
+    strncpy(input_copy, input, PATH_MAX_LEN - 1);
+    input_copy[PATH_MAX_LEN - 1] = '\0';
+
+    size_t copy_len = strlen(input_copy);
+    if (copy_len > 0 && (input_copy[copy_len - 1] == '/' || input_copy[copy_len - 1] == '\\')) {
+        input_copy[copy_len - 1] = '\0';
+    }
+
+    char* segments[256];
+    int segment_count = 0;
+
+    char* seg = strtok(input_copy, "/\\");
+    while (seg && segment_count < 256) {
+        segments[segment_count++] = seg;
+        seg = strtok(NULL, "/\\");
+    }
+
+    if (segment_count == 0) return false;
+
+    char current[PATH_MAX_LEN];
+    char next[PATH_MAX_LEN];
+    strncpy(current, root_path, PATH_MAX_LEN - 1);
+    current[PATH_MAX_LEN - 1] = '\0';
+
+    int dir_count = trailing_slash ? segment_count : segment_count - 1;
+
+    for (int i = 0; i < dir_count; i++) {
+        if (!PlatformJoinPath(next, sizeof(next), current, segments[i])) {
+            fprintf(stderr, "CreatePathUnderRoot: path too long at segment '%s'\n", segments[i]);
+            return false;
+        }
+
+        strncpy(current, next, PATH_MAX_LEN - 1);
+        current[PATH_MAX_LEN - 1] = '\0';
+        if (!PlatformMakeDir(current)) {
+            fprintf(stderr, "CreatePathUnderRoot: failed to create dir '%s'\n", current);
+            return false;
+        }
+    }
+
+    if (!trailing_slash) {
+        if (!PlatformJoinPath(next, sizeof(next), current, segments[segment_count - 1])) {
+            fprintf(stderr, "CreatePathUnderRoot: path too long for file '%s'\n", segments[segment_count - 1]);
+            return false;
+        }
+        if (!PlatformMakeFile(next)) {
+            fprintf(stderr, "CreatePathUnderRoot: failed to create file '%s'\n", next);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static void StrToLower(const char* src, char* dst, size_t dst_size) {
+    size_t i = 0;
+    for (; src[i] && i < dst_size - 1; i++) {
+        dst[i] = (char)tolower((unsigned char)src[i]);
+    }
+    dst[i] = '\0';
+}
+
+static void InitFsEntryList(FsEntryList* list) {
+    list->items = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static void ClearFsEntryList(FsEntryList* list) {
+    free(list->items);
+    list->items = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static int CompareFsEntry(const void* a, const void* b) {
+    const FsEntry* ea = (const FsEntry*)a;
+    const FsEntry* eb = (const FsEntry*)b;
+
+    if (ea->is_dir != eb->is_dir) {
+        return ea->is_dir ? -1 : 1;
+    }
+
+    #ifdef _WIN32
+        return _stricmp(ea->name, eb->name);
+    #else
+        return strcasecmp(ea->name, eb->name);
+    #endif
+}
+
+static void SortFsEntry(FsEntryList* list) {
+    if (list->count > 1) {
+        qsort(list->items, list->count, sizeof(FsEntry), CompareFsEntry);
+    }
+}
+
+static void InitChildArray(ChildArray* arr) {
+    arr->items = NULL;
+    arr->count = 0;
+    arr->capacity = 0;
+}
+
+static void ClearChildArray(ChildArray* arr) {
+    free(arr->items);
+    arr->items = NULL;
+    arr->count = 0;
+    arr->capacity = 0;
+}
+
+static void PushChildArray(ChildArray* arr, CacheHandle handle) {
+    if (arr->count == arr->capacity) {
+        arr->capacity = arr->capacity ? arr->capacity * 2 : 8;
+        arr->items = (CacheHandle*)realloc(arr->items, arr->capacity * sizeof(CacheHandle));
+    }
+    arr->items[arr->count++] = handle;
+}
+
+FileCacheEntry* FileSystemGetEntry(const FileSystem* system, CacheHandle handle) {
+    if (cache_handle_is_invalid(handle)) return NULL;
+    if (handle.index >= system->count) return NULL;
+
+    FileCacheEntry* e = &system->entries[handle.index];
+    if (e->generation != handle.generation) return NULL;
+    if (!e->alive) return NULL;
+    return e;
+}
+
+static uint32_t FindSortedPosChildArray(const FileSystem* system, const ChildArray* arr, const FileCacheEntry* new_entry) {
+    for (uint32_t i = 0; i < arr->count; i++) {
+        const FileCacheEntry* existing = FileSystemGetEntry(system, arr->items[i]);
+        if (!existing) continue;
+
+        if (new_entry->type == TYPE_DIR && existing->type == TYPE_FILE) {
+            return i;
+        }
+        if (new_entry->type == TYPE_FILE && existing->type == TYPE_DIR) {
+            continue;
+        }
+
+        #ifdef _WIN32
+            if (_stricmp(new_entry->name, existing->name) < 0) return i;
+        #else
+            if (strcasecmp(new_entry->name, existing->name) < 0) return i;
+        #endif
+    }
+    return arr->count;
+}
+
+static void InsertSortedChildArray(FileSystem* system, ChildArray* arr, CacheHandle handle) {
+    const FileCacheEntry* entry = FileSystemGetEntry(system, handle);
+    if (!entry) return;
+
+    uint32_t pos = FindSortedPosChildArray(system, arr, entry);
+
+    if (arr->count == arr->capacity) {
+        arr->capacity = arr->capacity ? arr->capacity * 2 : 8;
+        arr->items = (CacheHandle*)realloc(arr->items,
+                                           arr->capacity * sizeof(CacheHandle));
+    }
+
+    if (pos < arr->count) {
+        memmove(&arr->items[pos + 1], &arr->items[pos],
+                (arr->count - pos) * sizeof(CacheHandle));
+    }
+    arr->items[pos] = handle;
+    arr->count++;
+}
+
+static void FileSystemEnsureCapacity(FileSystem* system, size_t needed) {
+    if (needed <= system->capacity) return;
+
+    size_t new_cap = system->capacity ? system->capacity * 2 : 256;
+    while (new_cap < needed) new_cap *= 2;
+
+    system->entries = (FileCacheEntry*)realloc(system->entries, new_cap * sizeof(FileCacheEntry));
+    system->capacity = new_cap;
+}
+
+static CacheHandle FileSystemAlloc(FileSystem* system) {
+    uint32_t idx;
+
+    if (system->free_count > 0) {
+        idx = system->free_list[--system->free_count];
+        system->entries[idx].generation++;
+    } else {
+        FileSystemEnsureCapacity(system, system->count + 1);
+        idx = (uint32_t)system->count++;
+        system->entries[idx].generation = 1;
+    }
+
+    FileCacheEntry* e = &system->entries[idx];
+    e->alive = true;
+    e->parent = CACHE_HANDLE_INVALID;
+    InitChildArray(&e->children);
+    e->name[0] = '\0';
+    e->name_lower[0] = '\0';
+    e->rel_path[0] = '\0';
+    e->type = TYPE_FILE;
+    e->mtime = 0;
+    e->is_open = false;
+
+    return (CacheHandle){idx, e->generation};
+}
+
+static void FileSystemFree(FileSystem* system, CacheHandle handle) {
+    FileCacheEntry* e = FileSystemGetEntry(system, handle);
+    if (!e) return;
+
+    ClearChildArray(&e->children);
+    e->alive = false;
+
+    if (system->free_count == system->free_capacity) {
+        system->free_capacity = system->free_capacity ? system->free_capacity * 2 : 64;
+        system->free_list = (uint32_t*)realloc(
+            system->free_list, system->free_capacity * sizeof(uint32_t)
+        );
+    }
+    system->free_list[system->free_count++] = handle.index;
+}
+
+static void RemoveChildFromArray(ChildArray* arr, CacheHandle handle) {
+    for (uint32_t i = 0; i < arr->count; i++) {
+        if (cache_handle_eq(arr->items[i], handle)) {
+            memmove(&arr->items[i], &arr->items[i + 1],
+                (arr->count - i - 1) * sizeof(CacheHandle));
+                arr->count--;
+                return;
+        }
+    }
+}
+
+static void FileSystemDeleteRecursive(FileSystem* system, CacheHandle handle) {
+    FileCacheEntry* root_entry = FileSystemGetEntry(system, handle);
+    if (!root_entry) return;
+
+    FileCacheEntry* parent = FileSystemGetEntry(system, root_entry->parent);
+    if (parent) {
+        RemoveChildFromArray(&parent->children, handle);
+    } else {
+        RemoveChildFromArray(&system->root_children, handle);
+    }
+
+
+    size_t stack_cap = 64;
+    size_t stack_count = 0;
+    CacheHandle* stack = (CacheHandle*)malloc(stack_cap * sizeof(CacheHandle));
+
+    stack[stack_count++] = handle;
+
+    while (stack_count > 0) {
+        CacheHandle current = stack[stack_count - 1];
+        FileCacheEntry* entry = FileSystemGetEntry(system, current);
+
+        if (!entry) {
+            stack_count--;
+            continue;
+        }
+
+        if (entry->type == TYPE_DIR && entry->children.count > 0) {
+            uint32_t n = entry->children.count;
+
+            while (stack_count + n > stack_cap) {
+                stack_cap *= 2;
+                stack = (CacheHandle*)realloc(stack, stack_cap * sizeof(CacheHandle));
+            }
+
+            for (uint32_t i = 0; i < n; i++) {
+                stack[stack_count++] = entry->children.items[i];
+            }
+
+            entry->children.count = 0;
+        } else {
+            stack_count--;
+            FileSystemFree(system, current);
+        }
+    }
+
+    free(stack);
+}
+
+static void FileSystemRebuildAllHandles(FileSystem* system) {
+    system->all_handles_count = 0;
+
+    for (size_t i = 0; i < system->count; i++) {
+        if (!system->entries[i].alive) continue;
+
+        if (system->all_handles_count == system->all_handles_capacity) {
+            system->all_handles_capacity = system->all_handles_capacity ? system->all_handles_capacity * 2 : 256;
+            system->all_handles = (CacheHandle*)realloc(system->all_handles, system->all_handles_capacity * sizeof(CacheHandle));
+        }
+
+        system->all_handles[system->all_handles_count++] = (CacheHandle) {(uint32_t)i, system->entries[i].generation};
+    }
+}
+
+static void InitScaneStack(ScanStack* stack) {
+    stack->items = NULL;
+    stack->count = 0; 
+    stack->capacity = 0;
+}
+
+static void ClearScanStack(ScanStack* stack) {
+    free(stack->items);
+    stack->items = NULL;
+    stack->count = 0;
+    stack->capacity = 0;
+}
+
+static void PushScanStack(ScanStack* stack, CacheHandle parent, const char* abs_path, const char* rel_path) {
+    if (stack->count == stack->capacity) {
+        stack->capacity = stack->capacity ? stack->capacity * 2 : 32;
+        stack->items = (ScanFrame*)realloc(stack->items, stack->capacity * sizeof(ScanFrame));
+    }
+
+    ScanFrame* f = &stack->items[stack->count++];
+    f->parent_handle = parent;
+    strncpy(f->abs_path, abs_path, PATH_MAX_LEN - 1);
+    f->abs_path[PATH_MAX_LEN - 1] = '\0';
+    strncpy(f->rel_path, rel_path, PATH_MAX_LEN - 1);
+    f->rel_path[PATH_MAX_LEN - 1] = '\0';
+}
+
+static bool PopScanStack(ScanStack* stack, ScanFrame* out) {
+    if (stack->count == 0) return false;
+    *out = stack->items[--stack->count];
+    return true;
+}
+
+static CacheHandle FileSystemCreateEntry(FileSystem* system, CacheHandle parent_handle, const char* rel_dir_path, const FsEntry* fs) {
+    size_t estimated_len;
+    if (rel_dir_path[0] == '\0') {
+        estimated_len = strlen(fs->name);
+    } else {
+        estimated_len = strlen(rel_dir_path) + 1 + strlen(fs->name);
+    }
+    
+    if (estimated_len >= PATH_MAX_LEN) {
+        fprintf(stderr, "Warning: Relative path too long, skipping: %s\n", fs->name);
+        return CACHE_HANDLE_INVALID;
+    }
+
+    CacheHandle handle = FileSystemAlloc(system);
+    FileCacheEntry* entry = FileSystemGetEntry(system, handle);
+    if (!entry) return CACHE_HANDLE_INVALID;
+
+    strncpy(entry->name, fs->name, NAME_MAX_LEN - 1);
+    entry->name[NAME_MAX_LEN - 1] = '\0';
+    StrToLower(entry->name, entry->name_lower, NAME_MAX_LEN);
+    
+    if (rel_dir_path[0] == '\0') {
+        strncpy(entry->rel_path, fs->name, PATH_MAX_LEN - 1);
+    } else {
+#ifdef _WIN32
+        snprintf(entry->rel_path, PATH_MAX_LEN, "%s\\%s", rel_dir_path, fs->name);
+#else
+        snprintf(entry->rel_path, PATH_MAX_LEN, "%s/%s", rel_dir_path, fs->name);
+#endif
+    }
+    entry->rel_path[PATH_MAX_LEN - 1] = '\0';
+
+
+    entry->type = fs->is_dir ? TYPE_DIR : TYPE_FILE;
+    entry->mtime = fs->mtime;
+    entry->parent = parent_handle;
+    entry->is_open = false;
+    return handle;
+}
+
+void ClearFileSystem(FileSystem* system) {
+    for (size_t i = 0; i < system->count; i++) {
+        if (system->entries[i].alive) {
+            ClearChildArray(&system->entries[i].children);
+        }
+    }
+
+    free(system->entries);
+    system->entries = 0;
+    system->capacity = 0;
+    system->count = 0;
+    
+    free(system->free_list);
+    system->free_list = NULL;
+    system->free_capacity = 0;
+    system->free_count = 0;
+
+    ClearChildArray(&system->root_children);
+    
+    free(system->all_handles);
+    system->all_handles = NULL;
+    system->all_handles_capacity = 0;
+    system->all_handles_count = 0;
+
+    
+    system->root_path[0] = '\0';
+    system->root_mtime   = 0;
+    system->dirty         = false;
+}
+
+bool FileSystemBuild(FileSystem* system, const char* root_path) {
+    ClearFileSystem(system);
+
+    strncpy(system->root_path, root_path, PATH_MAX_LEN - 1);
+    system->root_path[PATH_MAX_LEN - 1] = '\0';
+
+    system->root_mtime = PlatformGetMTime(root_path);
+    if (system->root_mtime == 0) return false;
+
+    FsEntryList fs_list;
+    InitFsEntryList(&fs_list);
+
+    ScanStack stack;
+    InitScaneStack(&stack);
+
+    PushScanStack(&stack, CACHE_HANDLE_INVALID, root_path, "");
+
+    ScanFrame frame;
+    while (PopScanStack(&stack, &frame)) {
+
+        if (!PlatformReadDirectory(frame.abs_path, &fs_list)) continue;
+        SortFsEntry(&fs_list);
+
+        for (size_t i = 0; i < fs_list.count; i++) {
+            FsEntry* fs = &fs_list.items[i];
+
+            if (fs->is_dir && IsIgnoredDir(fs->name)) continue;
+
+            CacheHandle handle = FileSystemCreateEntry(system, frame.parent_handle, frame.rel_path, fs);
+            if (cache_handle_is_invalid(handle)) continue;
+
+            // Get parent_children AFTER allocation to avoid pointer invalidation
+            ChildArray* parent_children;
+            if (cache_handle_is_invalid(frame.parent_handle)) {
+                parent_children = &system->root_children;
+            } else {
+                FileCacheEntry* parent_entry = FileSystemGetEntry(system, frame.parent_handle);
+                if (!parent_entry) continue;
+                parent_children = &parent_entry->children;
+            }
+
+            PushChildArray(parent_children, handle);
+
+            if (fs->is_dir) {
+                char abs_child[PATH_MAX_LEN];
+                if (PlatformJoinPath(abs_child, sizeof(abs_child), frame.abs_path, fs->name)) {
+                    FileCacheEntry* entry = FileSystemGetEntry(system, handle);
+                    if (entry) {
+                        PushScanStack(&stack, handle, abs_child, entry->rel_path);
+                    }
+                } else {
+                    fprintf(stderr, "Skipping directory (path too long): %s\n", fs->name);
+                }
+            }
+        }
+    }
+
+    ClearFsEntryList(&fs_list);
+    ClearScanStack(&stack);
+
+    FileSystemRebuildAllHandles(system);
+    system->dirty = true;
+    
+    return true;
+}
+
+static CacheHandle FindChildByName(const FileSystem* system, const ChildArray* children, const char* name) {
+    for (uint32_t i = 0; i < children->count; i++) {
+        const FileCacheEntry* e = FileSystemGetEntry(system, children->items[i]);
+        if (!e) continue;
+#ifdef _WIN32
+        if (_stricmp(e->name, name) == 0) return children->items[i];
+#else
+        if (strcmp(e->name, name) == 0) return children->items[i];
+#endif
+    }
+    return CACHE_HANDLE_INVALID;
+}
+
+static bool FsEntryListContains(const FsEntryList* list, const char* name) {
+    for (size_t i = 0; i < list->count; i++) {
+#ifdef _WIN32
+        if (_stricmp(list->items[i].name, name) == 0) return true;
+#else
+        if (strcmp(list->items[i].name, name) == 0) return true;
+#endif
+    }
+    return false;
+}
+
+void FileSystemPollBegin(FileSystem* system) {
+    PollState* ps = &system->poll_state;
+    ps->in_progress = true;
+    ps->changed = false;
+    ps->stack_count = 0;
+
+    if (ps->stack_count >= ps->stack_capacity) {
+        ps->stack_capacity = ps->stack_capacity ? ps->stack_capacity * 2 : 32;
+        ps->stack = realloc(ps->stack, ps->stack_capacity * sizeof(PollFrame));
+    }
+    PollFrame* f = &ps->stack[ps->stack_count++];
+    f->dir_handle = CACHE_HANDLE_INVALID;
+    strncpy(f->abs_path, system->root_path, PATH_MAX_LEN - 1);
+    f->abs_path[PATH_MAX_LEN - 1] = '\0';
+    f->rel_path[0] = '\0';
+    f->cached_mtime = system->root_mtime;
+}
+
+bool FileSystemPollStep(FileSystem* system, size_t max_dirs) {
+    PollState* ps = &system->poll_state;
+    size_t dirs_processed = 0;
+
+    // Phase 1: Process poll stack (check existing dirs for changes)
+    while (ps->stack_count > 0 && dirs_processed < max_dirs) {
+        PollFrame frame = ps->stack[--ps->stack_count];
+
+        ChildArray* dir_children;
+        if (cache_handle_is_invalid(frame.dir_handle)) {
+            dir_children = &system->root_children;
+        } else {
+            FileCacheEntry* e = FileSystemGetEntry(system, frame.dir_handle);
+            if (!e) continue;
+            dir_children = &e->children;
+        }
+
+        dirs_processed++;
+
+        uint64_t current_mtime = PlatformGetMTime(frame.abs_path);
+
+        if (current_mtime != frame.cached_mtime) {
+            FileCacheEntry* e = FileSystemGetEntry(system, frame.dir_handle);
+            if (e) e->mtime = current_mtime;
+
+            
+
+            if (PlatformReadDirectory(frame.abs_path, &ps->fs_list)) {
+                // Remove children that no longer exist on disk
+                for (int32_t i = (int32_t)dir_children->count - 1; i >= 0; i--) {
+                    CacheHandle child_h = dir_children->items[i];
+                    FileCacheEntry* child = FileSystemGetEntry(system, child_h);
+                    if (!child) continue;
+
+                    if (!FsEntryListContains(&ps->fs_list, child->name)) {
+                        FileSystemDeleteRecursive(system, child_h);
+                        ps->changed = true;
+                    }
+                }
+
+                // Add or update children from disk
+                for (size_t i = 0; i < ps->fs_list.count; i++) {
+                    FsEntry* fs = &ps->fs_list.items[i];
+
+                    if (fs->is_dir && IsIgnoredDir(fs->name)) continue;
+
+                    CacheHandle existing = FindChildByName(system, dir_children, fs->name);
+
+                    if (cache_handle_is_invalid(existing)) {
+                        CacheHandle handle = FileSystemCreateEntry(system, frame.dir_handle, frame.rel_path, fs);
+                        if (cache_handle_is_invalid(handle)) continue;
+
+                        ChildArray* dir_children;
+                        if (cache_handle_is_invalid(frame.dir_handle)) {
+                            dir_children = &system->root_children;
+                        } else {
+                            FileCacheEntry* dir_entry = FileSystemGetEntry(system, frame.dir_handle);
+                            if (!dir_entry) continue;
+                            dir_children = &dir_entry->children;
+                        }
+
+                        InsertSortedChildArray(system, dir_children, handle);
+
+                        if (fs->is_dir) {
+                            char abs_child[PATH_MAX_LEN];
+                            if (!PlatformJoinPath(abs_child, sizeof(abs_child), frame.abs_path, fs->name)) {
+                                continue;
+                            }
+                            FileCacheEntry* entry = FileSystemGetEntry(system, handle);
+                            if (entry) {
+                                PushScanStack(&ps->scan_stack, handle, abs_child, entry->rel_path);
+                            }
+                        }
+
+                        ps->changed = true;
+                    } else {
+                        FileCacheEntry* e = FileSystemGetEntry(system, existing);
+                        if (e) {
+                            FileType fs_type = fs->is_dir ? TYPE_DIR : TYPE_FILE;
+                            if (e->type != fs_type) {
+                                FileSystemDeleteRecursive(system, existing);
+
+                                CacheHandle handle = FileSystemCreateEntry(system, frame.dir_handle, frame.rel_path, fs);
+                                if (cache_handle_is_invalid(handle)) continue;
+
+                                ChildArray* dir_children;
+                                if (cache_handle_is_invalid(frame.dir_handle)) {
+                                    dir_children = &system->root_children;
+                                } else {
+                                    FileCacheEntry* dir_entry = FileSystemGetEntry(system, frame.dir_handle);
+                                    if (!dir_entry) continue;
+                                    dir_children = &dir_entry->children;
+                                }
+
+                                InsertSortedChildArray(system, dir_children, handle);
+
+                                if (fs->is_dir) {
+                                    char abs_child[PATH_MAX_LEN];
+                                    if (!PlatformJoinPath(abs_child, sizeof(abs_child), frame.abs_path, fs->name)) {
+                                        continue;
+                                    }
+                                    FileCacheEntry* entry = FileSystemGetEntry(system, handle);
+                                    if (entry) {
+                                        PushScanStack(&ps->scan_stack, handle, abs_child, entry->rel_path);
+                                    }
+                                }
+
+                                ps->changed = true;
+                            } else {
+                                e->mtime = fs->mtime;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Enqueue child directories for future poll frames
+        {
+            uint32_t n = dir_children->count;
+            for (uint32_t i = 0; i < n; i++) {
+                CacheHandle child_h = dir_children->items[i];
+                FileCacheEntry* child = FileSystemGetEntry(system, child_h);
+                if (!child || child->type != TYPE_DIR) continue;
+                if (IsIgnoredDir(child->name)) continue;
+
+                if (ps->stack_count == ps->stack_capacity) {
+                    ps->stack_capacity = ps->stack_capacity ? ps->stack_capacity * 2 : 32;
+                    ps->stack = (PollFrame*)realloc(ps->stack, ps->stack_capacity * sizeof(PollFrame));
+                }
+
+                PollFrame* pf = &ps->stack[ps->stack_count++];
+                pf->dir_handle = child_h;
+                if (!PlatformJoinPath(pf->abs_path, sizeof(pf->abs_path), frame.abs_path, child->name)) {
+                    ps->stack_count--;
+                    continue;
+                }
+                strncpy(pf->rel_path, child->rel_path, PATH_MAX_LEN - 1);
+                pf->rel_path[PATH_MAX_LEN - 1] = '\0';
+                pf->cached_mtime = child->mtime;
+            }
+        }
+    }
+
+    // Phase 2: Drain scan_stack (fully expand newly discovered directories)
+    // Uses remaining budget from this frame
+    {
+        ScanFrame sf;
+        while (dirs_processed < max_dirs && PopScanStack(&ps->scan_stack, &sf)) {
+            dirs_processed++;
+
+            if (!PlatformReadDirectory(sf.abs_path, &ps->fs_list)) continue;
+            SortFsEntry(&ps->fs_list);
+
+            for (size_t i = 0; i < ps->fs_list.count; i++) {
+                FsEntry* fs = &ps->fs_list.items[i];
+
+                if (fs->is_dir && IsIgnoredDir(fs->name)) continue;
+
+                CacheHandle handle = FileSystemCreateEntry(system, sf.parent_handle, sf.rel_path, fs);
+                if (cache_handle_is_invalid(handle)) continue;
+
+                ChildArray* parent_children;
+                if (cache_handle_is_invalid(sf.parent_handle)) {
+                    parent_children = &system->root_children;
+                } else {
+                    FileCacheEntry* parent_entry = FileSystemGetEntry(system, sf.parent_handle);
+                    if (!parent_entry) continue;
+                    parent_children = &parent_entry->children;
+                }
+
+                PushChildArray(parent_children, handle);
+
+                if (fs->is_dir) {
+                    char abs_child[PATH_MAX_LEN];
+                    if (!PlatformJoinPath(abs_child, sizeof(abs_child), sf.abs_path, fs->name)) {
+                        continue;
+                    }
+                    FileCacheEntry* entry = FileSystemGetEntry(system, handle);
+                    if (entry) {
+                        PushScanStack(&ps->scan_stack, handle, abs_child, entry->rel_path);
+                    }
+                }
+            }
+        }
+    }
+
+    // Check if both stacks are empty → poll complete
+    if (ps->stack_count == 0 && ps->scan_stack.count == 0) {
+        if (ps->changed) {
+            FileSystemRebuildAllHandles(system);
+            system->dirty = true;
+        }
+        ps->in_progress = false;
+        return true;
+    }
+    return false;
+}
+
+FileSystem InitFileSystem() {
+    FileSystem system = {0};
+    system.scan_interval = INITIAL_SCAN_INTERVAL;
+    InitChildArray(&system.root_children);
+    return system;
+}
+
+Vector2 PositionToVector(Position position) {
+    return (Vector2){position.x, position.y};
+}
+
+typedef enum {
+    ACTION_NONE = 0,
+    ACTION_CURSOR_LEFT,
+    ACTION_CURSOR_RIGHT,
+    ACTION_CURSOR_UP,
+    ACTION_CURSOR_DOWN,
+    ACTION_CURSOR_WORD_LEFT,
+    ACTION_CURSOR_WORD_RIGHT,
+
+    ACTION_SELECT_LEFT,
+    ACTION_SELECT_RIGHT,
+    ACTION_SELECT_UP,
+    ACTION_SELECT_DOWN,
+    ACTION_SELECT_WORD_LEFT,
+    ACTION_SELECT_WORD_RIGHT,
+    ACTION_SELECT_ALL,
+
+    ACTION_INSERT_CHAR,
+    ACTION_INSERT_NEWLINE,
+    ACTION_INSERT_TAB,
+    ACTION_DELETE_FORWARD,
+    ACTION_DELETE_BACKWARD,
+
+    ACTION_COPY,
+    ACTION_CUT,
+    ACTION_PASTE,
+
+    ACTION_UNDO,
+    ACTION_REDO,
+
+    ACTION_GOTO,
+    ACTION_SEARCH,
+    ACTION_QUIT,
+    ACTION_CANCEL,
+    ACTION_OPEN_COMMAND_PALETTE,
+
+    ACTION_OPEN_BUFFER_LIST,
+    ACTION_OPEN_FILE,
+
+    ACTION_OPEN_FILE_EXPLORER,
+    ACTION_OPEN_STATISTICS,
+
+    ACTION_EXECUTE_COMMAND,
+
+    ACTION_SAVE,
+} ActionType;
+
+
+const char* ActionTypeToString(ActionType type) {
+    switch(type) {
+        case ACTION_NONE: return "ACTION_NONE";
+        case ACTION_CURSOR_LEFT: return "ACTION_CURSOR_LEFT";
+        case ACTION_CURSOR_RIGHT: return "ACTION_CURSOR_RIGHT";
+        case ACTION_CURSOR_UP: return "ACTION_CURSOR_UP";
+        case ACTION_CURSOR_DOWN: return "ACTION_CURSOR_DOWN";
+        case ACTION_CURSOR_WORD_LEFT: return "ACTION_CURSOR_WORD_LEFT";
+        case ACTION_CURSOR_WORD_RIGHT: return "ACTION_CURSOR_WORD_RIGHT";
+        case ACTION_SELECT_LEFT: return "ACTION_SELECT_LEFT";
+        case ACTION_SELECT_RIGHT: return "ACTION_SELECT_RIGHT";
+        case ACTION_SELECT_UP: return "ACTION_SELECT_UP";
+        case ACTION_SELECT_DOWN: return "ACTION_SELECT_DOWN";
+        case ACTION_SELECT_WORD_LEFT: return "ACTION_SELECT_WORD_LEFT";
+        case ACTION_SELECT_WORD_RIGHT: return "ACTION_SELECT_WORD_RIGHT";
+        case ACTION_SELECT_ALL: return "ACTION_SELECT_ALL";
+        case ACTION_INSERT_CHAR: return "ACTION_INSERT_CHAR";
+        case ACTION_INSERT_NEWLINE: return "ACTION_INSERT_NEWLINE";
+        case ACTION_INSERT_TAB: return "ACTION_INSERT_TAB";
+        case ACTION_DELETE_FORWARD: return "ACTION_DELETE_FORWARD";
+        case ACTION_DELETE_BACKWARD: return "ACTION_DELETE_BACKWARD";
+        case ACTION_COPY: return "ACTION_COPY";
+        case ACTION_CUT: return "ACTION_CUT";
+        case ACTION_PASTE: return "ACTION_PASTE";
+        case ACTION_UNDO: return "ACTION_UNDO";
+        case ACTION_REDO: return "ACTION_REDO";
+        case ACTION_GOTO: return "ACTION_GOTO";
+        case ACTION_SEARCH: return "ACTION_SEARCH";
+        case ACTION_QUIT: return "ACTION_QUIT";
+        case ACTION_CANCEL: return "ACTION_CANCEL";
+        case ACTION_OPEN_COMMAND_PALETTE: return "ACTION_OPEN_COMMAND_PALETTE";
+        case ACTION_EXECUTE_COMMAND: return "ACTION_EXECUTE_COMMAND";
+        case ACTION_OPEN_BUFFER_LIST: return "ACTION_OPEN_BUFFER_LIST";
+        case ACTION_OPEN_FILE: return "ACTION_OPEN_FILE";
+        case ACTION_OPEN_FILE_EXPLORER: return "ACTION_OPEN_FILE_EXPLORER";
+        case ACTION_OPEN_STATISTICS: return "ACTION_OPEN_STATISTICS";
+        case ACTION_SAVE: return "ACTION_SAVE";
+        default: return "UNKNOWN_ACTION";
+    }
+}
+
+bool is_number(const char* str) {
+    if (!str || *str == '\0') return false;
+    
+    const char* p = str;
+    if (*p == '-') p++;  // allow negative
+    
+    if (*p == '\0') return false;  // just a minus sign
+    
+    while (*p) {
+        if (!isdigit(*p)) return false;
+        p++;
+    }
+    return true;
+}
+
+typedef struct {
+    ActionType type;
+    char* text_buffer;
+    size_t length;
+} Action;
+
+void ClearAction(Action* action) {
+    if (action->text_buffer) {
+        free(action->text_buffer);
+    }
+    action->length = 0;
+}
+
+typedef enum {
+    MODI_NONE  = 0,
+    MODI_CTRL  = 1 << 0,
+    MODI_SHIFT = 1 << 1,
+    MODI_ALT   = 1 << 2,
+    MODI_SUPER = 1 << 3,
+} ModifierFlags;
+
+typedef struct {
+    int key;
+    ModifierFlags mods;
+    ActionType action;
+} KeyBinding;
+
+static KeyBinding default_normal_bindings[] = {
+    // Basic movement
+    { KEY_LEFT,  MODI_NONE,  ACTION_CURSOR_LEFT },
+    { KEY_RIGHT, MODI_NONE,  ACTION_CURSOR_RIGHT },
+    { KEY_UP,    MODI_NONE,  ACTION_CURSOR_UP },
+    { KEY_DOWN,  MODI_NONE,  ACTION_CURSOR_DOWN },
+    
+    // Word movement
+    { KEY_LEFT,  MODI_CTRL,  ACTION_CURSOR_WORD_LEFT },
+    { KEY_RIGHT, MODI_CTRL,  ACTION_CURSOR_WORD_RIGHT },
+    
+    // Selection variants (same keys + shift)
+    { KEY_LEFT,  MODI_SHIFT, ACTION_SELECT_LEFT },
+    { KEY_RIGHT, MODI_SHIFT, ACTION_SELECT_RIGHT },
+    { KEY_UP,    MODI_SHIFT, ACTION_SELECT_UP },
+    { KEY_DOWN,  MODI_SHIFT, ACTION_SELECT_DOWN },
+    { KEY_LEFT,  MODI_CTRL | MODI_SHIFT, ACTION_SELECT_WORD_LEFT },
+    { KEY_RIGHT, MODI_CTRL | MODI_SHIFT, ACTION_SELECT_WORD_RIGHT },
+    { KEY_A,     MODI_CTRL,  ACTION_SELECT_ALL },
+    
+    // Editing
+    { KEY_BACKSPACE, MODI_NONE, ACTION_DELETE_BACKWARD },
+    { KEY_DELETE,    MODI_NONE, ACTION_DELETE_FORWARD },
+    { KEY_ENTER,     MODI_NONE, ACTION_INSERT_NEWLINE },
+    { KEY_TAB,       MODI_NONE, ACTION_INSERT_TAB },
+    
+    // Clipboard
+    { KEY_C, MODI_CTRL, ACTION_COPY },
+    { KEY_X, MODI_CTRL, ACTION_CUT },
+    { KEY_V, MODI_CTRL, ACTION_PASTE },
+    
+    // History
+    { KEY_Z, MODI_CTRL, ACTION_UNDO },
+    { KEY_Y, MODI_CTRL, ACTION_REDO },
+    { KEY_Z, MODI_CTRL | MODI_SHIFT, ACTION_REDO },  // Alternative
+    
+    // Editor
+    { KEY_ESCAPE, MODI_NONE, ACTION_CANCEL },
+
+    // Command
+    { KEY_P, MODI_CTRL, ACTION_OPEN_COMMAND_PALETTE},
+    { KEY_G, MODI_CTRL, ACTION_GOTO},
+    { KEY_F, MODI_CTRL, ACTION_SEARCH},
+    { KEY_Q, MODI_CTRL, ACTION_QUIT },
+    { KEY_B, MODI_CTRL, ACTION_OPEN_BUFFER_LIST },
+    { KEY_O, MODI_CTRL, ACTION_OPEN_FILE },
+    { KEY_E, MODI_CTRL, ACTION_OPEN_FILE_EXPLORER },
+    { KEY_D, MODI_CTRL, ACTION_OPEN_STATISTICS },
+
+    { KEY_S, MODI_CTRL, ACTION_SAVE},
+};
+
+static KeyBinding default_command_bindings[] = {
+    { KEY_LEFT,  MODI_NONE,  ACTION_CURSOR_LEFT },
+    { KEY_RIGHT, MODI_NONE,  ACTION_CURSOR_RIGHT },
+
+    { KEY_BACKSPACE, MODI_NONE, ACTION_DELETE_BACKWARD },
+
+    { KEY_P, MODI_CTRL, ACTION_OPEN_COMMAND_PALETTE},
+
+    { KEY_ESCAPE, MODI_NONE, ACTION_CANCEL },
+
+    { KEY_ENTER,     MODI_NONE, ACTION_EXECUTE_COMMAND },
+};
+
+typedef struct Modal Modal;
+
+typedef void (*LayoutFunc)(Modal* modal);
+
+typedef struct {
+    Color background;
+    Color border;
+    Color text;
+    Color text_muted;
+    Color selection;
+    Color input_background;
+    Color focused_border;
+    int border_width;
+    Position content_padding;
+    int widget_spacing;
+    int title_height;
+    Position title_padding;
+    bool draw_title;
+} ModalStyle;
+
+typedef struct {
+    ModifierFlags modifiers;
+    int key;
+    bool is_char;
+} RawInput;
+
+typedef void (*ModalRenderFunc)(Modal* modal, Rect content_bounds);
+typedef void (*ModalInputFunc)(Modal* modal, RawInput input);
+typedef void (*ModalCleanupFunc)(void* state);
+typedef void (*ModalResultCallback)(Modal* modal, bool confirmed, void* result, void* user_data);
+typedef void (*ModalUpdateFunc)(Modal* modal);
+
+struct Modal {
+    char* title;
+
+    Rect bounds;
+    Position wanted_size;
+    Position min_size;
+    Position max_size;
+    Position margin; 
+    
+    ModalStyle style;
+
+    LayoutFunc* layouts;
+    size_t layout_count;
+    size_t layout_capacity;
+
+    bool is_cached;
+
+    ModalRenderFunc custom_render;
+    ModalUpdateFunc custom_update;
+    ModalInputFunc custom_input;
+    ModalCleanupFunc cleanup;
+
+    ModalResultCallback on_result;
+    void* on_result_user_data;
+    void* result_data;
+
+    void* state;
+};
+
+void ApplyWantedSize(Modal* modal) {
+    modal->bounds.size = modal->wanted_size;
+}
+
+void ApplyMaxSize(Modal* modal) {
+    if (modal->max_size.x > 0 && modal->bounds.size.x > modal->max_size.x) {
+        modal->bounds.size.x = modal->max_size.x;
+    }
+    if (modal->max_size.y > 0 && modal->bounds.size.y > modal->max_size.y) {
+        modal->bounds.size.y = modal->max_size.y;
+    }
+}
+
+void ApplyMinSize(Modal* modal) {
+    if (modal->min_size.x > 0 && modal->bounds.size.x < modal->min_size.x) {
+        modal->bounds.size.x = modal->min_size.x;
+    }
+    if (modal->min_size.y > 0 && modal->bounds.size.y < modal->min_size.y) {
+        modal->bounds.size.y = modal->min_size.y;
+    }
+}
+
+void ApplyMargin(Modal* modal) {
+    int sw = GetScreenWidth();
+    int sh = GetScreenHeight();
+    size_t max_w = sw - modal->margin.x * 2;
+    size_t max_h = sh - modal->margin.y * 2;
+    if (modal->bounds.size.x > max_w) {
+        modal->bounds.size.x = max_w;
+    }
+    if (modal->bounds.size.y > max_h) {
+        modal->bounds.size.y = max_h;
+    }
+}
+
+void CenterModal(Modal* modal) {
+    int sw = GetScreenWidth();
+    int sh = GetScreenHeight();
+    modal->bounds.position.x = (sw - modal->bounds.size.x) / 2;
+    modal->bounds.position.y = (sh - modal->bounds.size.y) / 2;
+}
+
+void ModalAddLayout(Modal* modal, LayoutFunc layout) {
+    if (modal->layouts == NULL) {
+        modal->layout_capacity = 4;
+        modal->layouts = calloc(modal->layout_capacity, sizeof(LayoutFunc));
+    }
+    if (modal->layout_count >= modal->layout_capacity) {
+        modal->layout_capacity *= 2;
+        modal->layouts = realloc(modal->layouts, modal->layout_capacity * sizeof(LayoutFunc));
+    }
+    modal->layouts[modal->layout_count++] = layout;
+}
+
+typedef struct {
+    char** modal_keys;
+    Modal** modal_cache;
+    size_t cache_count;
+    size_t cache_capacity;
+
+    Modal** stack;
+    size_t stack_count;
+    size_t stack_capacity;
+    
+    // Default style
+    ModalStyle default_style;
+    
+    // Font for rendering
+    Font font;
+    int font_size;
+    
+    int screen_width;
+    int screen_height;
+} ModalSystem;
+
+ModalSystem InitModalSystem() {
+    ModalSystem system;
+    system.stack_capacity = INITIAL_MODAL_BUFFER_CAPACITY;
+    system.stack = calloc(system.stack_capacity, sizeof(Modal*));
+    system.stack_count = 0;
+
+    system.cache_capacity = INITIAL_MODAL_CACHE_BUFFER_CAPACITY;
+    system.modal_cache = calloc(system.cache_capacity, sizeof(Modal*));
+    system.modal_keys = calloc(system.cache_capacity, sizeof(char*));
+    system.cache_count = 0;
+
+
+    system.default_style = (ModalStyle){
+        .background    = (Color){45, 48, 55, 240},
+        .border        = (Color){80, 85, 95, 255},
+        .text          = WHITE,
+        .text_muted    = (Color){150, 150, 150, 255},
+        .selection     = (Color){60, 100, 180, 255},
+        .input_background = (Color){30, 32, 38, 255},
+        .focused_border   = (Color){100, 140, 220, 255},
+        .border_width     = 2,
+        .content_padding  = (Position){12, 12},
+        .widget_spacing   = 4,
+        .title_height     = 32,
+    };
+
+    return system;
+}
+
+void RegisterModalToQuickCatch(ModalSystem* system, const char* key, Modal* modal) {
+    if (system->cache_count >= system->cache_capacity) {
+        system->cache_capacity *= 2;
+        system->modal_cache = realloc(system->modal_cache, system->cache_capacity * sizeof(Modal*));
+        system->modal_keys = realloc(system->modal_keys, system->cache_capacity * sizeof(char*));
+    }
+    size_t index = system->cache_count++;
+    system->modal_cache[index] = modal;
+    system->modal_keys[index] = strdup(key);
+}
+
+Modal* CreateModal(ModalSystem* system, const char* title, Position wanted_size, ModalRenderFunc render, ModalUpdateFunc update, ModalInputFunc input, ModalCleanupFunc cleanup, void* state) {
+    Modal* modal = calloc(1, sizeof(Modal));
+    modal->title = strdup(title);
+    modal->wanted_size = wanted_size;
+    modal->style = system->default_style;
+    modal->custom_render = render;
+    modal->custom_input = input;
+    modal->custom_update = update;
+    modal->cleanup = cleanup;
+    modal->state = state;
+
+    return modal;
+}
+
+void PushModal(ModalSystem* system, Modal* modal) {
+    if (system->stack_count >= system->stack_capacity) {
+        system->stack_capacity *= 2;
+        system->stack = realloc(system->stack, system->stack_capacity * sizeof(Modal*));
+    }
+    system->stack[system->stack_count++] = modal;
+}
+
+void PushModalFromCache(ModalSystem* system, char* key) {
+    for (int i = 0; i < system->cache_count; i++) {
+        if (strcmp(key, system->modal_keys[i]) == 0) {
+          PushModal(system, system->modal_cache[i]);  
+        }
+    }
+}
+
+Modal* GetTopModal(ModalSystem* system) {
+    if (system->stack_count == 0) return NULL;
+    return system->stack[system->stack_count - 1];
+}
+
+void ClearModal(Modal* modal);
+
+void CloseModal(ModalSystem* system, bool confirmed) {
+    if (system->stack_count == 0) return;
+
+    Modal* modal = system->stack[--system->stack_count];
+
+    if (modal->on_result) {
+        modal->on_result(modal, confirmed, modal->result_data, modal->on_result_user_data);
+    }
+
+    if (modal->is_cached) return;
+
+    ClearModal(modal);
+    free(modal);
+}
+
+void ClearModal(Modal* modal) {
+    if (modal->title) {
+        free(modal->title);
+    }
+
+    if (modal->layouts) {
+        free(modal->layouts);
+    }
+
+    if (modal->cleanup) {
+        modal->cleanup(modal->state);
+    }
+}
+
+bool ModalSystemHasActive(ModalSystem* system) {
+    return system->stack_count > 0;
+}
+
+void ClearModalSystem(ModalSystem* system) {
+    system->stack_count = 0;
+
+    for (size_t i = 0; i < system->cache_count; i++) {
+        Modal* modal = system->modal_cache[i];
+        ClearModal(modal);
+        free(modal);
+        free(system->modal_keys[i]);
+    }
+
+    free(system->stack);
+    free(system->modal_cache);
+    free(system->modal_keys);
+}
+
+typedef enum  {
+    TOKENTYPE_STRING,
+    TOKENTYPE_NUMBER
+} CommandTokenType;
+
+typedef struct {
+    CommandTokenType type;
+    char* char_value;
+    int numb_value;
+} CommandToken;
+
+void ClearCommandToken(CommandToken* token) {
+    if (token->char_value) {
+        free(token->char_value);
+    }
+    token->numb_value = 0;
+}
+
+typedef struct {
+    CommandToken* tokens;
+    size_t capacity;
+    size_t count;
+} TokenList;
+
+TokenList Tokenize(const char* command_buffer) {
+    TokenList result = { NULL, 0};
+    result.tokens = calloc(INITIAL_TOKENIZER_BUFFER_CAPACITY, sizeof(CommandToken));
+    result.capacity = INITIAL_TOKENIZER_BUFFER_CAPACITY;
+
+    const char* p = command_buffer;
+
+    while(*p) {
+        while (*p && isspace(*p)) p++;
+        if (!*p) break;
+
+        CommandToken token = {0};
+
+        if (*p == '"') {
+            p++;
+            const char* start = p;
+
+            while (*p && *p != '"') p++;
+
+            size_t len = p - start;
+            token.type = TOKENTYPE_STRING;
+            token.char_value = malloc(len + 1);
+            strncpy(token.char_value, start, len);
+            token.char_value[len] = '\0';
+            
+            if (*p == '"') p++;
+        } else {
+            const char* start = p;
+
+            while (*p && !isspace(*p)) p++;
+
+            size_t len = p - start;
+            char* value = malloc(len + 1);
+            strncpy(value, start, len);
+            value[len] = '\0';
+
+            if (is_number(value)) {
+                token.type = TOKENTYPE_NUMBER;
+                token.numb_value = atoi(value);
+                token.char_value = NULL;
+                free(value);
+            } else {
+                token.type = TOKENTYPE_STRING;
+                token.char_value = value;
+            }
+        }
+
+        while (result.count >= result.capacity) {
+            result.capacity *= 2;
+            result.tokens = realloc(result.tokens, result.capacity * sizeof(CommandToken));
+        }
+        result.tokens[result.count++] = token;
+    }
+
+    return result;
+}
+
+void ClearTokenList(TokenList* list) {
+    if (list->tokens) {
+        for (int i = 0; i < list->count; i++) {
+            ClearCommandToken(&list->tokens[i]);
+        }
+        free(list->tokens);
+    }
+    list->capacity = 0;
+    list->count = 0;
+}
+
+typedef void (*CommandExecuteFunc)(Editor* editor, CommandToken* tokens, size_t token_count);
+
+typedef struct {
+    char* command;
+    CommandTokenType* needed_types;
+    size_t needed_types_count;
+
+    CommandExecuteFunc execute;
+} CommandBinding;
+
+
+CommandBinding CreateCommandBinding(const char* command, CommandTokenType* needed_types, size_t needed_types_count, CommandExecuteFunc execute) {
+    CommandBinding binding;
+
+    binding.command = strdup(command);
+    if (needed_types_count > 0 && needed_types) {
+        binding.needed_types = calloc(needed_types_count, sizeof(CommandTokenType));
+        memcpy(binding.needed_types, needed_types, needed_types_count * sizeof(CommandTokenType));
+    } else {
+        binding.needed_types = NULL;
+    }
+    binding.needed_types_count = needed_types_count;
+    binding.execute = execute;
+
+    return binding;
+}
+
+void ClearCommandBinding(CommandBinding* binding) {
+    if (binding->command) {
+        free(binding->command);
+    }
+
+    if (binding->needed_types) {
+        free(binding->needed_types);
+    }
+
+    binding->needed_types_count = 0;
+}
+
+typedef struct {
+    char* command_buffer;
+    size_t command_buffer_capacity;
+
+    CommandBinding* bindings;
+    size_t command_bindings_capacity;
+    size_t command_bindings_count;
+
+    size_t pointer_position;
+} CommandSystem;
+
+CommandSystem InitCommandSystem() {
+    CommandSystem system;
+    system.command_buffer = calloc(INITIAL_COMMAND_BUFFER_CAPACITY, sizeof(char));
+    system.command_buffer_capacity = INITIAL_COMMAND_BUFFER_CAPACITY;
+    system.pointer_position = 0;
+
+    system.bindings = calloc(INITIAL_COMMAND_BINDING_CAPACITY, sizeof(CommandBinding));
+    system.command_bindings_capacity = INITIAL_COMMAND_BINDING_CAPACITY;
+    system.command_bindings_count = 0;
+
+    return system;
+}
+
+void CommandSystemInsertString(CommandSystem* system, char* value, size_t len) {
+    size_t command_buffer_length = strlen(system->command_buffer);
+    while (command_buffer_length + len >= system->command_buffer_capacity) {
+        system->command_buffer = realloc(system->command_buffer, system->command_buffer_capacity * 2 * sizeof(char));
+        system->command_buffer_capacity *= 2;
+    }
+    memmove(system->command_buffer + system->pointer_position + len, system->command_buffer + system->pointer_position, command_buffer_length - system->pointer_position + 1);
+    memcpy(system->command_buffer + system->pointer_position, value, len);
+    system->pointer_position += len;
+}
+
+void CommandSystemRemoveChar(CommandSystem* system) {
+    size_t command_buffer_length = strlen(system->command_buffer);
+    
+    if (system->pointer_position >= command_buffer_length) {
+        return;
+    }
+    
+    memmove(system->command_buffer + system->pointer_position,
+            system->command_buffer + system->pointer_position + 1,
+            command_buffer_length - system->pointer_position);
+}
+
+void CommandSystemBackspace(CommandSystem* system) {
+    if (system->pointer_position == 0) {
+        return;
+    }
+    
+    system->pointer_position--;
+    CommandSystemRemoveChar(system);
+}
+
+void MoveCommandPointerLeft(CommandSystem* system) {
+    if (system->pointer_position <= 0) return;
+    system->pointer_position--;
+}
+
+void MoveCommandPointerRight(CommandSystem* system) {
+    size_t command_buffer_length = strlen(system->command_buffer);
+    if (system->pointer_position >= command_buffer_length) return;
+    system->pointer_position++;
+}
+
+void AddCommandBinding(CommandSystem* system, CommandBinding binding) {
+    while (system->command_bindings_count >= system->command_bindings_capacity) {
+        system->bindings = realloc(system->bindings, system->command_bindings_capacity * 2 * sizeof(CommandBinding));
+        system->command_bindings_capacity *= 2;
+    }
+    system->bindings[system->command_bindings_count++] = binding;
+}
+
+void ClearCommandSystem(CommandSystem* system) {
+    if (system->command_buffer) {
+        free(system->command_buffer);
+    }
+
+    if (system->bindings) {
+        for (int i = 0; i < system->command_bindings_count; i++) {
+            ClearCommandBinding(&system->bindings[i]);
+        }
+        free(system->bindings);
+    }
+
+    system->command_buffer_capacity = 0;
+    system->pointer_position = 0;
+}
+
+typedef struct {
+    EditorMode current_mode;
+    
+    KeyBinding* bindings[MODE_COUNT];
+    size_t binding_counts[MODE_COUNT];
+    
+    CommandSystem command_system;
+} InputSystem;
+
+InputSystem InitInputSystem() {
+    InputSystem sys = {0};
+    sys.current_mode = MODE_TEXT;
+
+    sys.binding_counts[MODE_TEXT] = ARRAY_LEN(default_normal_bindings);
+    sys.bindings[MODE_TEXT] = malloc(sizeof(default_normal_bindings));
+    memcpy(sys.bindings[MODE_TEXT], default_normal_bindings, sizeof(default_normal_bindings));
+
+    sys.binding_counts[MODE_COMMAND] = ARRAY_LEN(default_command_bindings);
+    sys.bindings[MODE_COMMAND] = malloc(sizeof(default_command_bindings));
+    memcpy(sys.bindings[MODE_COMMAND], default_command_bindings, sizeof(default_command_bindings));
+    
+    sys.command_system = InitCommandSystem();
+    return sys;
+}
+
+ModifierFlags GetCurrentModifiers() {
+    ModifierFlags mods = MODI_NONE;
+
+    if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) {
+        mods |= MODI_CTRL;
+    }
+    if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) {
+        mods |= MODI_SHIFT;
+    }
+    if (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT)) {
+        mods |= MODI_ALT;
+    }
+    if (IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER)) {
+        mods |= MODI_SUPER;
+    }
+
+    return mods;
+}
+
+ActionType LookupBinding(InputSystem* sys, int key, ModifierFlags mods) {
+    KeyBinding* bindings = sys->bindings[sys->current_mode];
+    size_t count = sys->binding_counts[sys->current_mode];
+
+    for (size_t i = 0; i < count; i++) {
+        if (bindings[i].key == key && bindings[i].mods == mods) {
+            return bindings[i].action;
+        }
+    }
+
+    return ACTION_NONE;
+}
+
+Action InputSystemPoll(InputSystem* sys) {
+    Action action = { .type = ACTION_NONE };
+    ModifierFlags mods = GetCurrentModifiers();
+
+    if (!(mods & (MODI_CTRL | MODI_ALT | MODI_SUPER))) {
+        int ch = GetCharPressed();
+        if (ch != 0) {
+            action.type = ACTION_INSERT_CHAR;
+            action.text_buffer = malloc(2);
+            action.text_buffer[0] = (char)ch;
+            action.text_buffer[1] = '\0';
+            action.length = 1;
+            return action;
+        }
+    }
+
+    int key = GetKeyPressed();
+    if (key != 0) {
+        ActionType found = LookupBinding(sys, key, mods);
+        action.type = found;
+        return action;
+    }
+
+    return action;
+}
+
+bool HasModifiers(ModifierFlags modiefers, ModifierFlags check) {
+    return modiefers & check;
+}
+
+RawInput InputSystemPollRawInput() {
+    RawInput input = {0};
+    input.is_char = true;
+    input.modifiers = GetCurrentModifiers();
+    if (!HasModifiers(input.modifiers, MODI_CTRL | MODI_ALT | MODI_SUPER)) {
+        int ch = GetCharPressed();
+        if (ch != 0) {
+            input.key = ch;
+            return input;
+        }
+    }
+    input.is_char = false;
+    input.key = GetKeyPressed();
+    return input;
+}
+
+void normalize_line_endings(char* buf) {
+    char* src = buf;
+    char* dst = buf;
+    while (*src) {
+        if (*src != '\r') {
+            *dst++ = *src;
+        }
+        src++;
+    }
+    *dst = '\0';
+}
+
+FileType GetFileTypeFromPath(char* path) {
+    struct stat path_stat;
+    if (stat(path, &path_stat) != 0) {
+        return TYPE_ERROR;
+    } else if (S_ISDIR(path_stat.st_mode)) {
+        return TYPE_DIR;
+    } else if (S_ISREG(path_stat.st_mode)) {
+        return TYPE_FILE;
+    }
+
+    return TYPE_ERROR;
+}
+
+char* LoadFile(const char* filename, size_t* out_len) {
+    FILE* f = fopen(filename, "rb");
+    if (!f) {
+        fprintf(stderr, "Could not open file: %s\n", filename);
+        return NULL;
+    }
+    fseek(f, 0, SEEK_END);
+    size_t len = ftell(f);
+    rewind(f);
+
+    char* buf = malloc(len + 1);
+    if (!buf) {
+        fclose(f);
+        fprintf(stderr, "Out of memory!\n");
+        return NULL;
+    }
+    fread(buf, 1, len, f);
+    buf[len] = '\0';
+    fclose(f);
+    if (out_len) *out_len = len;
+    return buf;
+}
+
+void ClearInputSystem(InputSystem* system) {
+    for (size_t i = 0; i < MODE_COUNT; i++) {
+        if (system->bindings[i]) {
+            free(system->bindings[i]);
+        }
+    }
+    ClearCommandSystem(&system->command_system);
+}
 
 typedef enum {
     EDIT_INSERT,
@@ -71,6 +2012,16 @@ typedef struct {
     size_t cursor_after;
 } EditEntry;
 
+void ClearEditEntry(EditEntry* entry) {
+    if (!entry) return;
+    
+    if (entry->text) {
+        free(entry->text);
+        entry->text = NULL;
+        entry->length = 0;
+    }
+}
+
 typedef struct {
     EditEntry* entries;
     size_t count;
@@ -78,117 +2029,68 @@ typedef struct {
     size_t current;
 } UndoStack;
 
-typedef void (*Layout)(void* self);
+UndoStack InitUndoStack()  {
+    UndoStack stack;
+    stack.entries = calloc(INITIAL_UNDO_STACK_CAPACITY, sizeof(EditEntry));
+    stack.capacity = INITIAL_UNDO_STACK_CAPACITY;
+    stack.count = 0;
+    stack.current = 0;
+    return stack;
+}
+
+void ClearUndoStack(UndoStack* stack) {
+    if (!stack) return;
+
+    if (stack->entries) {
+        for (size_t i = 0; i < stack->count; i++) {
+            ClearEditEntry(&stack->entries[i]);
+        }
+        free(stack->entries);
+    }
+    stack->capacity = 0;
+    stack->current = 0;
+    stack->count = 0;
+}
 
 typedef struct {
-    Vector2 position;
-    Vector2 size;
-    Vector2 wanted_size;
-    Vector2 padding;
-    Color background_color;
-    Layout* layouts;
-    int layout_count;
-    void (*render)(void* self);
-    void (*input)(void* self);
-    void* state;
-} Modal;
-
-typedef enum {
-    TYPE_FILE,
-    TYPE_DIR
-} NodeType;
+    BufferType source;
+    size_t start;
+    size_t length;
+} Piece;
 
 typedef struct {
-    NodeType type;
-
-    char* path;
-    size_t path_length;
-    char* name;
-    size_t name_length;
-    int* children;
-    size_t children_count;
-} Node;
-
-typedef struct {
-    char* path;
-    char* name;
-    size_t parent_index;
-} DirWorkItem;
-
-typedef struct {
-    char* path;
-    size_t index;
-} PendingDir;
-
-typedef struct {
-    Node* nodes;
-    size_t count;
+    Position* line_positions;
+    size_t line_count;
     size_t capacity;
-    size_t root_index;
-} FileTree;
+    bool is_valid;
+} LineCache;
 
-typedef struct {
-    FileTree* active;     
-    FileTree* building;   
+LineCache InitLineCache() {
+    LineCache cache;
+    cache.capacity = 1024;
+    cache.line_positions = calloc(cache.capacity, sizeof(Position));
+    cache.line_count = 0;
+    cache.is_valid = false;
+    return cache;
+}
+void ClearLineCache(LineCache* cache) {
+    if (!cache) return;
     
-    double last_scan_time;
-    double scan_interval;
-    
-    bool rebuild_requested;
-    bool rebuild_in_progress;
-    
-    PendingDir* pending_dirs;
-    size_t pending_count;
-    size_t pending_capacity;
-    size_t dirs_per_frame;  
-} FileCacheManager;
-
-typedef struct {
-    size_t selected_index;
-    size_t scroll_offset;
-    size_t expanded_dirs[256];
-    size_t expanded_count;
-} FileBrowserState;
-
-char* root_path;
-
-FileCacheManager cache_manager = {
-    .active = NULL,
-    .building = NULL,
-    .last_scan_time = 0,
-    .scan_interval = 3.0,
-    .rebuild_requested = false,
-    .rebuild_in_progress = false,
-    .pending_dirs = NULL,
-    .pending_count = 0,
-    .pending_capacity = 0,
-    .dirs_per_frame = 50
-};
-
-#define MAX_PIECES 1024
-#define MAX_ADD_BUFFER 4096
-#define MAX_COMMAND_BUFFER 4096
-
-#define BackgroundColor (Color){32, 35, 41, 255}
-#define TextColor       WHITE
-#define ModeColor       WHITE
-#define CommandColor    WHITE
-#define LineNumberColor YELLOW
-
-typedef struct {
-    char* root_dir;
-
-    TextBuffer* text_buffers;
-    size_t text_buffers_capacity;
-    size_t text_buffers_count;
-
-
-} EditorState;
+    if (cache->line_positions) {
+        free(cache->line_positions);
+        cache->line_positions = NULL;
+    }
+    cache->line_count = 0;
+    cache->capacity = 0;
+    cache->is_valid = false;
+}
 
 typedef struct {
     char* file_path;
 
     char* org_buffer;
+    size_t org_buffer_size;
+
     char* add_buffer;
     size_t add_buffer_capacity;
     size_t add_buffer_count;
@@ -200,594 +2102,55 @@ typedef struct {
     LineCache line_cache;
 
     size_t line_anchor;
+    size_t offset_x;
 
-    size_t pointerPosition;
+    size_t pointer_position;
+    size_t selection_start;
+    size_t selection_end;
+
+    double time_since_last_edit;
+
+    Position pointer_position_cache;
+    size_t last_pointer_position_cached;
+    bool request_revalidate_pointer_cache;
+    bool has_selection;
+
+    UndoStack undo_stack;
 } TextBuffer;
 
-char* org_buffer = "";
-char add_buffer[MAX_ADD_BUFFER];
-
-size_t add_buffer_length = 0;
-Piece pieces[MAX_PIECES];
-size_t piece_count = 0;
-LineCache line_cache = {0};
-
-size_t line_anchor = 0;
-size_t offsetX = 0;
-
-size_t fontSize = 30;
-
-size_t pointerPosition = 0;
-size_t pointerPaddingX = 3, pointerPaddingY = 3, pointerWidth = 2;
-
-size_t numberPadding = 10;
-
-Font editor_font;
-
-
-size_t commando_pointer_position = 0;
-char commando_content[MAX_COMMAND_BUFFER] = "";
-size_t command_length = 0;
-bool is_command_mode = false;
-bool exit_requested = false;
-
-size_t mode_padding = 10;
-size_t command_padding = 10;
-CommandArgs command_args;
-
-
-UndoStack undoStack = {0};
-bool can_merge_with_previous = false;
-double time_since_last_edit = 0;
-
-size_t selection_start = 0;
-size_t selection_end = 0;
-bool has_selection = false;
-
-Modal* modal = NULL;
-
-
-FileTree* GetFileTree() {
-    return cache_manager.active;
+size_t GetTextSize(TextBuffer* buffer) {
+    size_t out = 0;
+    for (size_t i = 0; i < buffer->piece_count; ++i) {
+        out += buffer->pieces[i].length;
+    }
+    return out;
 }
 
-bool IsDirExpanded(FileBrowserState* state, size_t node_index) {
-    for (size_t i = 0; i < state->expanded_count; i++) {
-        if (state->expanded_dirs[i] == node_index) return true;
+void PushCommand(TextBuffer* buffer, EditType type, size_t position, const char* text, size_t length) {
+    UndoStack* stack = &buffer->undo_stack;
+    for (size_t i = stack->current; i < stack->count; i++) {
+        ClearEditEntry(&stack->entries[i]);      
     }
-    return false;
-}
+    stack->count = stack->current;
 
-// TODO: Rework to use Arena
-void ToggleDirExpanded(FileBrowserState* state, size_t node_index) {
-    for (size_t i = 0; i < state->expanded_count; i++) {
-        if (state->expanded_dirs[i] == node_index) {
-            memmove(&state->expanded_dirs[i], &state->expanded_dirs[i + 1],
-                    sizeof(size_t) * (state->expanded_count - i - 1));
-            state->expanded_count--;
-            return;
-        }
-    }
-    if (state->expanded_count < 256) {
-        state->expanded_dirs[state->expanded_count++] = node_index;
-    }
-}
-
-void RenderFileNode(Modal* modal, FileTree* tree, size_t node_index, FileBrowserState* state, float x, float* y, float indent, float item_height, float visible_top, float visible_bottom) {
-    if (!tree || !tree->nodes || node_index >= tree->count) {
-        return;
-    }
-    Node* node = &tree->nodes[node_index];
-
-    if (*y + item_height < visible_top || *y > visible_bottom) {
-        *y += item_height;
-        if (node->type == TYPE_DIR && IsDirExpanded(state, node_index)) {
-            for (size_t i = 0; i < node->children_count; i++) {
-                RenderFileNode(modal, tree, node->children[i], state, x, y, indent + 20, item_height, visible_top, visible_bottom);
-            }
-        }
-        return;
-    }
-
-    bool is_selected = (state->selected_index == node_index);
-    if (is_selected) {
-        DrawRectangle(x, *y, modal->size.x, item_height, (Color){60, 60, 80, 255});
-    }
-
-    const char* icon = (node->type == TYPE_DIR) 
-        ? (IsDirExpanded(state, node_index) ? "v " : "> ")
-        : "  ";
-
-    char display[256];
-    snprintf(display, sizeof(display), "%s%s", icon, node->name);
-    DrawTextEx(editor_font, display, (Vector2){x + indent, *y}, fontSize, 1, TextColor);
-    *y += item_height;
-
-    if (node->type == TYPE_DIR && IsDirExpanded(state, node_index)) {
-        for (size_t i = 0; i < node->children_count; i++) {
-            RenderFileNode(modal, tree, node->children[i], state, x, y, indent+20, item_height, visible_top, visible_bottom);
-        }
-    }
-}
-
-size_t CollectVisibleNodes(FileTree* tree, FileBrowserState* state, size_t node_index, 
-                           size_t* visible, size_t count, size_t max_count) {
-
-    if (!tree || !visible || node_index >= tree->count) {
-        return count;
-    }
-    if (count >= max_count) return count;
-    
-    visible[count++] = node_index;
-    
-    Node* node = &tree->nodes[node_index];
-    if (node->type == TYPE_DIR && IsDirExpanded(state, node_index)) {
-        for (size_t i = 0; i < node->children_count; i++) {
-            count = CollectVisibleNodes(tree, state, node->children[i], 
-                                        visible, count, max_count);
-        }
+    if (stack->count >= stack->capacity) {
+        ClearEditEntry(&stack->entries[0]);
+        memmove(stack->entries, stack->entries + 1, (stack->capacity - 1) * sizeof(EditEntry));
+        stack->count--;
     }
     
-    return count;
-}
-
-void MoveSelectionUp(FileBrowserState* state, FileTree* tree) {
-    size_t visible[4096];
-    size_t visible_count = CollectVisibleNodes(tree, state, tree->root_index, visible, 0, 4096);
-    
-    for (size_t i = 1; i < visible_count; i++) {
-        if (visible[i] == state->selected_index) {
-            state->selected_index = visible[i - 1];
-            return;
-        }
-    }
-}
-
-void MoveSelectionDown(FileBrowserState* state, FileTree* tree) {
-    size_t visible[4096];
-    size_t visible_count = CollectVisibleNodes(tree, state, tree->root_index, visible, 0, 4096);
-    
-    for (size_t i = 0; i < visible_count - 1; i++) {
-        if (visible[i] == state->selected_index) {
-            state->selected_index = visible[i + 1];
-            return;
-        }
-    }
-}
-
-int GetVisibleIndex(FileTree* tree, FileBrowserState* state, size_t target_index) {
-    size_t visible[4096];
-    size_t visible_count = CollectVisibleNodes(tree, state, tree->root_index, visible, 0, 4096);
-    
-    for (size_t i = 0; i < visible_count; i++) {
-        if (visible[i] == target_index) {
-            return (int)i;
-        }
-    }
-    return -1;
-}
-
-void EnsureSelectionVisible(Modal* modal, FileBrowserState* state, FileTree* tree) {
-    int visible_index = GetVisibleIndex(tree, state, state->selected_index);
-    if (visible_index < 0) return;
-    
-    float item_height = fontSize + 4;
-    float selection_y = visible_index * item_height;
-    float visible_height = modal->size.y - 20;
-    
-    if (selection_y < state->scroll_offset) {
-        state->scroll_offset = (size_t)selection_y;
-    }
-    
-    if (selection_y + item_height > state->scroll_offset + visible_height) {
-        state->scroll_offset = (size_t)(selection_y + item_height - visible_height);
-    }
-}
-
-void InputFileBrowser(void* modal_ptr) {
-    Modal* self = (Modal*)modal_ptr;
-    FileBrowserState* state = (FileBrowserState*)self->state;
-    FileTree* tree = GetFileTree();
-
-    if (!tree) return;
-    
-    if (IsKeyPressed(KEY_UP)) {
-        MoveSelectionUp(state, tree);
-        EnsureSelectionVisible(self, state, tree);
-    }
-    
-    if (IsKeyPressed(KEY_DOWN)) {
-        MoveSelectionDown(state, tree);
-        EnsureSelectionVisible(self, state, tree);
-    }
-
-    if (IsKeyPressed(KEY_ENTER)) {
-        Node* node = &tree->nodes[state->selected_index];
-        if (node->type == TYPE_DIR) {
-            ToggleDirExpanded(state, state->selected_index);
-            EnsureSelectionVisible(self, state, tree);
-        } else {
-            // TODO: Open file
-        }
-    }
-
-    if (IsKeyPressed(KEY_ESCAPE) ) {
-        modal = NULL;
-    }
-    if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_SPACE)) {
-        modal = NULL;
-    }
-}
-
-void RenderFileBrowser(void* modal_ptr) {
-    Modal* self = (Modal*)modal_ptr;
-    if (!self || !self->state) {
-        return;
-    }
-    FileBrowserState* state = (FileBrowserState*)self->state;
-
-    FileTree* tree = GetFileTree();
-
-    if (!tree || tree->count == 0) {
-        const char* msg = cache_manager.rebuild_in_progress 
-            ? "Loading..." 
-            : "No files";
-        Vector2 size = MeasureTextEx(editor_font, msg, fontSize, 1);
-        DrawTextEx(editor_font, msg, 
-            (Vector2){
-                self->position.x + self->size.x/2 - size.x/2,
-                self->position.y + self->size.y/2 - size.y/2
-            }, 
-            fontSize, 1, TextColor);
-        return;
-    }
-
-    if (tree->root_index >= tree->count) {
-        return;
-    }
-
-    float y = self->position.y + 10 - state->scroll_offset;
-    float visible_top = self->position.y;
-    float visible_bottom = self->position.y + self->size.y;
-
-    RenderFileNode(self, tree, tree->root_index, state, self->position.x, &y, 0, fontSize + 4, visible_top, visible_bottom);
-}
-
-FileTree* CreateFileTree() {
-    FileTree* tree = calloc(1, sizeof(FileTree));
-    tree->capacity = 256;
-    tree->nodes = calloc(tree->capacity, sizeof(Node));
-    tree->count = 0;
-    return tree;
-}
-
-void FreeFileTree(FileTree* tree) {
-    if (!tree) return;
-    for (size_t i = 0; i < tree->count; i++) {
-        free(tree->nodes[i].path);
-        free(tree->nodes[i].name);
-        free(tree->nodes[i].children);
-    }
-    free(tree->nodes);
-    free(tree);
-}
-
-size_t AddNodeToTree(FileTree* tree, NodeType type, const char* path, const char* name) {
-    if (tree->count >= tree->capacity) {
-        size_t new_capacity = tree->capacity * 2;
-        Node* new_nodes = realloc(tree->nodes, sizeof(Node) * new_capacity);
-
-        if (!new_nodes) {
-            return SIZE_MAX;
-        }
-        tree->nodes = new_nodes;
-        tree->capacity = new_capacity;
-    }
-    
-    size_t index = tree->count++;
-    Node* node = &tree->nodes[index];
-    node->type = type;
-    node->path = strdup(path);
-    node->name = strdup(name);
-
-    if (!node->path || !node->name) {
-        free(node->path);
-        free(node->name);
-        tree->count--;
-        return SIZE_MAX;
-    }
-
-    node->path_length = strlen(path);
-    node->name_length = strlen(name);
-    node->children = NULL;
-    node->children_count = 0;
-    
-    return index;
-}
-
-void AddPendingDir(const char* path, size_t node_index) {
-    if (node_index == SIZE_MAX) return;
-
-    if (cache_manager.pending_count >= cache_manager.pending_capacity) {
-        size_t new_capacity = cache_manager.pending_capacity == 0 
-            ? 64 : cache_manager.pending_capacity * 2;
-        PendingDir* new_dirs = realloc(cache_manager.pending_dirs,
-            sizeof(PendingDir) * new_capacity);
-        if (!new_dirs) {
-            return;
-        }
-        cache_manager.pending_dirs = new_dirs;
-        cache_manager.pending_capacity = new_capacity;
-    }
-
-    char* path_copy = strdup(path);
-    if (!path_copy) {
-        return;
-    }
-    
-    cache_manager.pending_dirs[cache_manager.pending_count++] = (PendingDir){
-        .path = path_copy,
-        .index = node_index
-    };
-}
-
-void AddChildToTreeNode(FileTree* tree, size_t parent_index, size_t child_index) {
-    if (parent_index >= tree->count || child_index == SIZE_MAX) {
-        return;
-    }
-
-    Node* parent = &tree->nodes[parent_index];
-    size_t current_capacity = (parent->children_count == 0) ? 0 : 
-        ((parent->children_count - 1) / 16 + 1) * 16;
-    
-    if (parent->children_count >= current_capacity) {
-        size_t new_capacity = current_capacity + 16;
-        int* new_children = realloc(parent->children, sizeof(int) * new_capacity);
-        if (!new_children) {
-            return;
-        }
-        parent->children = new_children;
-    }
-
-    parent->children[parent->children_count++] = (int)child_index;
-}
-
-char* JoinPath(const char* base, const char* name) {
-    size_t base_len = strlen(base);
-    size_t name_len = strlen(name);
-    char* result = malloc(base_len + name_len + 2);
-    
-    strcpy(result, base);
-    #ifdef _WIN32
-        if (base[base_len - 1] != '\\' && base[base_len - 1] != '/') {
-            strcat(result, "\\");
-        }
-    #else
-        if (base[base_len - 1] != '/') {
-            strcat(result, "/");
-        }
-    #endif
-    strcat(result, name);
-    return result;
-}
-
-void ProcessSingleDirectory(const char* path, size_t dir_node_index) {
-    FileTree* tree = cache_manager.building;
-    if (!tree || dir_node_index >= tree->count) return;
-    
-#ifdef _WIN32
-    char search_path[MAX_PATH];
-    snprintf(search_path, MAX_PATH, "%s\\*", path);
-    
-    WIN32_FIND_DATAA find_data;
-    HANDLE find_handle = FindFirstFileA(search_path, &find_data);
-    
-    if (find_handle == INVALID_HANDLE_VALUE) return;
-    
-    do {
-        if (strcmp(find_data.cFileName, ".") == 0 || 
-            strcmp(find_data.cFileName, "..") == 0) continue;
-        
-        if (find_data.cFileName[0] == '.') continue;
-        if (strcmp(find_data.cFileName, "node_modules") == 0) continue;
-        if (strcmp(find_data.cFileName, ".git") == 0) continue;
-        
-        char* full_path = JoinPath(path, find_data.cFileName);
-        size_t child_index;
-        
-        if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            child_index = AddNodeToTree(tree, TYPE_DIR, full_path, find_data.cFileName);
-            if (child_index != SIZE_MAX) {
-                AddPendingDir(full_path, child_index);
-            }
-        } else {
-            child_index = AddNodeToTree(tree, TYPE_FILE, full_path, find_data.cFileName);
-        }
-        if (child_index != SIZE_MAX) {
-            AddChildToTreeNode(tree, dir_node_index, child_index);
-        }
-        
-        free(full_path);
-        
-    } while (FindNextFileA(find_handle, &find_data));
-    
-    FindClose(find_handle);
-    
-#else
-    DIR* dir = opendir(path);
-    if (!dir) return;
-    
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || 
-            strcmp(entry->d_name, "..") == 0) continue;
-        
-        if (entry->d_name[0] == '.') continue;
-        if (strcmp(entry->d_name, "node_modules") == 0) continue;
-        
-        char* full_path = JoinPath(path, entry->d_name);
-        struct stat entry_stat;
-        
-        if (stat(full_path, &entry_stat) == 0) {
-            size_t child_index;
-            
-            if (S_ISDIR(entry_stat.st_mode)) {
-                child_index = AddNodeToTree(tree, TYPE_DIR, full_path, entry->d_name);
-                AddPendingDir(full_path, child_index);
-            } else {
-                child_index = AddNodeToTree(tree, TYPE_FILE, full_path, entry->d_name);
-            }
-            
-            AddChildToTreeNode(tree, dir_node_index, child_index);
-        }
-        free(full_path);
-    }
-    closedir(dir);
-#endif
-}
-
-void LogFileTreeNode(size_t node_index, int depth) {
-    if (node_index >= cache_manager.active->count) return;
-    
-    Node* node = &cache_manager.active->nodes[node_index];
-    
-    char indent[256] = {0};
-    for (int i = 0; i < depth && i < 127; i++) {
-        strcat(indent, "  ");
-    }
-    
-    const char* prefix = (node->type == TYPE_DIR) ? "[DIR] " : "[FILE]";
-    
-    TraceLog(LOG_INFO, "%s%s %s", indent, prefix, node->name);
-    
-    if (node->type == TYPE_DIR) {
-        for (size_t i = 0; i < node->children_count; i++) {
-            LogFileTreeNode(node->children[i], depth + 1);
-        }
-    }
-}
-
-void LogFileTree() {
-    if (cache_manager.active == NULL || cache_manager.active->count == 0) {
-        TraceLog(LOG_WARNING, "File cache is empty");
-        return;
-    }
-    
-    TraceLog(LOG_INFO, "========== FILE TREE ==========");
-    //LogFileTreeNode(cache_manager.active->root_index, 0);
-    //TraceLog(LOG_INFO, "===============================");
-    TraceLog(LOG_INFO, "Total nodes: %zu", cache_manager.active->count);
-}
-
-void UpdateFileCache() {
-    double current_time = GetTime();
-    
-    if (!cache_manager.rebuild_in_progress && 
-        (current_time - cache_manager.last_scan_time > cache_manager.scan_interval || cache_manager.active == NULL)) {
-        cache_manager.rebuild_requested = true;
-    }
-    
-    if (cache_manager.rebuild_requested && !cache_manager.rebuild_in_progress) {
-        cache_manager.rebuild_requested = false;
-        cache_manager.rebuild_in_progress = true;
-        
-        if (cache_manager.building) {
-            FreeFileTree(cache_manager.building);
-        }
-        cache_manager.building = CreateFileTree();
-
-        if (!cache_manager.building) {
-            cache_manager.rebuild_in_progress = false;
-            return;
-        }
-    
-        for (int i = 0; i < cache_manager.pending_count; i++) {
-            if (cache_manager.pending_dirs[i].path) {
-                free(cache_manager.pending_dirs[i].path);
-            }
-        }
-        cache_manager.pending_count = 0;
-        
-        const char* name = strrchr(root_path, '/');
-        #ifdef _WIN32
-            const char* name_win = strrchr(root_path, '\\');
-            if (name_win > name) name = name_win;
-        #endif
-        name = name ? name + 1 : root_path;
-        
-        cache_manager.building->root_index = AddNodeToTree(
-            cache_manager.building, TYPE_DIR, root_path, name);
-        if (cache_manager.building->root_index == SIZE_MAX) {
-            FreeFileTree(cache_manager.building);
-            cache_manager.building = NULL;
-            cache_manager.rebuild_in_progress = false;
-            return;
-        }
-        AddPendingDir(root_path, cache_manager.building->root_index);
-    }
-    
-    if (cache_manager.rebuild_in_progress) {
-        size_t dirs_to_process = cache_manager.dirs_per_frame;
-        
-        while (dirs_to_process > 0 && cache_manager.pending_count > 0) {
-            PendingDir entry = cache_manager.pending_dirs[--cache_manager.pending_count];
-            
-            ProcessSingleDirectory(entry.path, entry.index);
-            free(entry.path);
-            dirs_to_process--;
-        }
-        
-        if (cache_manager.pending_count == 0) {
-            cache_manager.rebuild_in_progress = false;
-            cache_manager.last_scan_time = current_time;
-            
-            FileTree* old = cache_manager.active;
-            cache_manager.active = cache_manager.building;
-            cache_manager.building = NULL;
-            LogFileTree();
-            FreeFileTree(old);
-        }
-    }
-}
-
-void InitUndoStack()  {
-    undoStack.capacity = 10000;
-    undoStack.entries = calloc(undoStack.capacity, sizeof(EditEntry));
-    undoStack.count = 0;
-    undoStack.current = 0;
-}
-
-void FreeEditEntry(EditEntry* entry) {
-    if (entry->text) {
-        free(entry->text);
-        entry->text = NULL;
-    }
-}
-
-void PushCommand(EditType type, size_t position, const char* text, size_t length) {
-    for (size_t i = undoStack.current; i < undoStack.count; i++) {
-        FreeEditEntry(&undoStack.entries[i]);      
-    }
-    undoStack.count = undoStack.current;
-
-    if (undoStack.count >= undoStack.capacity) {
-        FreeEditEntry(&undoStack.entries[0]);
-        memmove(undoStack.entries, undoStack.entries + 1, (undoStack.capacity - 1) * sizeof(EditEntry));
-        undoStack.count--;
-    }
-    
-    EditEntry* entry = &undoStack.entries[undoStack.count];
+    EditEntry* entry = &stack->entries[stack->count];
     entry->type = type;
     entry->position = position;
     entry->length = length;
-    entry->cursor_before = pointerPosition;
+    entry->cursor_before = buffer->pointer_position;
     switch (entry->type)
     {
         case EDIT_INSERT:
-            entry->cursor_after = pointerPosition + entry->length;
+            entry->cursor_after = buffer->pointer_position + entry->length;
             break;
         case EDIT_DELETE:
-            entry->cursor_after = pointerPosition - entry->length;
+            entry->cursor_after = buffer->pointer_position - entry->length;
             break;
     }
 
@@ -799,131 +2162,193 @@ void PushCommand(EditType type, size_t position, const char* text, size_t length
         entry->text = NULL;
     }
 
-    undoStack.count++;
-    undoStack.current = undoStack.count;
+    stack->count++;
+    stack->current = stack->count;
 }
 
-void LogAddBuffer() {
-    printf("AddBuffer: ");
-    for (size_t i = 0; i < add_buffer_length; ++i) {
-        if (add_buffer[i] == ' ') {
-            printf("Space ");
-        } else if (add_buffer[i] == '\n') {
-            printf("Enter ");
-        } else {
-            printf("%c ", add_buffer[i]);
+char GetCharAt(TextBuffer* buffer, size_t position) {
+    size_t traversed = 0;
+    char* work_buffer;
+    
+    for (size_t i = 0; i < buffer->piece_count; i++) {
+        work_buffer = buffer->pieces[i].source == ORIGINAL ? buffer->org_buffer : buffer->add_buffer;
+        
+        if (traversed + buffer->pieces[i].length > position) {
+            size_t offset = position - traversed;
+            return work_buffer[buffer->pieces[i].start + offset];
+        }
+        
+        traversed += buffer->pieces[i].length;
+    }
+    
+    return '\0'; 
+}
+
+bool TryToMergeCharacterRemove(TextBuffer* buffer, float current_time) {
+    UndoStack* stack = &buffer->undo_stack;
+    if (stack->current > 0 && current_time - buffer->time_since_last_edit < 1.0) {
+        EditEntry* prev = &stack->entries[stack->current - 1];
+        if (prev->type == EDIT_DELETE && prev->position == buffer->pointer_position) {
+            char deleted = GetCharAt(buffer, buffer->pointer_position - 1);
+
+            char* new_text = malloc(prev->length + 2);
+            new_text[0] = deleted;
+            memcpy(new_text + 1, prev->text, prev->length);
+            new_text[prev->length + 1] = '\0';
+
+            free(prev->text);
+            prev->text = new_text;
+            prev->length++;
+            prev->position--;
+            prev->cursor_after = buffer->pointer_position - 1;
+            
+            return true;
         }
     }
-    printf("\n");
+    return false;
 }
 
-void LogPieces() {
-    TraceLog(LOG_INFO, "===== PIECES =====");
-    for (size_t i = 0; i < piece_count; ++i) {
-        Piece p = pieces[i];
-        const char* sourceName = (p.source == ORIGINAL) ? "ORIGINAL" : "ADD";
-        const char* buffer = (p.source == ORIGINAL) ? org_buffer : add_buffer;
-
-        char text[1025] = {0};
-        size_t copyLen = (p.length < 1024) ? p.length : 1024;
-        strncpy(text, buffer + p.start, copyLen);
-        text[copyLen] = '\0';
-
-        TraceLog(LOG_INFO, "[%zu] Source: %s, Start: %zu, Length: %zu, Text: \"%s\"",
-                 i, sourceName, p.start, p.length, text);
+bool TryToMergeCharacterInsert(TextBuffer* buffer, char* value, size_t len, float current_time) {
+    UndoStack* stack = &buffer->undo_stack;
+    if (stack->current > 0 && current_time - buffer->time_since_last_edit < 1.0) {
+        EditEntry* prev = &stack->entries[stack->current - 1];
+        if (prev->type == EDIT_INSERT && 
+            prev->position + prev->length == buffer->pointer_position &&
+            memchr(value, '\n', len) == NULL) {
+            
+            char* new_text = realloc(prev->text, prev->length + len + 1);
+            if (!new_text) {
+                return false;
+            }
+            memcpy(new_text + prev->length, value, len);
+            new_text[prev->length + len] = '\0';
+            prev->text = new_text;
+            prev->length += len;
+            prev->cursor_after = buffer->pointer_position + len;
+            return true;
+        }
     }
-    TraceLog(LOG_INFO, "==================");
+    return false;
 }
 
-char* GenerateText(size_t* out_length) {
-    size_t buffer_length = 0;
-    for (size_t i = 0; i < piece_count; ++i) {
-        buffer_length += pieces[i].length;
-    }
-
-    char* out = calloc(buffer_length + 1, sizeof(char));
-    char* work_buffer;
-    char* marker = out;
-    for (size_t i = 0; i < piece_count; ++i) {
-        work_buffer = pieces[i].source == ORIGINAL ? org_buffer : add_buffer;
-        work_buffer = work_buffer + pieces[i].start;
-        memcpy(marker, work_buffer, pieces[i].length);
-        marker = marker + pieces[i].length;
-    }
-
-    *out_length = buffer_length;
-    return out;
-}
-
-void InitLineCache() {
-    line_cache.capacity = 1024;
-    line_cache.line_positions = calloc(line_cache.capacity, sizeof(Position));
-    line_cache.line_count = 0;
-    line_cache.is_valid = false;
-}
-
-void FreeLineCache() {
-    if (line_cache.line_positions) {
-        free(line_cache.line_positions);
-        line_cache.line_positions = NULL;
-    }
-
-    line_cache.line_count = 0;
-    line_cache.capacity = 0;
-    line_cache.is_valid = false;
-}
-
-void InvalidateLineCache() {
-    line_cache.is_valid = false;
-}
-
-void RebuildLineCache() {
-    line_cache.line_count = 0;
-    line_cache.line_positions[0].x = 0;
-    line_cache.line_positions[0].y = 0;
+void RebuildLineCache(TextBuffer* buffer) {
+    buffer->line_cache.line_count = 0;
+    buffer->line_cache.line_positions[0].x = 0;
+    buffer->line_cache.line_positions[0].y = 0;
     size_t current_pos = 0;
     char* work_buffer;
 
-    for (size_t i = 0; i < piece_count; ++i) {
-        work_buffer = pieces[i].source == ORIGINAL ? org_buffer : add_buffer;
+    for (size_t i = 0; i < buffer->piece_count; ++i) {
+        work_buffer = buffer->pieces[i].source == ORIGINAL ? buffer->org_buffer : buffer->add_buffer;
 
-        for (size_t j = 0; j < pieces[i].length; ++j) {
-            if (work_buffer[pieces[i].start + j] == '\n') {
+        for (size_t j = 0; j < buffer->pieces[i].length; ++j) {
+            if (work_buffer[buffer->pieces[i].start + j] == '\n') {
                 
-                if (line_cache.line_count + 1 >= line_cache.capacity) {
-                    line_cache.capacity *= 2;
-                    line_cache.line_positions = realloc(line_cache.line_positions, line_cache.capacity * sizeof(Position));
+                while (buffer->line_cache.line_count + 1 >= buffer->line_cache.capacity) {
+                    buffer->line_cache.capacity *= 2;
+                    buffer->line_cache.line_positions = realloc(buffer->line_cache.line_positions, buffer->line_cache.capacity * sizeof(Position));
                 }
 
-                line_cache.line_positions[line_cache.line_count].y = current_pos - line_cache.line_positions[line_cache.line_count].x;
-                line_cache.line_count++;
-                line_cache.line_positions[line_cache.line_count].x = current_pos + 1;
-                line_cache.line_positions[line_cache.line_count].y = 0;
+                buffer->line_cache.line_positions[buffer->line_cache.line_count].y = current_pos - buffer->line_cache.line_positions[buffer->line_cache.line_count].x;
+                buffer->line_cache.line_count++;
+                buffer->line_cache.line_positions[buffer->line_cache.line_count].x = current_pos + 1;
+                buffer->line_cache.line_positions[buffer->line_cache.line_count].y = 0;
             }
             current_pos++;
         }
     }
-    line_cache.line_positions[line_cache.line_count].y = current_pos - line_cache.line_positions[line_cache.line_count].x;
-    line_cache.line_count++;
-    line_cache.is_valid = true;
+    buffer->line_cache.line_positions[buffer->line_cache.line_count].y = current_pos - buffer->line_cache.line_positions[buffer->line_cache.line_count].x;
+    buffer->line_cache.line_count++;
+    buffer->line_cache.is_valid = true;
 }
 
-Position GetLinePosition(size_t index) {
-    if (!line_cache.is_valid) {
-        RebuildLineCache();
+void InitTextBuffer(TextBuffer* buffer) {
+    buffer->add_buffer = calloc(INITIAL_ADD_BUFFER_CAPACITY, sizeof(char));
+    buffer->add_buffer_capacity = INITIAL_ADD_BUFFER_CAPACITY;    
+    buffer->add_buffer_count = 0;
+
+    buffer->line_cache = InitLineCache();
+    
+    buffer->line_anchor = 0;
+    buffer->offset_x = 0;
+    buffer->pointer_position = 0;
+    buffer->pointer_position_cache = (Position){0, 0};
+    buffer->last_pointer_position_cached = 0;
+    buffer->request_revalidate_pointer_cache = false;
+    buffer->time_since_last_edit = 0;
+
+    buffer->selection_start = 0;
+    buffer->selection_end = 0;
+    buffer->has_selection = false;
+
+    buffer->undo_stack = InitUndoStack();
+}
+
+char* GetTextRange(TextBuffer* buffer, size_t start, size_t end) {
+    size_t length = end - start;
+    char* result = malloc(length + 1);
+    for (size_t i = 0; i < length; i++) {
+        result[i] = GetCharAt(buffer, start + i);
+    }
+    result[length] = '\0';
+    return result;
+}
+
+void InitPieceBuffer(TextBuffer* buffer) {
+    buffer->pieces = calloc(INITIAL_PIECE_BUFFER_CAPACITY, sizeof(Piece));
+    buffer->piece_capacity = INITIAL_PIECE_BUFFER_CAPACITY;
+    buffer->pieces[0].source = ORIGINAL;
+    buffer->pieces[0].start = 0;
+    buffer->pieces[0].length = strlen(buffer->org_buffer);
+    
+    buffer->piece_count = 1;
+}
+
+void InitEmptyTextBuffer(TextBuffer* buffer) {
+    InitTextBuffer(buffer);
+
+    buffer->file_path = NULL;
+    buffer->org_buffer = strdup("");
+    buffer->org_buffer_size = 0;
+
+    InitPieceBuffer(buffer);
+    RebuildLineCache(buffer);
+}
+
+void InitTextBufferFromPath(TextBuffer* buffer, const char* path) {
+    InitTextBuffer(buffer);
+    
+    buffer->file_path = strdup(path);
+    buffer->org_buffer = LoadFile(path, &buffer->org_buffer_size);
+    normalize_line_endings(buffer->org_buffer);
+
+    InitPieceBuffer(buffer);
+    RebuildLineCache(buffer);
+}
+
+Position GetLinePosition(TextBuffer* buffer, size_t index) {
+    if (!buffer->line_cache.is_valid) {
+        RebuildLineCache(buffer);
     }
 
-    return line_cache.line_positions[index];
+    return buffer->line_cache.line_positions[index];
 }
 
-
-Position GetLineByIndex(size_t index) {
-    return GetLinePosition(index);
+Position GetLineByIndex(TextBuffer* buffer, size_t index) {
+    return GetLinePosition(buffer, index);
 }
 
-char* GenerateLine(size_t index) {
+size_t GetLineCount(TextBuffer* buffer)  {
+    if (!buffer->line_cache.is_valid) {
+        RebuildLineCache(buffer);
+    }
+    return buffer->line_cache.line_count;
+}
+
+char* GenerateLine(TextBuffer* buffer, size_t index) {
+    //TODO: Use line cache
     char* line;
-    Position line_position = GetLineByIndex(index);
+    Position line_position = GetLineByIndex(buffer, index);
     line = calloc(line_position.y + 1, sizeof(char));
 
     size_t start_pos = line_position.x;
@@ -934,9 +2359,9 @@ char* GenerateLine(size_t index) {
     Piece piece;
     char* work_buffer;
     size_t copied = 0;
-    for (size_t i = 0; i < piece_count && copied < line_position.y; ++i) {
-        piece = pieces[i];
-        work_buffer = piece.source == ORIGINAL ? org_buffer : add_buffer;
+    for (size_t i = 0; i < buffer->piece_count && copied < line_position.y; ++i) {
+        piece = buffer->pieces[i];
+        work_buffer = piece.source == ORIGINAL ? buffer->org_buffer : buffer->add_buffer;
         
         size_t piece_start = traversed;
         size_t piece_end = traversed + piece.length;
@@ -954,33 +2379,18 @@ char* GenerateLine(size_t index) {
     return line;
 }
 
-int AppendAddBuffer(char* value, size_t len) {
-    // TODO: Possible Buffer overflow!
-    int result = add_buffer_length;
-    memcpy(&add_buffer[add_buffer_length], value, len);
-    add_buffer_length += len;
-    return result;
-}
-
-size_t GetTextSize() {
-    size_t out = 0;
-    for (size_t i = 0; i < piece_count; ++i) {
-        out += pieces[i].length;
-    }
-    return out;
-}
-
-Position GetPointerPosition() {
+Position IndexToPosition(TextBuffer* buffer, size_t index) {  
+    //TODO: Use line cache
     Position out = {0, 0};
     size_t traversed = 0;
     char* work_buffer;
-    for (size_t i = 0; i < piece_count && traversed < pointerPosition; ++i) {
-        work_buffer = pieces[i].source == ORIGINAL ? org_buffer : add_buffer;
+    for (size_t i = 0; i < buffer->piece_count && traversed < index; ++i) {
+        work_buffer = buffer->pieces[i].source == ORIGINAL ? buffer->org_buffer : buffer->add_buffer;
         
-        size_t to_read = pointerPosition - traversed;
-        if (to_read > pieces[i].length) to_read = pieces[i].length;
+        size_t to_read = index - traversed;
+        if (to_read > buffer->pieces[i].length) to_read = buffer->pieces[i].length;
         for (size_t j = 0; j < to_read; ++j) {
-            if (work_buffer[pieces[i].start + j] == '\n') {
+            if (work_buffer[buffer->pieces[i].start + j] == '\n') {
                 out.y++;
                 out.x = 0;
             } else {
@@ -992,16 +2402,1659 @@ Position GetPointerPosition() {
     return out;
 }
 
-bool RemoveCharacter(size_t position) {
+Position GetPointerPosition(TextBuffer* buffer) {
+    if (!buffer->request_revalidate_pointer_cache && buffer->pointer_position == buffer->last_pointer_position_cached) return buffer->pointer_position_cache;
+    Position out = IndexToPosition(buffer, buffer->pointer_position);
+
+    buffer->request_revalidate_pointer_cache = false;
+    buffer->pointer_position_cache = out;
+    buffer->last_pointer_position_cached = buffer->pointer_position;
+    return out;
+}
+
+void ClearTextBuffer(TextBuffer* buffer) {
+    if (!buffer) return;
+
+    if (buffer->file_path) {
+        free(buffer->file_path);
+        buffer->file_path = NULL;
+    }
+
+    if (buffer->org_buffer) {
+        free(buffer->org_buffer);
+        buffer->org_buffer = NULL;
+    }
+    buffer->org_buffer_size = 0;
+
+    if (buffer->add_buffer) {
+        free(buffer->add_buffer);
+        buffer->add_buffer = NULL;
+    }
+    buffer->add_buffer_capacity = 0;
+    buffer->add_buffer_count = 0;
+
+    if (buffer->pieces) {
+        free(buffer->pieces);
+        buffer->pieces = NULL;
+    }
+    buffer->piece_capacity = 0;
+    buffer->piece_count = 0;
+
+    ClearLineCache(&buffer->line_cache);
+
+    buffer->line_anchor = 0;
+    buffer->pointer_position = 0;
+    buffer->selection_start = 0;
+    buffer->selection_end = 0;
+    buffer->has_selection = false;
+
+    ClearUndoStack(&buffer->undo_stack);
+}
+
+typedef struct {
+    char* root_dir;
+
+    TextBuffer* text_buffers;
+    size_t text_buffers_capacity;
+    size_t text_buffers_count;
+
+    int open_text_buffer_index;
+    bool exit_requested;
+
+} EditorState;
+
+EditorState InitEditorState(size_t capacity) {
+    EditorState state = {0};
+    state.root_dir = NULL;
+    state.open_text_buffer_index = -1;
+    state.text_buffers = calloc(capacity, sizeof(TextBuffer));
+    state.text_buffers_capacity = capacity;
+    state.text_buffers_count = 0;
+    return state;
+}
+
+void ClearEditorState(EditorState* state) {
+    if (!state) return;
+
+    if (state->root_dir) {
+        free(state->root_dir);
+        state->root_dir = NULL;
+    }
+
+    if (state->text_buffers) {
+        for (size_t i = 0; i < state->text_buffers_count; i++) {
+            ClearTextBuffer(&state->text_buffers[i]);
+        }
+        free(state->text_buffers);
+        state->text_buffers = NULL;
+    }
+    state->text_buffers_capacity = 0;
+    state->text_buffers_count = 0;
+    state->open_text_buffer_index = 0;
+
+    state->exit_requested = false;
+}
+
+void ResizeTextBuffers(EditorState* state) {
+    size_t new_size = state->text_buffers_capacity * 2;
+    state->text_buffers = realloc(state->text_buffers, new_size * sizeof(TextBuffer));
+    state->text_buffers_capacity = new_size;
+
+    if (!state->text_buffers) {
+        // TODO: Handle realloc fail gracefully
+    }
+}
+
+size_t GetFreeTextBufferIndex(EditorState* state) {
+    size_t index = state->text_buffers_count++;
+    while (index >= state->text_buffers_capacity) {
+        ResizeTextBuffers(state);
+    }
+    return index;
+}
+
+typedef struct {
+    Color background_color;
+    Color mode_color;
+    Color text_color;
+    Color command_color;
+    Color line_number_color;
+} ColorScheme;
+
+typedef struct {
+    ColorScheme scheme;
+    Font editor_font;
+    Position pointer_padding;
+    Position mode_padding;
+    Position command_padding;
+    size_t number_padding;
+    size_t pointer_width;
+    size_t font_size;
+} EditorSettings;
+
+void ClearEditorSettings(EditorSettings* settings) {
+    if (!settings) return;
+
+    if (settings->editor_font.texture.id > 0) {
+        UnloadFont(settings->editor_font);
+    }
+}
+
+
+
+static void PrintTree(const FileSystem* system, const ChildArray* children, int indent) {
+    for (uint32_t i = 0; i < children->count; i++) {
+        FileCacheEntry* e = FileSystemGetEntry(system, children->items[i]);
+        if (!e) continue;
+        for (int j = 0; j < indent; j++) printf("  ");
+        if (e->type == TYPE_DIR) {
+            printf("[DIR]  %s  (rel: %s)\n", e->name, e->rel_path);
+            PrintTree(system, &e->children, indent + 1);
+        } else {
+            printf("[FILE] %s  (rel: %s)\n", e->name, e->rel_path);
+        }
+    }
+}
+
+static void PrintFileSystem(const FileSystem* system) {
+    printf("\n=== FileSystem ===\n");
+    printf("Root: %s\n", system->root_path);
+    printf("Alive: %zu / %zu slots, Free: %zu\n",
+           system->all_handles_count, system->count, system->free_count);
+    printf("Dirty: %s\n\n", system->dirty ? "YES" : "NO");
+    PrintTree(system, &system->root_children, 0);
+    printf("\n");
+}
+
+
+struct Editor{
+    EditorState state;
+    EditorSettings settings;
+    InputSystem input_system;
+    ModalSystem modal_system;
+    FileSystem file_system;
+    StatisticSystem statistic_system;
+};
+ 
+void OpenEmptyBuffer(Editor* editor) {
+    EditorState* state = &editor->state;
+    size_t index = GetFreeTextBufferIndex(state); 
+
+    InitEmptyTextBuffer(&state->text_buffers[index]);
+    state->open_text_buffer_index = index;
+}
+
+void OpenDirectoryFromPath(Editor* editor, const char* path) {
+    FileSystemBuild(&editor->file_system, path);
+    //PrintFileSystem(&editor->file_system);
+    OpenEmptyBuffer(editor);
+}
+
+void OpenFileFromPath(Editor* editor, const char* path) {
+    EditorState* state = &editor->state;
+    size_t index = GetFreeTextBufferIndex(state); 
+
+    InitTextBufferFromPath(&state->text_buffers[index], path);
+    state->open_text_buffer_index = index;
+}
+
+int FindBufferByPath(Editor* editor, const char* path) {
+    EditorState* state = &editor->state;
+    for (size_t i = 0; i < state->text_buffers_count; i++) {
+        if (state->text_buffers[i].file_path && strcmp(state->text_buffers[i].file_path, path) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+void OpenOrSwitchToFile(Editor* editor, const char* path) {
+    int existing = FindBufferByPath(editor, path);
+    if (existing >= 0) {
+        editor->state.open_text_buffer_index = existing;
+    } else {
+        OpenFileFromPath(editor, path);
+    }
+}
+
+void ModalSystemRender(Editor* editor) {
+    ModalSystem* system = &editor->modal_system;
+    if (system->stack_count == 0) return;
+    int sw = GetScreenWidth();
+    int sh = GetScreenHeight();
+
+    DrawRectangle(0, 0, sw, sh, (Color){0, 0, 0, 120});
+
+    Modal* active_modal = GetTopModal(system);
+
+    for (size_t i = 0; i < active_modal->layout_count; i++) {
+        active_modal->layouts[i](active_modal);
+    }
+
+    Rect bounding = active_modal->bounds;
+
+    BeginScissorMode(BREAK_DOWN_RECT(bounding));
+
+    DrawRectangle(BREAK_DOWN_RECT(bounding), active_modal->style.background);
+
+    if (active_modal->style.draw_title) {
+        int title_height = active_modal->style.title_height + active_modal->style.title_padding.y * 2;
+
+        DrawTextEx(editor->settings.editor_font, active_modal->title, (Vector2){bounding.position.x + active_modal->style.title_padding.x, bounding.position.y + active_modal->style.title_padding.y}, active_modal->style.title_height, 1, active_modal->style.text);
+
+
+        bounding.position.y += title_height;
+        bounding.size.y -= title_height;
+    }
+
+
+    if (active_modal->custom_render) {
+        active_modal->custom_render(active_modal, bounding);
+    }
+
+    EndScissorMode();
+}
+
+typedef struct {
+    Editor* editor;
+    size_t scroll_offset;
+} StatisticsState;
+
+void StatisticsRender(Modal* modal, Rect content) {
+    StatisticsState* state = (StatisticsState*)modal->state;
+    Editor* editor = state->editor;
+    StatisticSystem* stats = &editor->statistic_system;
+    Font font = editor->settings.editor_font;
+    int font_size = editor->settings.font_size;
+    int row_height = font_size + modal->style.widget_spacing;
+    int pad = modal->style.content_padding.x;
+
+    BeginScissorMode(content.position.x, content.position.y,
+                     content.size.x, content.size.y);
+
+    int y = content.position.y + pad;
+    
+    char buffer[256];
+    snprintf(buffer, sizeof(buffer), "Frame Count: %llu", 
+             (unsigned long long)stats->frame_count);
+    DrawTextEx(font, buffer, (Vector2){content.position.x + pad, y}, 
+               font_size, 1, modal->style.text);
+    y += row_height;
+    
+    y += row_height / 2;
+    DrawLine(content.position.x + pad, y, 
+             content.position.x + content.size.x - pad, y, 
+             modal->style.border);
+    y += row_height / 2;
+    
+    const char* timer_names[] = {
+        "Frame Timer",
+        "Render Timer",
+        "Update Timer",
+        "File Polling Timer",
+        "File Step Polling Timer",
+        "Modal Update",
+        "Input Timer"
+    };
+    
+    for (int i = 0; i < EDITOR_TIMER_COUNT; i++) {
+        if (i >= state->scroll_offset && 
+            y < content.position.y + content.size.y - row_height) {
+            
+            StatisticTimer* timer = &stats->timers[i];
+            
+            DrawTextEx(font, timer_names[i], 
+                      (Vector2){content.position.x + pad, y}, 
+                      font_size, 1, modal->style.focused_border);
+            y += row_height;
+            
+            double avg_ms = TimerAverage(stats, i);
+            snprintf(buffer, sizeof(buffer), "  Average: %.3f ms", avg_ms);
+            DrawTextEx(font, buffer, 
+                      (Vector2){content.position.x + pad * 2, y}, 
+                      font_size * 0.8, 1, modal->style.text);
+            y += row_height;
+            
+            double min_ms = timer->count > 0 ? timer->min_ns / 1000000.0 : 0.0;
+            snprintf(buffer, sizeof(buffer), "  Min: %.3f ms", min_ms);
+            DrawTextEx(font, buffer, 
+                      (Vector2){content.position.x + pad * 2, y}, 
+                      font_size * 0.8, 1, modal->style.text);
+            y += row_height;
+            
+            double max_ms = timer->max_ns / 1000000.0;
+            snprintf(buffer, sizeof(buffer), "  Max: %.3f ms", max_ms);
+            DrawTextEx(font, buffer, 
+                      (Vector2){content.position.x + pad * 2, y}, 
+                      font_size * 0.8, 1, modal->style.text);
+            y += row_height;
+            
+            snprintf(buffer, sizeof(buffer), "  Count: %llu", 
+                    (unsigned long long)timer->count);
+            DrawTextEx(font, buffer, 
+                      (Vector2){content.position.x + pad * 2, y}, 
+                      font_size * 0.8, 1, modal->style.text_muted);
+            y += row_height + row_height / 2;
+        }
+    }
+
+    EndScissorMode();
+}
+
+void StatisticsInput(Modal* modal, RawInput input) {
+    StatisticsState* state = (StatisticsState*)modal->state;
+    
+    switch (input.key) {
+        case KEY_UP:
+            if (state->scroll_offset > 0) {
+                state->scroll_offset--;
+            }
+            break;
+        case KEY_DOWN:
+            if (state->scroll_offset < EDITOR_TIMER_COUNT - 1) {
+                state->scroll_offset++;
+            }
+            break;
+        case KEY_ESCAPE:
+        case KEY_D: 
+            if (input.key == KEY_D && !HasModifiers(input.modifiers, MODI_CTRL)) {
+                break;
+            }
+            CloseModal(&state->editor->modal_system, false);
+            break;
+    }
+}
+
+void StatisticsCleanup(void* raw_state) {
+    StatisticsState* state = (StatisticsState*)raw_state;
+    free(state);
+}
+
+void RegisterStatisticsModal(Editor* editor) {
+    StatisticsState* state = calloc(1, sizeof(StatisticsState));
+    state->editor = editor;
+    state->scroll_offset = 0;
+
+    Modal* modal = CreateModal(
+        &editor->modal_system,
+        "Performance Statistics",
+        (Position){700, 600},
+        StatisticsRender,
+        NULL,  // No update function needed
+        StatisticsInput,
+        StatisticsCleanup,
+        state
+    );
+    
+    modal->style.draw_title = true;
+    modal->style.title_padding = (Position){10, 10};
+    modal->is_cached = true;
+    modal->margin = (Position){50, 50};
+
+    ModalAddLayout(modal, ApplyWantedSize);
+    ModalAddLayout(modal, ApplyMinSize);
+    ModalAddLayout(modal, ApplyMaxSize);
+    ModalAddLayout(modal, ApplyMargin);
+    ModalAddLayout(modal, CenterModal);
+
+    RegisterModalToQuickCatch(&editor->modal_system, "statistics", modal);
+}
+
+void OpenStatisticsModal(Editor* editor) {
+    PushModalFromCache(&editor->modal_system, "statistics");
+    
+    Modal* top = GetTopModal(&editor->modal_system);
+    if (top) {
+        StatisticsState* state = (StatisticsState*)top->state;
+        state->scroll_offset = 0;  // Reset scroll on open
+    }
+}
+
+typedef struct {
+    Editor* editor;
+    size_t selected_index;
+    size_t scroll_offset;
+} BufferListState;
+
+void BufferListRender(Modal* modal, Rect content) {
+    BufferListState* state = (BufferListState*)modal->state;
+    Editor* editor = state->editor;
+    EditorState* es = &editor->state;
+    Font font = editor->settings.editor_font;
+    int font_size = editor->settings.font_size;
+    int row_height = font_size + modal->style.widget_spacing;
+    size_t visible_rows = content.size.y / row_height;
+
+    if (state->selected_index < state->scroll_offset) {
+        state->scroll_offset = state->selected_index;
+    }
+    if (state->selected_index >= state->scroll_offset + visible_rows) {
+        state->scroll_offset = state->selected_index - visible_rows + 1;
+    }
+
+    BeginScissorMode(content.position.x, content.position.y,
+                     content.size.x, content.size.y);
+
+    for (size_t i = state->scroll_offset; i < es->text_buffers_count; i++) {
+        size_t display_i = i - state->scroll_offset;
+        if (display_i >= visible_rows) break;
+
+        int y = content.position.y + display_i * row_height;
+
+        const char* full_path = es->text_buffers[i].file_path;
+        const char* label = "[untitled]";
+        if (full_path) {
+            const char* slash = strrchr(full_path, '/');
+            const char* bslash = strrchr(full_path, '\\');
+            if (bslash && (!slash || bslash > slash)) slash = bslash;
+            label = slash ? slash + 1 : full_path;
+        }
+
+        const char* prefix = (i == state->selected_index) ? "> " : "  ";
+        Color text_color = modal->style.text;
+        if ((int)i == es->open_text_buffer_index) {
+            text_color = modal->style.focused_border;
+        }
+
+        DrawTextEx(font, TextFormat("%s%s", prefix, label),
+                   (Vector2){content.position.x + 4,
+                             y + modal->style.widget_spacing / 2},
+                   font_size, 1, text_color);
+    }
+
+    EndScissorMode();
+}
+
+void BufferListInput(Modal* modal, RawInput input) {
+    BufferListState* state = (BufferListState*)modal->state;
+    size_t count = state->editor->state.text_buffers_count;
+
+    switch (input.key) {
+        case KEY_DOWN:
+            if (state->selected_index + 1 < count) {
+                state->selected_index++;
+            }
+            break;
+        case KEY_UP:
+            if (state->selected_index > 0) {
+                state->selected_index--;
+            }
+            break;
+        case KEY_ENTER:
+            modal->result_data = (void*)(uintptr_t)state->selected_index;
+            CloseModal(&state->editor->modal_system, true);
+            break;
+        case KEY_ESCAPE:
+            CloseModal(&state->editor->modal_system, false);
+            break;
+    }
+}
+
+void BufferListResult(Modal* modal, bool confirmed, void* result, void* user_data) {
+    if (!confirmed) return;
+
+    Editor* editor = (Editor*)user_data;
+    size_t index = (size_t)(uintptr_t)result;
+
+    if (index < editor->state.text_buffers_count) {
+        editor->state.open_text_buffer_index = (int)index;
+    }
+}
+
+void BufferListCleanup(void* state) {
+    free(state);
+}
+
+void RegisterBufferListModal(Editor* editor) {
+    BufferListState* state = calloc(1, sizeof(BufferListState));
+    state->editor = editor;
+    state->selected_index = 0;
+    state->scroll_offset = 0;
+
+    Modal* modal = CreateModal(
+        &editor->modal_system,
+        "Open Buffers",
+        (Position){500, 400},
+        BufferListRender,
+        NULL,
+        BufferListInput,
+        BufferListCleanup,
+        state
+    );
+    modal->style.draw_title = true;
+    modal->style.title_padding = (Position){10, 10};
+    modal->on_result = BufferListResult;
+    modal->on_result_user_data = editor;
+    modal->is_cached = true;
+    modal->margin = (Position){50, 50};
+
+    ModalAddLayout(modal, ApplyWantedSize);
+    ModalAddLayout(modal, ApplyMinSize);
+    ModalAddLayout(modal, ApplyMaxSize);
+    ModalAddLayout(modal, ApplyMargin);
+    ModalAddLayout(modal, CenterModal);
+
+    RegisterModalToQuickCatch(&editor->modal_system, "buffer_list", modal);
+}
+
+void OpenBufferListModal(Editor* editor) {
+    PushModalFromCache(&editor->modal_system, "buffer_list");
+
+    Modal* top = GetTopModal(&editor->modal_system);
+    if (top) {
+        BufferListState* state = (BufferListState*)top->state;
+        state->selected_index = editor->state.open_text_buffer_index >= 0
+                              ? (size_t)editor->state.open_text_buffer_index : 0;
+        state->scroll_offset = 0;
+    }
+}
+
+typedef struct {
+    size_t* node_indices;
+    int* depths;
+    size_t count;
+    size_t capacity;
+} VisibleNodeList;
+
+void VisibleNodeListAdd(VisibleNodeList* list, size_t node_index, int depth) {
+    if (list->count >= list->capacity) {
+        size_t new_cap = list->capacity == 0 ? 256 : list->capacity * 2;
+        list->node_indices = realloc(list->node_indices, new_cap * sizeof(size_t));
+        list->depths = realloc(list->depths, new_cap * sizeof(int));
+        list->capacity = new_cap;
+    }
+    list->node_indices[list->count] = node_index;
+    list->depths[list->count] = depth;
+    list->count++;
+}
+
+void ClearVisibleNodeList(VisibleNodeList* list) {
+    if (list->node_indices) free(list->node_indices);
+    if (list->depths) free(list->depths);
+    list->node_indices = NULL;
+    list->depths = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+typedef struct {
+    char buffer[256];
+    size_t length;
+    size_t cursor;
+} SearchBar;
+
+typedef struct {
+    char** paths;
+    size_t count;
+    size_t capacity;
+} OpenPathSet;
+
+static void InitOpenPathSet(OpenPathSet* set) {
+    set->paths = NULL;
+    set->count = 0;
+    set->capacity = 0;
+}
+
+static void ClearOpenPathSet(OpenPathSet* set) {
+    for (size_t i = 0; i < set->count; i++) {
+        free(set->paths[i]);
+    }
+
+    free(set->paths);
+    set->paths = NULL;
+    set->count = 0;
+    set->capacity = 0;
+}
+
+static size_t OpenPathSetFind(const OpenPathSet* set, const char* path) {
+    if (set->count == 0) return 0;
+
+    size_t lo = 0;
+    size_t hi = set->count;
+
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int cmp = strcmp(set->paths[mid], path);
+        if (cmp < 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    return lo;
+}
+
+static bool OpenPathSetContains(const OpenPathSet* set, const char* path) {
+    size_t pos = OpenPathSetFind(set, path);
+    return pos < set->count && strcmp(set->paths[pos], path) == 0;
+}
+
+static void OpenPathSetInsert(OpenPathSet* set, const char* path) {
+    size_t pos = OpenPathSetFind(set, path);
+
+    if (pos < set->count && strcmp(set->paths[pos], path) == 0) {
+        return;
+    }
+
+    if (set->count >= set->capacity) {
+        set->capacity = set->capacity ? set->capacity * 2 : 32;
+        set->paths = realloc(set->paths, set->capacity * sizeof(char*));
+    }
+
+    if (pos < set->count) {
+        memmove(&set->paths[pos + 1], &set->paths[pos], (set->count - pos) * sizeof(char*));
+    }
+
+    set->paths[pos] = strdup(path);
+    set->count++;
+}
+
+static void OpenPathSetRemove(OpenPathSet* set, const char* path) {
+    size_t pos = OpenPathSetFind(set, path);
+
+    if (pos >= set->count || strcmp(set->paths[pos], path) != 0) {
+        return;
+    }
+
+    free(set->paths[pos]);
+    if (pos + 1 < set->count) {
+        memmove(&set->paths[pos], &set->paths[pos + 1],
+                (set->count - pos - 1) * sizeof(char*));
+    }
+    set->count--;
+}
+
+static void OpenPathSetToggle(OpenPathSet* set, const char* path) {
+    if (OpenPathSetContains(set, path)) {
+        OpenPathSetRemove(set, path);
+    } else {
+        OpenPathSetInsert(set, path);
+    }
+}
+
+typedef struct {
+    CacheHandle handle;
+    int depth;
+    bool is_dir;
+} FlatEntry;
+
+typedef struct {
+    FlatEntry* items;
+    size_t     count;
+    size_t     capacity;
+} FlatEntryList;
+
+static void FlatEntryListReset(FlatEntryList* list) {
+    list->count = 0;
+}
+
+static void FlatEntryListClear(FlatEntryList* list) {
+    free(list->items);
+    list->items = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static void FlatEntryListPush(FlatEntryList* list, CacheHandle handle, int depth, bool is_dir) {
+    if (list->count >= list->capacity) {
+        list->capacity = list->capacity ? list->capacity * 2 : 256;
+        list->items = realloc(list->items, list->capacity * sizeof(FlatEntry));
+    }
+    list->items[list->count].handle = handle;
+    list->items[list->count].depth = depth;
+    list->items[list->count].is_dir = is_dir;
+    list->count++;
+}
+
+typedef struct {
+    Editor* editor;
+    char buffer[512];
+    size_t cursor;
+    size_t length;
+} StringInputState;
+
+void StringInputRender(Modal* modal, Rect content) {
+    StringInputState* state = (StringInputState*)modal->state;
+    Editor* editor = state->editor;
+    Font font = editor->settings.editor_font;
+    int font_size = editor->settings.font_size;
+    int pad = modal->style.content_padding.x;
+
+    BeginScissorMode(content.position.x, content.position.y,
+                     content.size.x, content.size.y);
+
+    // Center the input box vertically in the content area
+    int input_height = font_size + 12;
+    int input_y = content.position.y + (content.size.y - input_height) / 2;
+    int input_x = content.position.x + pad;
+    int input_w = content.size.x - pad * 2;
+
+    DrawRectangle(input_x, input_y, input_w, input_height,
+                  modal->style.input_background);
+    DrawRectangleLinesEx(
+        (Rectangle){input_x, input_y, input_w, input_height},
+        modal->style.border_width,
+        modal->style.focused_border
+    );
+
+    // Measure text before cursor to find cursor draw position
+    char before_cursor[512];
+    strncpy(before_cursor, state->buffer, state->cursor);
+    before_cursor[state->cursor] = '\0';
+    Vector2 before_size = MeasureTextEx(font, before_cursor, font_size, 1);
+
+    int text_x = input_x + 6;
+    int text_y = input_y + 6;
+
+    DrawTextEx(font, state->buffer,
+               (Vector2){text_x, text_y},
+               font_size, 1, modal->style.text);
+
+    DrawRectangle(text_x + (int)before_size.x, text_y,
+                  2, font_size, modal->style.text);
+
+    EndScissorMode();
+}
+
+void StringInputInput(Modal* modal, RawInput input) {
+    StringInputState* state = (StringInputState*)modal->state;
+    Editor* editor = state->editor;
+
+    if (!input.is_char) {
+        switch (input.key) {
+            case KEY_ENTER: {
+                char* result = malloc(state->length + 1);
+                memcpy(result, state->buffer, state->length);
+                result[state->length] = '\0';
+                modal->result_data = result;
+                CloseModal(&editor->modal_system, true);
+                return;
+            }
+            case KEY_ESCAPE:
+                CloseModal(&editor->modal_system, false);
+                return;
+            case KEY_BACKSPACE:
+                if (state->cursor > 0) {
+                    memmove(&state->buffer[state->cursor - 1],
+                            &state->buffer[state->cursor],
+                            state->length - state->cursor);
+                    state->cursor--;
+                    state->length--;
+                    state->buffer[state->length] = '\0';
+                }
+                return;
+            case KEY_DELETE:
+                if (state->cursor < state->length) {
+                    memmove(&state->buffer[state->cursor],
+                            &state->buffer[state->cursor + 1],
+                            state->length - state->cursor - 1);
+                    state->length--;
+                    state->buffer[state->length] = '\0';
+                }
+                return;
+            case KEY_LEFT:
+                if (state->cursor > 0) state->cursor--;
+                return;
+            case KEY_RIGHT:
+                if (state->cursor < state->length) state->cursor++;
+                return;
+        }
+        return;
+    }
+
+    // Printable character
+    if (input.key >= 32 && input.key < 127 &&
+        !HasModifiers(input.modifiers, MODI_CTRL | MODI_ALT | MODI_SUPER) &&
+        state->length < sizeof(state->buffer) - 1) {
+        memmove(&state->buffer[state->cursor + 1],
+                &state->buffer[state->cursor],
+                state->length - state->cursor);
+        state->buffer[state->cursor] = (char)input.key;
+        state->cursor++;
+        state->length++;
+        state->buffer[state->length] = '\0';
+    }
+}
+
+void StringInputCleanup(void* raw_state) {
+    free(raw_state);
+}
+
+void PushStringInputModal(Editor* editor, const char* title,
+                          ModalResultCallback on_result, void* user_data) {
+    StringInputState* state = calloc(1, sizeof(StringInputState));
+    state->editor = editor;
+
+    Modal* modal = CreateModal(
+        &editor->modal_system,
+        title,
+        (Position){500, 120},
+        StringInputRender,
+        NULL,
+        StringInputInput,
+        StringInputCleanup,
+        state
+    );
+    modal->style.draw_title = true;
+    modal->style.title_padding = (Position){10, 10};
+    modal->on_result = on_result;
+    modal->on_result_user_data = user_data;
+    modal->margin = (Position){50, 50};
+
+    ModalAddLayout(modal, ApplyWantedSize);
+    ModalAddLayout(modal, ApplyMinSize);
+    ModalAddLayout(modal, ApplyMaxSize);
+    ModalAddLayout(modal, ApplyMargin);
+    ModalAddLayout(modal, CenterModal);
+
+    PushModal(&editor->modal_system, modal);
+}
+
+typedef struct {
+    Editor* editor;
+
+    SearchBar search;
+    OpenPathSet open_dirs;
+
+    FlatEntryList all;
+    FlatEntryList visible;
+
+    size_t selected_index;
+    size_t scroll_offset;
+
+    bool needs_rebuild_all;
+    bool needs_rebuild_visible;
+} FileExplorerState;
+
+
+
+void FileExplorerCleanup(void* raw_state) {
+    FileExplorerState* state = (FileExplorerState*)raw_state;
+    
+    ClearOpenPathSet(&state->open_dirs);
+    FlatEntryListClear(&state->all);
+    FlatEntryListClear(&state->visible);
+    
+    free(state);
+}
+
+bool StrContainsCaseInsensitive(const char* haystack, const char* needle) {
+    if (!needle || !needle[0]) return true;
+    if (!haystack) return false;
+    size_t h_len = strlen(haystack);
+    size_t n_len = strlen(needle);
+    if (n_len > h_len) return false;
+    for (size_t i = 0; i <= h_len - n_len; i++) {
+        bool match = true;
+        for (size_t j = 0; j < n_len; j++) {
+            char a = haystack[i + j];
+            char b = needle[j];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+typedef struct {
+    CacheHandle handle;
+    int depth;
+} WalkFrame;
+
+static void RebuildAllEntries(FileSystem* system, FlatEntryList* all) {
+    FlatEntryListReset(all);
+
+    size_t stack_cap = 64;
+    size_t stack_count = 0;
+    WalkFrame* stack = malloc(stack_cap * sizeof(WalkFrame));
+
+    for (int i = (int)system->root_children.count - 1; i >= 0; i--) {
+        if (stack_count >= stack_cap) {
+            stack_cap *= 2;
+            stack = realloc(stack, stack_cap * sizeof(WalkFrame));
+        }
+
+        stack[stack_count++] = (WalkFrame){ system->root_children.items[i], 0 };
+    }
+
+    while (stack_count > 0) {
+        WalkFrame frame = stack[--stack_count];
+        FileCacheEntry* entry = FileSystemGetEntry(system, frame.handle);
+        if (!entry) continue;
+
+        bool is_dir = entry->type == TYPE_DIR;  
+        FlatEntryListPush(all, frame.handle, frame.depth, is_dir);
+
+        if (is_dir) {
+            for (int i = (int)entry->children.count - 1; i >= 0; i--) {
+                if (stack_count >= stack_cap) {
+                    stack_cap *= 2;
+                    stack = realloc(stack, stack_cap * sizeof(WalkFrame));
+                }
+                stack[stack_count++] = (WalkFrame){ entry->children.items[i], frame.depth + 1};
+            }
+        }
+    }
+
+    free(stack);
+}
+
+static void RebuildVisibleEntries(FileSystem* system, FlatEntryList* all, FlatEntryList* visible, const OpenPathSet* open_dirs, const char* search, size_t search_len) {
+    FlatEntryListReset(visible);
+    if (search_len == 0) {
+        int skip_below = INT_MAX;
+
+        for (size_t i = 0; i < all->count; i++) {
+            FlatEntry* fe = &all->items[i];
+
+            if (fe->depth > skip_below) continue;
+
+            skip_below = INT_MAX;
+
+            FileCacheEntry* entry = FileSystemGetEntry(system, fe->handle);
+            if (!entry) continue;
+
+            FlatEntryListPush(visible, fe->handle, fe->depth, fe->is_dir);
+
+            if (fe->is_dir && !OpenPathSetContains(open_dirs, entry->rel_path)) {
+                skip_below = fe->depth;
+            }
+        }
+    } else {
+        char search_lower[256];
+        StrToLower(search, search_lower, sizeof(search_lower));
+
+        for (size_t i = 0; i < all->count; i++) {
+            FlatEntry* fe = &all->items[i];
+            FileCacheEntry* entry = FileSystemGetEntry(system, fe->handle);
+            if (!entry) continue;
+
+            if (strstr(entry->name_lower, search_lower)) {
+                FlatEntryListPush(visible, fe->handle, 0, fe->is_dir);
+            }
+        }
+    }
+}
+
+void FileExplorerRender(Modal* modal, Rect content) {
+    FileExplorerState* state = (FileExplorerState*)modal->state;
+    Editor* editor = state->editor;
+    FileSystem* system = &editor->file_system;
+    Font font = editor->settings.editor_font;
+    int font_size = editor->settings.font_size;
+    int row_height = font_size + modal->style.widget_spacing;
+    int pad = modal->style.content_padding.x;
+    int search_bar_height = font_size + 12;
+
+    BeginScissorMode(content.position.x, content.position.y,
+                     content.size.x, content.size.y);
+
+    // Draw search bar
+    int search_y = content.position.y + pad;
+    DrawRectangle(content.position.x + pad, search_y, 
+                  content.size.x - pad * 2, search_bar_height,
+                  modal->style.input_background);
+    
+    const char* search_prefix = "Search: ";
+    DrawTextEx(font, search_prefix,
+               (Vector2){content.position.x + pad + 4, search_y + 6},
+               font_size * 0.8, 1, modal->style.text_muted);
+    
+    Vector2 prefix_size = MeasureTextEx(font, search_prefix, font_size * 0.8, 1);
+    DrawTextEx(font, state->search.buffer,
+               (Vector2){content.position.x + pad + 4 + prefix_size.x, search_y + 6},
+               font_size * 0.8, 1, modal->style.text);
+
+    // Calculate list area
+    int list_y = search_y + search_bar_height + pad;
+    int list_height = content.size.y - (list_y - content.position.y) - pad;
+    size_t visible_rows = list_height / row_height;
+
+    // Adjust scroll offset
+    if (state->selected_index < state->scroll_offset) {
+        state->scroll_offset = state->selected_index;
+    }
+    if (state->selected_index >= state->scroll_offset + visible_rows) {
+        state->scroll_offset = state->selected_index - visible_rows + 1;
+    }
+
+    // Draw file list
+    for (size_t i = state->scroll_offset; i < state->visible.count; i++) {
+        size_t display_i = i - state->scroll_offset;
+        if (display_i >= visible_rows) break;
+
+        FlatEntry* entry = &state->visible.items[i];
+        FileCacheEntry* file_entry = FileSystemGetEntry(system, entry->handle);
+        if (!file_entry) continue;
+
+        int y = list_y + display_i * row_height;
+        
+        // Draw selection background
+        if (i == state->selected_index) {
+            DrawRectangle(content.position.x + pad, y - 2,
+                         content.size.x - pad * 2, row_height,
+                         modal->style.selection);
+        }
+
+        // Calculate indentation
+        int indent = entry->depth * 16;
+        
+        // Draw icon and name
+        const char* icon = entry->is_dir ? 
+            (OpenPathSetContains(&state->open_dirs, file_entry->rel_path) ? "▼ " : "▶ ") : 
+            "  ";
+        
+        Color text_color = entry->is_dir ? modal->style.focused_border : modal->style.text;
+        
+        char display_text[NAME_MAX_LEN + 4];
+        snprintf(display_text, sizeof(display_text), "%s%s", icon, file_entry->name);
+        
+        DrawTextEx(font, display_text,
+                   (Vector2){content.position.x + pad + indent,
+                             y + modal->style.widget_spacing / 2},
+                   font_size, 1, text_color);
+    }
+
+    EndScissorMode();
+}
+
+void FileExplorerSearchInsertChar(FileExplorerState* state, char ch) {
+    if (state->search.length >= sizeof(state->search.buffer) - 1) return;
+
+    memmove(&state->search.buffer[state->search.cursor + 1],
+            &state->search.buffer[state->search.cursor],
+            state->search.length - state->search.cursor);
+
+    state->search.buffer[state->search.cursor] = ch;
+    state->search.cursor++;
+    state->search.length++;
+    state->search.buffer[state->search.length] = '\0';
+
+    state->needs_rebuild_visible = true;
+}
+
+void FileExplorerSearchBackspace(FileExplorerState* state) {
+    if (state->search.cursor == 0) return;
+
+    memmove(&state->search.buffer[state->search.cursor - 1],
+            &state->search.buffer[state->search.cursor],
+            state->search.length - state->search.cursor);
+
+    state->search.cursor--;
+    state->search.length--;
+    state->search.buffer[state->search.length] = '\0';
+
+    state->needs_rebuild_visible = true;
+}
+
+void FileExplorerSearchClear(FileExplorerState* state) {
+    state->search.buffer[0] = '\0';
+    state->search.length = 0;
+    state->search.cursor = 0;
+    state->needs_rebuild_visible = true;
+}
+
+static void EnsurePathVisible(FileSystem* system, OpenPathSet* open_dirs, const char* target_rel_path) {
+    char path_copy[PATH_MAX_LEN];
+    strncpy(path_copy, target_rel_path, PATH_MAX_LEN - 1);
+    path_copy[PATH_MAX_LEN - 1] = '\0';
+    
+    char* last_sep;
+    
+    while (1) {
+        last_sep = strrchr(path_copy, '/');
+        #ifdef _WIN32
+        char* last_bslash = strrchr(path_copy, '\\');
+        if (last_bslash && (!last_sep || last_bslash > last_sep)) {
+            last_sep = last_bslash;
+        }
+        #endif
+        
+        if (!last_sep) break;
+        
+        *last_sep = '\0';
+        if (path_copy[0] != '\0') {
+            OpenPathSetInsert(open_dirs, path_copy);
+        }
+    }
+}
+
+void FileExplorerUpdate(Modal* modal) {
+    FileExplorerState* state = (FileExplorerState*)modal->state;
+    Editor* editor = state->editor;
+    FileSystem* system = &editor->file_system;
+
+    if (!system->poll_state.in_progress && system->dirty) {
+        state->needs_rebuild_all = true;
+    }
+
+    if (state->needs_rebuild_all) {
+        RebuildAllEntries(system, &state->all);
+        state->needs_rebuild_all = false;
+        state->needs_rebuild_visible = true;
+    }
+
+    if (state->needs_rebuild_visible) {
+        CacheHandle selected_handle = CACHE_HANDLE_INVALID;
+        const char* selected_path = NULL;
+        
+        if (state->selected_index < state->visible.count) {
+            selected_handle = state->visible.items[state->selected_index].handle;
+            FileCacheEntry* entry = FileSystemGetEntry(system, selected_handle);
+            if (entry) {
+                selected_path = entry->rel_path;
+            }
+        }
+        
+        if (state->search.length == 0 && selected_path && selected_path[0] != '\0') {
+            EnsurePathVisible(system, &state->open_dirs, selected_path);
+        }
+        
+        RebuildVisibleEntries(system, &state->all, &state->visible, &state->open_dirs, state->search.buffer, state->search.length);
+        state->needs_rebuild_visible = false;
+
+        if (!cache_handle_is_invalid(selected_handle)) {
+            bool found = false;
+            for (size_t i = 0; i < state->visible.count; i++) {
+                if (cache_handle_eq(state->visible.items[i].handle, selected_handle)) {
+                    state->selected_index = i;
+                    found = true;
+                    break;
+                }
+            }
+            
+            if (!found && state->visible.count > 0) {
+                if (state->selected_index >= state->visible.count) {
+                    state->selected_index = state->visible.count - 1;
+                }
+            }
+        }
+
+        if (state->visible.count == 0) {
+            state->selected_index = 0;
+            state->scroll_offset = 0;
+        } else {
+            if (state->selected_index >= state->visible.count) {
+                state->selected_index = state->visible.count - 1;
+            }
+            if (state->scroll_offset > state->selected_index) {
+                state->scroll_offset = state->selected_index;
+            }
+        }
+    }
+}
+
+typedef struct {
+    Editor* editor;
+    char base_path[PATH_MAX_LEN];
+} CreateFileContext;
+
+void OnCreateFileOrDirConfirmed(Modal* modal, bool confirmed, void* result, void* user_data) {
+    CreateFileContext* ctx = (CreateFileContext*)user_data;
+    if (!confirmed) {
+        free(ctx);
+        return;
+    }
+
+    const char* input = (const char*)result;
+
+    CreatePathUnderRoot(ctx->base_path, input);
+    if (strlen(ctx->editor->file_system.root_path) > 0) {
+        ctx->editor->file_system.poll_state.request_validation = true;
+    }
+    free(result);
+    free(ctx);
+}
+
+void FileExplorerInput(Modal* modal, RawInput input) {
+FileExplorerState* state = (FileExplorerState*)modal->state;
+    Editor* editor = state->editor;
+    FileSystem* system = &editor->file_system;
+
+    switch (input.key) {
+        case KEY_N: {
+            if (state->search.length == 0 && HasModifiers(input.modifiers, MODI_CTRL)) {
+                CreateFileContext* ctx = malloc(sizeof(CreateFileContext));
+                ctx->editor = editor;
+                strncpy(ctx->base_path, system->root_path, PATH_MAX_LEN - 1);
+                ctx->base_path[PATH_MAX_LEN - 1] = '\0';
+
+                if (state->visible.count > 0 && state->selected_index < state->visible.count) {
+                    FlatEntry* sel = &state->visible.items[state->selected_index];
+                    FileCacheEntry* sel_entry = FileSystemGetEntry(system, sel->handle);
+                    if (sel_entry) {
+                        char dir_rel[PATH_MAX_LEN];
+                        if (sel->is_dir) {
+                            strncpy(dir_rel, sel_entry->rel_path, PATH_MAX_LEN - 1);
+                            dir_rel[PATH_MAX_LEN - 1] = '\0';
+                        } else {
+                            strncpy(dir_rel, sel_entry->rel_path, PATH_MAX_LEN - 1);
+                            dir_rel[PATH_MAX_LEN - 1] = '\0';
+                            char* last_sep = strrchr(dir_rel, '/');
+                            #ifdef _WIN32
+                            char* last_bslash = strrchr(dir_rel, '\\');
+                            if (last_bslash && (!last_sep || last_bslash > last_sep))
+                                last_sep = last_bslash;
+                            #endif
+                            if (last_sep) *last_sep = '\0';
+                            else dir_rel[0] = '\0';
+                        }
+                        if (dir_rel[0] != '\0') {
+                            PlatformJoinPath(ctx->base_path, PATH_MAX_LEN, system->root_path, dir_rel);
+                        }
+                    }
+                }
+
+                PushStringInputModal(editor, "Create File/Dir", OnCreateFileOrDirConfirmed, ctx);
+            }
+            return;
+        }
+        case KEY_UP: {
+            if (state->selected_index > 0) {
+                state->selected_index--;
+            }
+            return;
+        }
+        case KEY_DOWN: {
+            if (state->selected_index + 1 < state->visible.count) {
+                state->selected_index++;
+            }
+            return;
+        }
+        case KEY_ENTER: {
+            if (state->visible.count == 0) return;
+            
+            FlatEntry* entry = &state->visible.items[state->selected_index];
+            FileCacheEntry* file_entry = FileSystemGetEntry(system, entry->handle);
+            if (!file_entry) return;
+            
+            if (entry->is_dir) {
+                // Toggle directory open/closed
+                OpenPathSetToggle(&state->open_dirs, file_entry->rel_path);
+                state->needs_rebuild_visible = true;
+            } else {
+                // Open file
+                char full_path[PATH_MAX_LEN];
+                snprintf(full_path, sizeof(full_path), "%s%c%s", 
+                        system->root_path, 
+                        #ifdef _WIN32
+                        '\\',
+                        #else
+                        '/',
+                        #endif
+                        file_entry->rel_path);
+                modal->result_data = strdup(full_path);
+                CloseModal(&editor->modal_system, true);
+            }
+            return;
+        }
+        case KEY_ESCAPE: {
+            CloseModal(&editor->modal_system, false);
+            return;
+        }
+        case KEY_BACKSPACE: {
+            FileExplorerSearchBackspace(state);
+            return;
+        }
+    }
+
+    if (input.is_char && input.key >= 32 && input.key < 127 &&
+        !HasModifiers(input.modifiers, MODI_CTRL | MODI_ALT | MODI_SUPER)) {
+        FileExplorerSearchInsertChar(state, (char)input.key);
+        return;
+    }
+}
+
+void FileExplorerResult(Modal* modal, bool confirmed, void* result, void* user_data) {
+    if (!confirmed) return;
+
+    Editor* editor = (Editor*)user_data;
+    const char* path = (const char*)result;
+    if (path) {
+        OpenOrSwitchToFile(editor, path);
+    }
+}
+
+void RegisterFileExplorerModal(Editor* editor) {
+    FileExplorerState* state = calloc(1, sizeof(FileExplorerState));
+    state->editor = editor;
+    state->needs_rebuild_all = true;
+
+    Modal* modal = CreateModal(
+        &editor->modal_system,
+        "File Explorer",
+        (Position){600, 500},
+        FileExplorerRender,
+        FileExplorerUpdate,
+        FileExplorerInput,
+        FileExplorerCleanup,
+        state
+    );
+    modal->style.draw_title = true;
+    modal->style.title_padding = (Position){10, 10};
+    modal->on_result = FileExplorerResult;
+    modal->on_result_user_data = editor;
+    modal->is_cached = true;
+    modal->margin = (Position){50, 50};
+
+    ModalAddLayout(modal, ApplyWantedSize);
+    ModalAddLayout(modal, ApplyMinSize);
+    ModalAddLayout(modal, ApplyMaxSize);
+    ModalAddLayout(modal, ApplyMargin);
+    ModalAddLayout(modal, CenterModal);
+
+    RegisterModalToQuickCatch(&editor->modal_system, "file_explorer", modal);
+}
+
+void OpenFileExplorerModal(Editor* editor) {
+    PushModalFromCache(&editor->modal_system, "file_explorer");
+
+    Modal* top = GetTopModal(&editor->modal_system);
+    if (top) {
+        FileExplorerState* state = (FileExplorerState*)top->state;
+        // Reset search on open
+        
+    }
+}
+
+void TryExecuteCommandSystem(Editor* editor) {
+    CommandSystem* system = &editor->input_system.command_system;
+    TokenList tokens = Tokenize(system->command_buffer);
+    
+    if (tokens.count == 0 || tokens.tokens[0].type != TOKENTYPE_STRING) {
+        ClearTokenList(&tokens);
+        return;
+    }
+
+    for (size_t i = 0; i < system->command_bindings_count; i++) {
+        CommandBinding* binding = &system->bindings[i];
+
+        if (strcmp(tokens.tokens[0].char_value, binding->command) != 0) {
+            continue;
+        }
+
+        if (tokens.count - 1 < binding->needed_types_count) {
+            continue;
+        }
+
+        bool types_match = true;
+
+        for (size_t j = 0; j < binding->needed_types_count; j++) {
+            if (tokens.tokens[j + 1].type != binding->needed_types[j]) {
+                types_match = false;
+                break;
+            }
+        }
+
+        if (types_match) {
+            if (binding->execute) {
+                binding->execute(editor, &tokens.tokens[1], tokens.count - 1);   
+            }
+            ClearTokenList(&tokens);
+            return;
+        }
+    }
+    ClearTokenList(&tokens);
+}
+
+Editor CreateEditor(EditorSettings settings, char* path) {
+    Editor editor;
+    editor.settings = settings;
+    editor.state = InitEditorState(INITIAL_TEXT_BUFFER_CAPACITY);
+    
+    FileType root_type = TYPE_ERROR;
+    if (path) {
+        root_type = GetFileTypeFromPath(path);
+    } 
+
+
+    editor.input_system = InitInputSystem();
+    editor.modal_system = InitModalSystem();
+    editor.file_system = InitFileSystem();
+    editor.statistic_system = InitStatisticSystem();
+
+    if (root_type == TYPE_FILE) {
+        OpenFileFromPath(&editor, path);
+    } else if (root_type == TYPE_DIR) {
+        OpenDirectoryFromPath(&editor, path);
+    } else {
+        OpenEmptyBuffer(&editor);
+    }
+
+
+    RegisterBufferListModal(&editor);
+    RegisterFileExplorerModal(&editor);
+    RegisterStatisticsModal(&editor);
+
+    return editor;
+}
+
+TextBuffer* GetActiveBuffer(Editor* editor) {
+    return &editor->state.text_buffers[editor->state.open_text_buffer_index];
+}
+
+void ClearEditor(Editor* editor) {
+    if (!editor) return;
+
+    ClearEditorState(&editor->state);
+    ClearEditorSettings(&editor->settings);
+    ClearInputSystem(&editor->input_system);
+    ClearModalSystem(&editor->modal_system);
+    ClearFileSystem(&editor->file_system);
+    ClearStatisticsSystem(&editor->statistic_system);
+}
+
+bool ShouldEditorClose(Editor* editor) {
+    return editor->state.exit_requested;
+}
+
+Rect GetEditorTextFieldSize(Editor* editor) {
+    return (Rect){
+        .position = (Position){0, editor->settings.mode_padding.x * 2 + editor->settings.font_size},
+        .size = (Position){GetScreenWidth() - 40, GetScreenHeight() - (editor->settings.mode_padding.y * 2 + editor->settings.font_size * 2 + editor->settings.command_padding.y * 2)}
+    };
+}
+
+void MovePointerLeft(TextBuffer* buffer) {
+    if (buffer->pointer_position > 0) {
+        buffer->pointer_position--;
+        buffer->request_revalidate_pointer_cache = true; // TODO: strictly not needed!
+    }
+}
+
+void MovePointerRight(TextBuffer* buffer) {
+    if (buffer->pointer_position <= GetTextSize(buffer)) {
+        buffer->pointer_position++;
+        buffer->request_revalidate_pointer_cache = true; // TODO: strictly not needed!
+    }
+}
+
+void MovePointerUp(TextBuffer* buffer) {
+    Position pointer = GetPointerPosition(buffer);
+    if (pointer.y == 0) {
+        return;
+    }
+    Position nextLine = GetLineByIndex(buffer, pointer.y - 1);
+    if (buffer->pointer_position != nextLine.x + min(nextLine.y, pointer.x)) {
+        buffer->pointer_position = nextLine.x + min(nextLine.y, pointer.x);
+        buffer->request_revalidate_pointer_cache = true; // TODO: strictly not needed!
+    }   
+}
+
+void MovePointerDown(TextBuffer* buffer) {
+    Position pointer = GetPointerPosition(buffer);
+    size_t max_lines = GetLineCount(buffer);
+    if (pointer.y >= max_lines - 1) {
+        return;
+    }
+    Position nextLine = GetLineByIndex(buffer, pointer.y + 1);
+    if (buffer->pointer_position != nextLine.x + min(nextLine.y, pointer.x)) {
+        buffer->pointer_position = nextLine.x + min(nextLine.y, pointer.x);
+        buffer->request_revalidate_pointer_cache = true; // TODO: strictly not needed!
+    }
+}
+
+bool IsWordChar(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+bool IsPunct(char c) {
+    return c && !IsWordChar(c) && c != ' ' && c != '\t' && c != '\n';
+}
+
+void MovePointerWordRight(TextBuffer* buffer) {
+    size_t size = GetTextSize(buffer);
+    if (buffer->pointer_position >= size) return;
+    char c = GetCharAt(buffer, buffer->pointer_position);
+    
+    if (c == '\n') {
+        buffer->pointer_position++;
+        return;
+    }
+    
+    if (IsWordChar(c)) {
+        while (buffer->pointer_position < size && IsWordChar(GetCharAt(buffer, buffer->pointer_position))) buffer->pointer_position++;
+    } else if (IsPunct(c)) {
+        while (buffer->pointer_position < size && IsPunct(GetCharAt(buffer, buffer->pointer_position))) buffer->pointer_position++;
+    } else {
+        while (buffer->pointer_position < size && (c = GetCharAt(buffer, buffer->pointer_position), c == ' ' || c == '\t')) buffer->pointer_position++;
+        if (buffer->pointer_position < size && GetCharAt(buffer, buffer->pointer_position) == '\n') return;
+        while (buffer->pointer_position < size && IsPunct(GetCharAt(buffer, buffer->pointer_position))) buffer->pointer_position++;
+    }
+}
+
+void MovePointerWordLeft(TextBuffer* buffer) {
+    size_t size = GetTextSize(buffer);
+    if (buffer->pointer_position == 0) return;
+    buffer->pointer_position--;
+    
+    char c = GetCharAt(buffer, buffer->pointer_position);
+    if (c == '\n') return;
+    
+    while (buffer->pointer_position > 0 && (c = GetCharAt(buffer, buffer->pointer_position), c == ' ' || c == '\t')) {
+        if (GetCharAt(buffer, buffer->pointer_position - 1) == '\n') return;
+        buffer->pointer_position--;
+    }
+    
+    c = GetCharAt(buffer, buffer->pointer_position);
+    if (IsWordChar(c)) {
+        while (buffer->pointer_position > 0 && IsWordChar(GetCharAt(buffer, buffer->pointer_position - 1))) buffer->pointer_position--;
+    } else if (IsPunct(c)) {
+        while (buffer->pointer_position > 0 && IsPunct(GetCharAt(buffer, buffer->pointer_position - 1))) buffer->pointer_position--;
+    }
+}
+
+void MovePointerAction(Editor* editor, void(*move_function)(TextBuffer* buffer)) {
+    TextBuffer* buffer = GetActiveBuffer(editor); 
+    size_t pointer_before = buffer->pointer_position;
+    move_function(buffer);
+    if (buffer->pointer_position != pointer_before) {
+        buffer->has_selection = false;
+    }
+}
+void MovePointerSelectionAction(Editor* editor, void(*move_function)(TextBuffer* buffer)) {
+    TextBuffer* buffer = GetActiveBuffer(editor);
+    size_t pointer_before = buffer->pointer_position;
+    move_function(buffer);
+    if (pointer_before != buffer->pointer_position) {
+        if (!buffer->has_selection) {
+            buffer->has_selection = true;
+            buffer->selection_start = pointer_before;
+        }
+        buffer->selection_end = buffer->pointer_position;
+    }
+}
+
+size_t AppendAddBuffer(TextBuffer* buffer, char* value, size_t len) {
+    while (buffer->add_buffer_count + len >= buffer->add_buffer_capacity) {
+        buffer->add_buffer = (char*)realloc(buffer->add_buffer, buffer->add_buffer_capacity * 2 * sizeof(char));
+        buffer->add_buffer_capacity *= 2;
+    }
+
+    size_t index = buffer->add_buffer_count;
+    
+    memcpy(&buffer->add_buffer[buffer->add_buffer_count], value, len);
+
+    buffer->add_buffer_count += len;
+    
+    return index;
+}
+
+void InsertString(TextBuffer* buffer, size_t position, char* value, size_t len) {
+    // TODO: Use memove and inplace to make this function O(n) for the insertion!
+    size_t new_start = AppendAddBuffer(buffer, value, len);
+
+    Piece new_piece = {ADD, new_start, len};
+
+    Piece* new_pieces = malloc((buffer->piece_count + 2) * sizeof(Piece));
+    size_t new_count = 0; 
+    size_t current_pos = 0;
+    bool inserted = false;
+
+    if (buffer->piece_count == 0) {
+        new_pieces[new_count++] = new_piece;
+        inserted = true;
+    }
+
+    for(size_t i = 0; i < buffer->piece_count; i++) {
+        Piece p = buffer->pieces[i];
+        if (current_pos + p.length < position) {
+            new_pieces[new_count++] = p;
+            current_pos += p.length;
+        } else {
+            size_t offset = position - current_pos;
+            if (offset > 0) {
+                Piece left = p;
+                left.length = offset;
+                new_pieces[new_count++] = left;
+            }
+
+            new_pieces[new_count++] = new_piece;
+            inserted = true;
+
+            if (offset < p.length) {
+                Piece right = p;
+                right.start += offset;
+                right.length -= offset;
+                new_pieces[new_count++] = right;
+            }    
+
+            for (size_t j = i + 1; j < buffer->piece_count; j++) {
+                new_pieces[new_count++] = buffer->pieces[j];
+            }
+            break;
+        }
+    }
+
+    if (!inserted) {
+        new_pieces[new_count++] = new_piece;
+    }
+
+    while (new_count > buffer->piece_capacity) {
+        buffer->piece_capacity = new_count * 2;
+        buffer->pieces = realloc(buffer->pieces, buffer->piece_capacity * sizeof(Piece));
+    }
+
+    memcpy(buffer->pieces, new_pieces, sizeof(Piece) * new_count);
+    buffer->piece_count = new_count;
+    free(new_pieces);
+
+    buffer->line_cache.is_valid = false;
+}
+
+bool RemoveCharacter(TextBuffer* buffer, size_t position) {
     if (position > 0) {
-        Piece new_pieces[MAX_PIECES];
+        Piece* new_pieces = malloc((buffer->piece_count + 1) * sizeof(Piece));
         int new_count = 0;
         size_t current_pos = 0;
 
         position--;
 
-        for (size_t i = 0; i < piece_count; ++i) {
-            Piece p = pieces[i];
+        for (size_t i = 0; i < buffer->piece_count; ++i) {
+            Piece p = buffer->pieces[i];
 
             if (current_pos + p.length <= position) {
                 new_pieces[new_count++] = p;
@@ -1028,175 +4081,586 @@ bool RemoveCharacter(size_t position) {
                 current_pos += p.length;
             }
         }
-        memcpy(pieces, new_pieces, sizeof(Piece) * new_count);
-        piece_count = new_count;
-        InvalidateLineCache();
+
+        while (new_count > buffer->piece_capacity) {
+            buffer->piece_capacity = new_count * 2;
+            buffer->pieces = realloc(buffer->pieces, buffer->piece_capacity * sizeof(Piece));
+        }
+        memcpy(buffer->pieces, new_pieces, sizeof(Piece) * new_count);
+        buffer->piece_count = new_count;
+        buffer->line_cache.is_valid = false;
         return true;
     }
     return false;
 }
 
-char GetCharAt(size_t position) {
-    size_t traversed = 0;
-    char* work_buffer;
-    
-    for (size_t i = 0; i < piece_count; i++) {
-        work_buffer = pieces[i].source == ORIGINAL ? org_buffer : add_buffer;
-        
-        if (traversed + pieces[i].length > position) {
-            size_t offset = position - traversed;
-            return work_buffer[pieces[i].start + offset];
-        }
-        
-        traversed += pieces[i].length;
+void ExecuteDelete(TextBuffer* buffer, size_t position, size_t length) {
+    for (size_t i = 0; i < length; ++i) {
+        RemoveCharacter(buffer, position + 1);
     }
-    
-    return '\0'; 
+    buffer->pointer_position = position;
 }
 
-bool TryToMergeCharacterRemove(float current_time) {
-    if (undoStack.current > 0 && current_time - time_since_last_edit < 1.0) {
-        EditEntry* prev = &undoStack.entries[undoStack.current - 1];
-        if (prev->type == EDIT_DELETE && prev->position == pointerPosition) {
-            char deleted = GetCharAt(pointerPosition - 1);
+void RemoveArea(TextBuffer* buffer, size_t position, size_t length) {
+    char* deleted_text = GetTextRange(buffer, position, position + length);
+    PushCommand(buffer, EDIT_DELETE, position, deleted_text, length);
+    free(deleted_text);
 
-            char* new_text = malloc(prev->length + 2);
-            new_text[0] = deleted;
-            memcpy(new_text + 1, prev->text, prev->length);
-            new_text[prev->length + 1] = '\0';
-
-            free(prev->text);
-            prev->text = new_text;
-            prev->length++;
-            prev->position--;
-            prev->cursor_after = pointerPosition - 1;
-            
-            return true;
-        }
-    }
-    return false;
+    ExecuteDelete(buffer, position, length);
 }
 
-void RemoveCharacterAtPointer() {
-    if (pointerPosition == 0) return;
+void RemoveSelection(TextBuffer* buffer) {
+    size_t selection_length = abs((int)(buffer->selection_end) - (int)(buffer->selection_start));
+    RemoveArea(buffer, min(buffer->selection_start, buffer->selection_end), selection_length);
+    buffer->has_selection = false;
+}
+
+void InsertStringAction(Editor* editor, char* value, size_t len) {
+    TextBuffer* buffer = GetActiveBuffer(editor);
+    if (buffer->has_selection) {
+        RemoveSelection(buffer);
+    }
     double current_time = GetTime();
-
-    if (!TryToMergeCharacterRemove(current_time)) {
-        char deleted_char = GetCharAt(pointerPosition - 1);
-        PushCommand(EDIT_DELETE, pointerPosition - 1, &deleted_char, 1);
+    if (!TryToMergeCharacterInsert(buffer, value, len, current_time)) {
+        char* text = malloc(len + 1);
+        memcpy(text, value, len);
+        text[len] = '\0';
+        PushCommand(buffer, EDIT_INSERT, buffer->pointer_position, text, len);
+        free(text);
     }
-    
-    if (RemoveCharacter(pointerPosition)) {
-        pointerPosition--;
-    }
-
-    time_since_last_edit = current_time;
+    InsertString(buffer, buffer->pointer_position, value, len);
+    buffer->pointer_position += len;
+    buffer->time_since_last_edit = current_time;
 }
 
-void InsertString(size_t position, char* value, size_t len) {
-    size_t new_start = AppendAddBuffer(value, len);
-    Piece new_piece = {ADD, new_start, len};
-    Piece new_pieces[MAX_PIECES];
-    size_t new_count = 0;
-    size_t current_pos = 0;
-    if (piece_count == 0) {
-        new_pieces[new_count++] = new_piece;
+void RemoveBackwardsAction(Editor* editor) {
+    TextBuffer* buffer = GetActiveBuffer(editor);
+    if (buffer->has_selection) {
+        RemoveSelection(buffer);
+    } else {
+        if (buffer->pointer_position == 0) return;
+
+        double current_time = GetTime();
+
+        if (!TryToMergeCharacterRemove(buffer, current_time)) {
+            char deleted_char = GetCharAt(buffer, buffer->pointer_position - 1);
+            PushCommand(buffer, EDIT_DELETE, buffer->pointer_position - 1, &deleted_char, 1);
+        }
+
+        if (RemoveCharacter(buffer, buffer->pointer_position)) {
+            buffer->pointer_position--;
+        }
+        buffer->time_since_last_edit = current_time;
     }
-    for (size_t i = 0; i < piece_count; ++i) {
-        Piece p = pieces[i];
-        if (current_pos + p.length < position) {
-            new_pieces[new_count++] = p;
-            current_pos += p.length;
-        } else {
-            size_t offset = position - current_pos;
-            if (offset > 0) {
-                Piece left = p;
-                left.source = p.source;
-                left.length = offset;
-                new_pieces[new_count++] = left;
-            }
+}
 
-            new_pieces[new_count++] = new_piece;
+void InsertNewLineAction(Editor* editor) {
+    char new_line_buffer[1];
+    new_line_buffer[0] = '\n';
+    InsertStringAction(editor, new_line_buffer, 1);
+}
 
-            if (offset < p.length) {
-                Piece right = p;
-                right.source = p.source;
-                right.start += offset;
-                right.length -= offset;
-                new_pieces[new_count++] = right;
-            }
+void InsertTabAction(Editor* editor) {
+    char tab_buffer[2];
+    tab_buffer[0] = ' ';
+    tab_buffer[1] = ' ';
+    InsertStringAction(editor, tab_buffer, 2);
+}
 
-            for (size_t j = i + 1; j < piece_count; ++j) {
-                new_pieces[new_count++] = pieces[j];
-            }
+void UndoAction(Editor* editor) {
+    TextBuffer* buffer = GetActiveBuffer(editor);
+    UndoStack* stack = &buffer->undo_stack;
+    if (stack->current == 0) return;
+
+    stack->current--;
+    EditEntry* entry = &stack->entries[stack->current];
+
+    switch (entry->type) 
+    {
+        case EDIT_INSERT:
+            ExecuteDelete(buffer, entry->position, entry->length);        
+            break;
+        case EDIT_DELETE:
+            InsertString(buffer, entry->position, entry->text, entry->length);
+            break;
+    }
+
+    buffer->pointer_position = entry->cursor_before;
+    buffer->line_cache.is_valid = false;
+}
+
+void RedoAction(Editor* editor) {
+    TextBuffer* buffer = GetActiveBuffer(editor);
+    UndoStack* stack = &buffer->undo_stack;
+    if (stack->current >= stack->count) return;
+    
+    EditEntry* entry = &stack->entries[stack->current];
+    
+    switch (entry->type) {
+        case EDIT_INSERT: {
+            InsertString(buffer, entry->position, entry->text, entry->length);
+            break;
+        }
+        case EDIT_DELETE: {
+            ExecuteDelete(buffer, entry->position, entry->length);
             break;
         }
     }
-    memcpy(pieces, new_pieces, sizeof(Piece) * new_count);
-    piece_count = new_count;
-    InvalidateLineCache();
+    
+    buffer->pointer_position = entry->cursor_after;
+    stack->current++;
+    buffer->line_cache.is_valid = false;
 }
 
-void InsertStringAtPointer(char* value, size_t len) {
-    PushCommand(EDIT_INSERT, pointerPosition, value, len);
-    InsertString(pointerPosition, value, len);
-    pointerPosition += len;
+void PasteAction(Editor* editor) {
+    TextBuffer* buffer = GetActiveBuffer(editor);
+    const char* clipboard_text = GetClipboardText();
+    if (clipboard_text == NULL || clipboard_text[0] == '\0') {
+        return;
+    }
+
+    if (buffer->has_selection) {
+        RemoveSelection(buffer);
+    }
+    
+    size_t clipboard_length = strlen(clipboard_text);
+    char* paste_buffer = malloc(clipboard_length + 1);
+    if (paste_buffer == NULL) {
+        return;
+    }
+    strcpy(paste_buffer, clipboard_text);
+
+    normalize_line_endings(paste_buffer);
+    size_t paste_buffer_length = strlen(paste_buffer);
+
+    PushCommand(buffer, EDIT_INSERT, buffer->pointer_position, paste_buffer, paste_buffer_length);
+
+    InsertString(buffer, buffer->pointer_position, paste_buffer, paste_buffer_length);
+    buffer->pointer_position += paste_buffer_length;
+    
+    free(paste_buffer);
 }
 
-void InsertCharacter(size_t position, char value) {
-    InsertString(position, &value, 1);
+void CopyAction(Editor* editor) {
+    TextBuffer* buffer = GetActiveBuffer(editor);
+    if (!buffer->has_selection) return;
+    size_t selection_length = abs((int)buffer->selection_end - (int)buffer->selection_start);
+    char* selection_buffer = GetTextRange(buffer, min(buffer->selection_start, buffer->selection_end), min(buffer->selection_start, buffer->selection_end) + selection_length);
+
+    SetClipboardText(selection_buffer);
+
+    free(selection_buffer);
 }
 
-bool TryToMergeCharacterInsert(char value, float current_time) {
-    if (undoStack.current > 0 && current_time - time_since_last_edit < 1.0) {
-        EditEntry* prev = &undoStack.entries[undoStack.current - 1];
+void CutAction(Editor* editor) {
+    TextBuffer* buffer = GetActiveBuffer(editor);
+    if (!buffer->has_selection) return;
 
-        if (prev->type == EDIT_INSERT && prev->position + prev->length == pointerPosition && value != '\n') {
-            char* new_text = realloc(prev->text, prev->length + 2);
-            new_text[prev->length] = value;
-            new_text[prev->length + 1] = '\0';
-            prev->text = new_text;
-            prev->length++;
-            prev->cursor_after = pointerPosition + 1;
-            return true;
+    CopyAction(editor);
+    RemoveSelection(buffer);
+}
+
+void ToggleCommandModeAction(Editor* editor) {
+    if (editor->input_system.current_mode == MODE_COMMAND) {
+        editor->input_system.current_mode = MODE_TEXT;
+    } else {
+        editor->input_system.current_mode = MODE_COMMAND;
+    }
+}
+
+void ResetCommandBuffer(CommandSystem* system) {
+    memset(system->command_buffer, 0, system->command_buffer_capacity);
+    system->pointer_position = 0;
+}
+
+void OpenCommand(Editor* editor, CommandToken* tokens, size_t token_count) {
+    struct stat st;
+    if (stat(tokens[0].char_value, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return;
+    }
+    OpenFileFromPath(editor, tokens[0].char_value);
+    ResetCommandBuffer(&editor->input_system.command_system);
+    editor->input_system.current_mode = MODE_TEXT;
+}
+
+void QuitCommando(Editor* editor, CommandToken* tokens, size_t token_count) {
+    editor->state.exit_requested = true;
+}
+
+void GotoCommand(Editor* editor, CommandToken* tokens, size_t token_count) {
+    TextBuffer* buffer = GetActiveBuffer(editor);
+    size_t line = tokens[0].numb_value - 1;
+    if (line >= 0 && line < GetLineCount(buffer)) {
+        buffer->pointer_position = GetLineByIndex(buffer, line).x;
+        ResetCommandBuffer(&editor->input_system.command_system);
+        editor->input_system.current_mode = MODE_TEXT;
+    }
+}
+
+size_t PositionToIndex(TextBuffer* buffer, Position in) {
+    if (!buffer->line_cache.is_valid) {
+        RebuildLineCache(buffer);
+    }
+    size_t out = 0;
+
+    for (size_t i = 0; i < in.y; ++i) {
+        Position line = GetLineByIndex(buffer, i);
+        out += line.y + 1;
+    }
+
+    out += in.x;
+
+    return out;
+}
+
+void FindCommand(Editor* editor, CommandToken* tokens, size_t token_count) {
+    TextBuffer* buffer = GetActiveBuffer(editor);
+    size_t line_counter = GetPointerPosition(buffer).y + 1;
+    size_t line_count = GetLineCount(buffer);
+    size_t search_length = strlen(tokens[0].char_value);
+    Position found = {-1, -1};
+    for (size_t i = 0; i < line_count; ++i) {
+        size_t working_line = (line_counter + i) % line_count;
+        char* line = GenerateLine(buffer, working_line);
+        size_t line_length = strlen(line);
+        
+        if (line_length < search_length) {
+            free(line);
+            continue;
+        }
+
+        for (size_t j = 0; j < line_length - search_length; ++j) {
+            if (strncmp(line + j, tokens[0].char_value, search_length) == 0) {
+                found.x = j;
+                found.y = working_line;
+                break;
+            }
+        }
+        free(line);
+        if (found.x != -1) {
+            break;
         }
     }
-    return false;
+    if (found.x != -1) {
+        buffer->pointer_position = PositionToIndex(buffer, found) + search_length;
+        buffer->has_selection = true;
+        buffer->selection_start = buffer->pointer_position;
+        buffer->selection_end = buffer->pointer_position - search_length;
+    }
 }
 
-void InsertCharacterAtPointer(char value) {
-    double current_time = GetTime();
-    if (!TryToMergeCharacterInsert(value, current_time)) {
-        char text[2] = {value, '\0'};
-        PushCommand(EDIT_INSERT, pointerPosition, text, 1);
+void RegisterDefaultCommandBinding(CommandSystem* system) {
+    CommandTokenType goto_types[] = { TOKENTYPE_NUMBER };
+    AddCommandBinding(system, CreateCommandBinding("goto", goto_types, 1, GotoCommand));
+
+    CommandTokenType find_types[] = { TOKENTYPE_STRING };
+    AddCommandBinding(system, CreateCommandBinding("find", find_types, 1, FindCommand));
+    
+    AddCommandBinding(system, CreateCommandBinding("quit", NULL, 0, QuitCommando));
+
+    CommandTokenType open_types[] = { TOKENTYPE_STRING };
+    AddCommandBinding(system, CreateCommandBinding("open", open_types, 1, OpenCommand));
+}
+
+void EnterCommandModeWithCommand(Editor* editor, const char* command, size_t pointer_position) {
+    CommandSystem* system = &editor->input_system.command_system;
+    size_t command_length = strlen(command);
+
+    while (command_length >= system->command_buffer_capacity) {
+        system->command_buffer = realloc(system->command_buffer, system->command_buffer_capacity * sizeof(char) * 2);
+        system->command_buffer_capacity *= 2;
     }
 
-    InsertCharacter(pointerPosition, value);
-    pointerPosition += 1;
+    memset(system->command_buffer, 0, system->command_buffer_capacity);
+    memcpy(system->command_buffer, command, command_length);
+    system->pointer_position = pointer_position;
 
-    time_since_last_edit = current_time;
+    editor->input_system.current_mode = MODE_COMMAND;
 }
 
-size_t GetPointerOffsetFromLeft(Position pointer) {
+char* FlattenTextBuffer(TextBuffer* buffer, size_t* out_len) {
+    size_t total = GetTextSize(buffer);
+    char* result = malloc(total + 1);
+    if (!result) return NULL;
+
+    size_t written = 0;
+    for (size_t i = 0; i < buffer->piece_count; i++) {
+        char* src = buffer->pieces[i].source == ORIGINAL ? buffer->org_buffer : buffer->add_buffer;
+
+        memcpy(result + written, src + buffer->pieces[i].start, buffer->pieces[i].length);
+        written += buffer->pieces[i].length;
+    }
+
+    result[written] = '\0';
+    if (out_len) *out_len = written;
+    return result;
+}
+
+bool SaveActiveTextBuffer(Editor* editor) {
+    TextBuffer* active_buffer = GetActiveBuffer(editor);
+    if (!active_buffer->file_path) return false; // TODO: Add path input method on save
+
+    size_t len;
+    char* text = FlattenTextBuffer(active_buffer, &len);
+    
+    if (!text) return false;
+
+    char tmp_path[PATH_MAX_LEN];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", active_buffer->file_path);
+
+    FILE* f = fopen(tmp_path, "wb");
+    if (!f) {
+        free(text);
+        return false;
+    }
+
+    size_t written = fwrite(text, 1, len, f);
+    fclose(f);
+    free(text);
+
+    if (written != len) {
+        remove(tmp_path);
+        return false;
+    }
+
+    #ifdef _WIN32
+        if (!MoveFileExA(tmp_path, active_buffer->file_path, MOVEFILE_REPLACE_EXISTING)) {
+            remove(tmp_path);
+            return false;
+        }
+    #else
+        if (rename(tmp_path, active_buffer->file_path) != 0) {
+            remove(tmp_path);
+            return false;
+        }
+    #endif
+    return true;
+}
+
+void SaveAction(Editor* editor) {
+    bool is_saved = SaveActiveTextBuffer(editor);
+
+    // TODO: Show is saved failed
+}
+
+void DispatchInputTextMode(Editor* editor, Action action){
+    switch (action.type)
+    {
+    case ACTION_CURSOR_LEFT:
+        MovePointerAction(editor, MovePointerLeft);
+        break;
+    case ACTION_CURSOR_RIGHT:
+        MovePointerAction(editor, MovePointerRight);
+        break;
+    case ACTION_CURSOR_DOWN:
+        MovePointerAction(editor, MovePointerDown);
+        break;
+    case ACTION_CURSOR_UP:
+        MovePointerAction(editor, MovePointerUp);
+        break;
+    case ACTION_CURSOR_WORD_RIGHT:
+        MovePointerAction(editor, MovePointerWordRight);
+        break;
+    case ACTION_CURSOR_WORD_LEFT:
+        MovePointerAction(editor, MovePointerWordLeft);
+        break;
+    case ACTION_SELECT_LEFT:
+        MovePointerSelectionAction(editor, MovePointerLeft);
+        break;
+    case ACTION_SELECT_RIGHT:
+        MovePointerSelectionAction(editor, MovePointerRight);
+        break;
+    case ACTION_SELECT_DOWN:
+        MovePointerSelectionAction(editor, MovePointerDown);
+        break;
+    case ACTION_SELECT_UP:
+        MovePointerSelectionAction(editor, MovePointerUp);
+        break; 
+    case ACTION_SELECT_WORD_RIGHT:
+        MovePointerSelectionAction(editor, MovePointerWordRight);
+        break;
+    case ACTION_SELECT_WORD_LEFT:
+        MovePointerSelectionAction(editor, MovePointerWordLeft);
+        break;
+    case ACTION_INSERT_CHAR:
+        InsertStringAction(editor, action.text_buffer, action.length);
+        break;
+    case ACTION_DELETE_BACKWARD:
+        RemoveBackwardsAction(editor);
+        break;
+    case ACTION_INSERT_NEWLINE:
+        InsertNewLineAction(editor);
+        break;
+    case ACTION_INSERT_TAB:
+        InsertTabAction(editor);
+        break;
+    case ACTION_UNDO:
+        UndoAction(editor);
+        break;
+    case ACTION_REDO:
+        RedoAction(editor);
+        break;
+    case ACTION_PASTE:
+        PasteAction(editor);
+        break;
+    case ACTION_COPY:
+        CopyAction(editor);
+        break;
+    case ACTION_CUT:
+        CutAction(editor);
+        break;
+    case ACTION_OPEN_COMMAND_PALETTE:
+        ToggleCommandModeAction(editor);
+        break;
+    case ACTION_GOTO:
+        EnterCommandModeWithCommand(editor, "goto ", strlen("goto "));
+        break;
+    case ACTION_QUIT:
+        EnterCommandModeWithCommand(editor, "quit ", strlen("quit"));
+        break;
+    case ACTION_SEARCH:
+        EnterCommandModeWithCommand(editor, "find \"\"", strlen("find \"\"") - 1);
+        break;
+    case ACTION_OPEN_BUFFER_LIST:
+        OpenBufferListModal(editor);
+        break;
+    case ACTION_OPEN_FILE:
+        EnterCommandModeWithCommand(editor, "open \"\"", strlen("open \"\"") - 1);
+        break;
+    case ACTION_OPEN_FILE_EXPLORER:
+        OpenFileExplorerModal(editor);
+        break;
+    case ACTION_OPEN_STATISTICS:
+        OpenStatisticsModal(editor);
+        break;
+    case ACTION_SAVE:
+        SaveAction(editor);
+        break;
+    default:
+        TraceLog(LOG_INFO, "ActionType: %s is not implemented for Text Mode", ActionTypeToString(action.type));
+    }
+}
+
+void DispatchInputCommandMode(Editor* editor, Action action) {
+    switch (action.type)
+    {
+    case ACTION_OPEN_COMMAND_PALETTE:
+        ToggleCommandModeAction(editor);
+        break;
+    case ACTION_CANCEL:
+        ToggleCommandModeAction(editor);
+        break;
+    case ACTION_CURSOR_LEFT:
+        MoveCommandPointerLeft(&editor->input_system.command_system);
+        break;
+    case ACTION_CURSOR_RIGHT:
+        MoveCommandPointerRight(&editor->input_system.command_system);
+        break;
+    case ACTION_DELETE_BACKWARD:
+        CommandSystemBackspace(&editor->input_system.command_system);
+        break;
+    case ACTION_EXECUTE_COMMAND:
+        TryExecuteCommandSystem(editor);
+        break;
+    case ACTION_INSERT_CHAR:
+        CommandSystemInsertString(&editor->input_system.command_system, action.text_buffer, action.length);
+        break;
+    default:
+        TraceLog(LOG_INFO, "ActionType: %s is not implemented for Command Mode", ActionTypeToString(action.type));
+    }
+}
+
+void FileSystemUpdate(Editor* editor) {
+    double current_time = GetTime();
+
+    FileSystem* file_system = &editor->file_system;
+    if (file_system->poll_state.in_progress) {
+        TimerStart(&editor->statistic_system, FILE_POLLING_STEP_TIMER);
+        if (FileSystemPollStep(file_system, INITIAL_DIRS_PER_FRAME)) {
+            TimerEnd(&editor->statistic_system, FILE_POLLING_TIMER);
+        }
+        TimerEnd(&editor->statistic_system, FILE_POLLING_STEP_TIMER);
+    } else if (strlen(file_system->root_path) > 0 &&
+               current_time - file_system->last_scan_time > file_system->scan_interval) {
+                file_system->poll_state.request_validation = true;
+    }
+
+    if (file_system->poll_state.request_validation && !file_system->poll_state.in_progress) {
+        file_system->poll_state.request_validation = false;
+        file_system->last_scan_time = current_time;
+        TimerStart(&editor->statistic_system, FILE_POLLING_TIMER);
+        FileSystemPollBegin(file_system);
+    }
+}
+
+void EditorHandleUpdate(Editor* editor) {
+    FileSystemUpdate(editor);
+
+    TimerStart(&editor->statistic_system, MODAL_UPDATE);
+    ModalSystem* system = &editor->modal_system;
+
+    for (size_t i = 0; i < system->stack_count; i++) {
+        if (system->stack[i] && system->stack[i]->custom_update) {
+            Modal* modal = system->stack[i];
+            system->stack[i]->custom_update(modal);
+        }
+    }
+    TimerEnd(&editor->statistic_system, MODAL_UPDATE);
+    
+    if (!editor->file_system.poll_state.in_progress) {
+        editor->file_system.dirty = false;
+    }
+}
+
+void EditorHandleInput(Editor* editor) {
+    if (ModalSystemHasActive(&editor->modal_system)) {
+        RawInput input = InputSystemPollRawInput();
+
+        while (input.key != 0) {
+            Modal* top = GetTopModal(&editor->modal_system);
+            if (top && top->custom_input) {
+                top->custom_input(top, input);
+            }
+
+            input = InputSystemPollRawInput();
+        }
+        return;
+    }
+
+
+    Action action = InputSystemPoll(&editor->input_system);
+
+    while (action.type != ACTION_NONE) {
+        if (editor->input_system.current_mode == MODE_TEXT) {
+            DispatchInputTextMode(editor, action);
+        } else if (editor->input_system.current_mode == MODE_COMMAND) {
+            DispatchInputCommandMode(editor, action);
+        }
+        ClearAction(&action);
+        action = InputSystemPoll(&editor->input_system);
+    }
+}
+
+size_t GetPointerOffsetFromLeft(Editor* editor, TextBuffer* buffer, Position pointer) {
     char* temp = NULL;
-    char* line = GenerateLine(pointer.y);
+    char* line = GenerateLine(buffer, pointer.y);
     size_t line_length = strlen(line);
     temp = calloc(line_length+1, sizeof(char));
 
     strncpy(temp, line, pointer.x);
-    Vector2 draw_length = MeasureTextEx(editor_font, temp, fontSize, 1);
+    Vector2 draw_length = MeasureTextEx(editor->settings.editor_font, temp, editor->settings.font_size, 1);
     
     free(temp);
     free(line);
     return draw_length.x;
 }
 
-void RenderLineBufferWithSelection(char* text_buffer, Position position, size_t line_length, Vector2 drawPosition, Position selection_start_position, Position selection_end_position) {
-    Vector2 draw_length = MeasureTextEx(editor_font, text_buffer, fontSize, 1);
+void RenderLineBufferWithSelection(Editor* editor, TextBuffer* buffer, char* text_buffer, Position position, size_t line_length, Vector2 drawPosition, Position selection_start_position, Position selection_end_position) {
+    Vector2 draw_length = MeasureTextEx(editor->settings.editor_font, text_buffer, editor->settings.font_size, 1);
     
     
     if (position.y < selection_start_position.y || position.y > selection_end_position.y) {
-        DrawTextEx(editor_font, text_buffer, drawPosition, fontSize, 1, TextColor);
+        DrawTextEx(editor->settings.editor_font, text_buffer, drawPosition, editor->settings.font_size, 1, editor->settings.scheme.text_color);
         return;
     }
 
@@ -1217,7 +4681,7 @@ void RenderLineBufferWithSelection(char* text_buffer, Position position, size_t 
     if (buffer_start > 0) {
         before_buffer = calloc(buffer_start + 1, sizeof(char));
         strncpy(before_buffer, text_buffer, buffer_start);
-        Vector2 before_buffer_size = MeasureTextEx(editor_font, before_buffer, fontSize, 1);
+        Vector2 before_buffer_size = MeasureTextEx(editor->settings.editor_font, before_buffer, editor->settings.font_size, 1);
         line_buffer_start.x += before_buffer_size.x;
     }
 
@@ -1234,20 +4698,20 @@ void RenderLineBufferWithSelection(char* text_buffer, Position position, size_t 
     }
 
     if (before_buffer != NULL) {
-        DrawTextEx(editor_font, before_buffer, drawPosition, fontSize, 1, TextColor);
+        DrawTextEx(editor->settings.editor_font, before_buffer, drawPosition, editor->settings.font_size, 1, editor->settings.scheme.text_color);
     }
     
     if (line_buffer != NULL) {
-        Vector2 line_buffer_size = MeasureTextEx(editor_font, line_buffer, fontSize, 1);
-        DrawRectangle(line_buffer_start.x, line_buffer_start.y, line_buffer_size.x, line_buffer_size.y, TextColor);
-        DrawTextEx(editor_font, line_buffer, line_buffer_start, fontSize, 1, BackgroundColor);
+        Vector2 line_buffer_size = MeasureTextEx(editor->settings.editor_font, line_buffer, editor->settings.font_size, 1);
+        DrawRectangle(line_buffer_start.x, line_buffer_start.y, line_buffer_size.x, line_buffer_size.y, editor->settings.scheme.text_color);
+        DrawTextEx(editor->settings.editor_font, line_buffer, line_buffer_start, editor->settings.font_size, 1, editor->settings.scheme.background_color);
     }
     
     if (after_buffer != NULL) {
-        Vector2 line_buffer_size = MeasureTextEx(editor_font, line_buffer != NULL ? line_buffer : "", fontSize, 1);
+        Vector2 line_buffer_size = MeasureTextEx(editor->settings.editor_font, line_buffer != NULL ? line_buffer : "", editor->settings.font_size, 1);
         Vector2 after_start = line_buffer_start;
         after_start.x += line_buffer_size.x;
-        DrawTextEx(editor_font, after_buffer, after_start, fontSize, 1, TextColor);
+        DrawTextEx(editor->settings.editor_font, after_buffer, after_start, editor->settings.font_size, 1, editor->settings.scheme.text_color);
     }
 
     free(before_buffer);
@@ -1255,32 +4719,31 @@ void RenderLineBufferWithSelection(char* text_buffer, Position position, size_t 
     free(after_buffer);
 }
 
-void RenderLineBuffer(char* text_buffer, Position position, size_t line_length, Vector2 drawPosition, Position selection_start_position, Position selection_end_position) {
-    if (has_selection && position.y >= selection_start_position.y && position.y <= selection_end_position.y) {
-        RenderLineBufferWithSelection(text_buffer, position, line_length, drawPosition, selection_start_position, selection_end_position);
+void RenderLineBuffer(Editor* editor, TextBuffer* buffer, char* text_buffer, Position position, size_t line_length, Vector2 drawPosition, Position selection_start_position, Position selection_end_position) {
+    if (buffer->has_selection && position.y >= selection_start_position.y && position.y <= selection_end_position.y) {
+        RenderLineBufferWithSelection(editor, buffer, text_buffer, position, line_length, drawPosition, selection_start_position, selection_end_position);
     } else {
-        DrawTextEx(editor_font, text_buffer, drawPosition, fontSize, 1, TextColor);
+        DrawTextEx(editor->settings.editor_font, text_buffer, drawPosition, editor->settings.font_size, 1, editor->settings.scheme.text_color);
     }
 }
 
-void RenderLine(int y_line, int xX, int yY, size_t index, Position pointer, Position selection_start_position, Position selection_end_position) {
-    Position position = {xX, yY};
+void RenderLine(Editor* editor, TextBuffer* buffer, int y_line, Position position, size_t index, Position pointer, Position selection_start_position, Position selection_end_position) {
     char* temp = NULL;
     size_t line_buffer_length;
-    char* line = GenerateLine(index);
+    char* line = GenerateLine(buffer, index);
     size_t line_length = strlen(line);
     if (pointer.y != index) {
-        RenderLineBuffer(line, (Position){0, y_line}, line_length, (Vector2){xX, yY}, selection_start_position, selection_end_position);
+        RenderLineBuffer(editor, buffer, line, (Position){0, y_line}, line_length, PositionToVector(position), selection_start_position, selection_end_position);
     } else {       
         if (temp != NULL) {
             free(temp);
         } 
         temp = calloc(line_length + 1, sizeof(char));
         strncpy(temp, line, pointer.x);
-        Vector2 draw_length = MeasureTextEx(editor_font, temp, fontSize, 1);
-        RenderLineBuffer(temp, (Position){0, y_line}, pointer.x, (Vector2){xX, yY}, selection_start_position, selection_end_position);
-        RenderLineBuffer(line + pointer.x, (Position){pointer.x, y_line}, line_length - pointer.x, (Vector2){xX + draw_length.x + pointerPaddingX * 2 + pointerWidth, yY}, selection_start_position, selection_end_position);   
-        DrawRectangle(xX + draw_length.x + pointerPaddingX, yY, pointerWidth, fontSize - 2 * pointerPaddingY, TextColor);
+        Vector2 draw_length = MeasureTextEx(editor->settings.editor_font, temp, editor->settings.font_size, 1);
+        RenderLineBuffer(editor, buffer, temp, (Position){0, y_line}, pointer.x, PositionToVector(position), selection_start_position, selection_end_position);
+        RenderLineBuffer(editor, buffer, line + pointer.x, (Position){pointer.x, y_line}, line_length - pointer.x, (Vector2){position.x + draw_length.x + editor->settings.pointer_padding.x * 2 + editor->settings.pointer_width, position.y}, selection_start_position, selection_end_position);   
+        DrawRectangle(position.x + draw_length.x + editor->settings.pointer_padding.x, position.y, editor->settings.pointer_width, editor->settings.font_size - 2 * editor->settings.pointer_padding.y, editor->settings.scheme.text_color);
     }
     free(line);
     if (temp != NULL) {
@@ -1288,830 +4751,187 @@ void RenderLine(int y_line, int xX, int yY, size_t index, Position pointer, Posi
     }
 }
 
-size_t GetLineCount()  {
-    if (!line_cache.is_valid) {
-        RebuildLineCache();
+void EditorRenderCommand(Editor* editor) {
+    int screen_height = GetScreenHeight();
+    Position offset = (Position){editor->settings.command_padding.x, screen_height - editor->settings.command_padding.y - editor->settings.font_size};
+    DrawTextEx(editor->settings.editor_font, ":", (Vector2){offset.x, offset.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color); 
+    Vector2 offset_prefix = MeasureTextEx(editor->settings.editor_font, ":", editor->settings.font_size, 1); 
+    if (editor->input_system.current_mode != MODE_COMMAND) {
+        DrawTextEx(editor->settings.editor_font, editor->input_system.command_system.command_buffer, (Vector2){offset.x + offset_prefix.x, offset.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);    
+    } else {
+        char* temp;
+        temp = calloc(editor->input_system.command_system.pointer_position + 1, sizeof(char));
+        strncpy(temp, editor->input_system.command_system.command_buffer, editor->input_system.command_system.pointer_position);
+        DrawTextEx(editor->settings.editor_font, temp, (Vector2){offset.x + offset_prefix.x, offset.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);
+        Vector2 offset_first_part = MeasureTextEx(editor->settings.editor_font, temp, editor->settings.font_size, 1);
+        DrawRectangle(offset.x + offset_prefix.x + offset_first_part.x + editor->settings.pointer_padding.x, offset.y + editor->settings.pointer_padding.y, editor->settings.pointer_width, editor->settings.font_size - editor->settings.pointer_padding.y * 2, WHITE);
+        char* last_part = editor->input_system.command_system.command_buffer + editor->input_system.command_system.pointer_position;
+        DrawTextEx(editor->settings.editor_font, last_part, (Vector2){offset.x + offset_prefix.x + offset_first_part.x + editor->settings.pointer_padding.x * 2 + editor->settings.pointer_width, offset.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);
+        free(temp);
     }
-    return line_cache.line_count;
 }
 
-Position IndexToPosition(size_t index) {  
-    Position out = {0, 0};
-    size_t traversed = 0;
-    char* work_buffer;
-    for (size_t i = 0; i < piece_count && traversed < index; ++i) {
-        work_buffer = pieces[i].source == ORIGINAL ? org_buffer : add_buffer;
-        
-        size_t to_read = index - traversed;
-        if (to_read > pieces[i].length) to_read = pieces[i].length;
-        for (size_t j = 0; j < to_read; ++j) {
-            if (work_buffer[pieces[i].start + j] == '\n') {
-                out.y++;
-                out.x = 0;
-            } else {
-                out.x++;
-            }
-        }
-        traversed += to_read;
-    }    
-    return out;
-}
-
-void RenderTextBuffer(size_t startX, size_t startY, size_t width, size_t height) {
-    Position pointer = GetPointerPosition();
+void EditorRenderTextBuffer(Editor* editor, Rect render_field) {
+    TextBuffer* buffer = &editor->state.text_buffers[editor->state.open_text_buffer_index]; 
+    Position pointer = GetPointerPosition(buffer);
     Position selection_start_position = {0};
-    Position selection_end_position = {0};
-    if (has_selection) {
-        selection_start_position = IndexToPosition(min(selection_start, selection_end));
-        selection_end_position = IndexToPosition(max(selection_start, selection_end));
-    }
-    size_t pointer_offset = GetPointerOffsetFromLeft(pointer);
-    size_t lines_completly_rendered = height / fontSize;size_t line_number = line_anchor;
-    size_t line_count = GetLineCount();
-
-    BeginScissorMode(startX, startY, width, height);
-    if (pointer.y >= line_anchor + lines_completly_rendered) {
-        line_anchor = pointer.y - lines_completly_rendered + 1;
-    }
-    if (pointer.y <= line_anchor) {
-        line_anchor = pointer.y;
+    Position selection_end_position = {0};    
+    
+    if (buffer->has_selection) {
+        selection_start_position = IndexToPosition(buffer, min(buffer->selection_start, buffer->selection_end));
+        selection_end_position = IndexToPosition(buffer, max(buffer->selection_start, buffer->selection_end));
     }
 
-    if (offsetX + width <= pointer_offset) {
-        offsetX = pointer_offset - width + pointerPaddingX * 2 + pointerWidth;
+    size_t pointer_offset = GetPointerOffsetFromLeft(editor, buffer, pointer);
+    size_t lines_completly_rendered = render_field.size.y / editor->settings.font_size;
+    size_t line_number = buffer->line_anchor;
+    size_t line_count = GetLineCount(buffer);
+    BeginScissorMode(BREAK_DOWN_RECT(render_field));
+    if (pointer.y >= buffer->line_anchor + lines_completly_rendered) {
+        buffer->line_anchor = pointer.y - lines_completly_rendered + 1;
     }
-    if (offsetX > pointer_offset) {
-        offsetX = pointer_offset;
+    if (pointer.y <= buffer->line_anchor) {
+        buffer->line_anchor = pointer.y;
+    }
+
+    if (buffer->offset_x + render_field.size.x <= pointer_offset) {
+        buffer->offset_x = pointer_offset - render_field.size.x + editor->settings.pointer_padding.x * 2 + editor->settings.pointer_width;
+    }
+    if (buffer->offset_x > pointer_offset) {
+        buffer->offset_x = pointer_offset;
     }
 
     size_t line_y = 0;
-    for (size_t i = line_anchor; i < min(line_anchor + lines_completly_rendered + 1, line_count); ++i) {    
-        RenderLine(i, startX-offsetX, startY + line_y * fontSize, i, pointer, selection_start_position, selection_end_position);
+    for (size_t i = buffer->line_anchor; i < min(buffer->line_anchor + lines_completly_rendered + 1, line_count); ++i) {    
+        RenderLine(editor, buffer, i, (Position){render_field.position.x-buffer->offset_x, render_field.position.y + line_y * editor->settings.font_size}, i, pointer, selection_start_position, selection_end_position);
         line_y++;
     }
     EndScissorMode();
 }
 
-void RenderTextField(size_t startX, size_t startY, size_t width, size_t height) {
-    Position pointer = GetPointerPosition();
-    size_t pointer_offset = GetPointerOffsetFromLeft(pointer);
-    size_t lines_completly_rendered = height / fontSize;size_t line_number = line_anchor;
-    size_t line_count = GetLineCount();
+void EditorRenderTextField(Editor* editor, Rect render_field) {
+    TextBuffer* buffer = &editor->state.text_buffers[editor->state.open_text_buffer_index]; 
+    Position pointer = GetPointerPosition(buffer);
+    size_t pointer_offset = GetPointerOffsetFromLeft(editor, buffer, pointer);
+    size_t lines_completly_rendered = render_field.size.y / editor->settings.font_size;
+    size_t line_number = buffer->line_anchor;
+    size_t line_count = GetLineCount(buffer);
 
     size_t max_offset = 0;
-    size_t digits = snprintf(NULL, 0, "%zu", min(line_anchor + lines_completly_rendered + 1, line_count) + 1);
+    size_t digits = snprintf(NULL, 0, "%zu", min(buffer->line_anchor + lines_completly_rendered + 1, line_count) + 1);
     size_t local_offset = 0;
     Vector2 measured_text;
     char* number_str  = malloc(digits + 1);
-    for (size_t i = line_anchor; i < min(line_anchor + lines_completly_rendered + 1, line_count); ++i) {
+    for (size_t i = buffer->line_anchor; i < min(buffer->line_anchor + lines_completly_rendered + 1, line_count); ++i) {
         snprintf(number_str, digits + 1, "%zu", i + 1);
-        measured_text = MeasureTextEx(editor_font, number_str, fontSize, 1);
+        measured_text = MeasureTextEx(editor->settings.editor_font, number_str, editor->settings.font_size, 1);
         local_offset = measured_text.x;
         if (local_offset > max_offset) {
             max_offset = local_offset;
         }
     }
-    max_offset += numberPadding * 2;
+    max_offset += editor->settings.number_padding * 2;
+    Rect text_buffer_field = (Rect){render_field.position.x + max_offset, render_field.position.y, render_field.size.x - max_offset, render_field.size.y};
+    EditorRenderTextBuffer(editor,text_buffer_field);
 
-    RenderTextBuffer(startX + max_offset, startY, width - max_offset, height);
-
-    BeginScissorMode(startX, startY, width, height);
+    BeginScissorMode(BREAK_DOWN_RECT(render_field));
     size_t line_y = 0;
-    for (size_t i = line_anchor; i < min(line_anchor + lines_completly_rendered + 1, line_count); ++i) {
+    for (size_t i = buffer->line_anchor; i < min(buffer->line_anchor + lines_completly_rendered + 1, line_count); ++i) {
         snprintf(number_str, digits + 1, "%zu", i + 1);
-        measured_text = MeasureTextEx(editor_font, number_str, fontSize, 1);
+        measured_text = MeasureTextEx(editor->settings.editor_font, number_str, editor->settings.font_size, 1);
         local_offset = measured_text.x;
-        DrawTextEx(editor_font, number_str, (Vector2){startX + max_offset - numberPadding - local_offset, startY + line_y * fontSize}, fontSize, 1, LineNumberColor);
+        DrawTextEx(editor->settings.editor_font, number_str, (Vector2){render_field.position.x + max_offset - editor->settings.number_padding - local_offset, render_field.position.y + line_y * editor->settings.font_size}, editor->settings.font_size, 1, editor->settings.scheme.line_number_color);
         line_y++;
     }
     EndScissorMode();
     free(number_str);
 }
 
-void RenderMode() {
+void EditorRenderMode(Editor* editor) {
     char* mode;
-    if (is_command_mode) {
+    if (editor->input_system.current_mode == MODE_COMMAND) {
         mode = "Command Mode";
     } else {
         mode = "Text Mode";
     }
-    DrawTextEx(editor_font, mode, (Vector2){mode_padding, mode_padding}, fontSize, 1, ModeColor);
+    DrawTextEx(editor->settings.editor_font, mode, PositionToVector(editor->settings.mode_padding), editor->settings.font_size, 1, editor->settings.scheme.mode_color);
 }
 
-void RenderCommand(size_t offsetX, size_t offsetY) {
-    DrawTextEx(editor_font, ":", (Vector2){offsetX, offsetY}, fontSize, 1, CommandColor); 
-    Vector2 offset_prefix = MeasureTextEx(editor_font, ":", fontSize, 1); 
-    if (!is_command_mode) {
-        DrawTextEx(editor_font, commando_content, (Vector2){offsetX + offset_prefix.x, offsetY}, fontSize, 1, CommandColor);    
-    } else {
-        char* temp;
-        temp = calloc(commando_pointer_position + 1, sizeof(char));
-        strncpy(temp, commando_content, commando_pointer_position);
-        DrawTextEx(editor_font, temp, (Vector2){offsetX + offset_prefix.x, offsetY}, fontSize, 1, CommandColor);
-        Vector2 offset_first_part = MeasureTextEx(editor_font, temp, fontSize, 1);
-        DrawRectangle(offsetX + offset_prefix.x + offset_first_part.x + pointerPaddingX, offsetY + pointerPaddingY, pointerWidth, fontSize - pointerPaddingY * 2, WHITE);
-        char* last_part = commando_content + commando_pointer_position;
-        DrawTextEx(editor_font, last_part, (Vector2){offsetX + offset_prefix.x + offset_first_part.x + pointerPaddingX * 2 + pointerWidth, offsetY}, fontSize, 1, CommandColor);
-        free(temp);
-    }
+void EditorRender(Editor* editor) {
+    ClearBackground(editor->settings.scheme.background_color);
+    EditorRenderMode(editor);
+    EditorRenderTextField(editor, GetEditorTextFieldSize(editor));
+    EditorRenderCommand(editor);
+    ModalSystemRender(editor);
 }
 
-char* load_file(const char* filename, size_t* out_len) {
-    FILE* f = fopen(filename, "rb");
-    if (!f) {
-        fprintf(stderr, "Could not open file: %s\n", filename);
-        return NULL;
-    }
-    fseek(f, 0, SEEK_END);
-    size_t len = ftell(f);
-    rewind(f);
-
-    char* buf = malloc(len + 1);
-    if (!buf) {
-        fclose(f);
-        fprintf(stderr, "Out of memory!\n");
-        return NULL;
-    }
-    fread(buf, 1, len, f);
-    buf[len] = '\0';
-    fclose(f);
-    if (out_len) *out_len = len;
-    return buf;
-}
-
-void save_file(const char* filename, char* content, size_t length) {
-    FILE* file = fopen(filename, "wb");
-   if (file == NULL) {
-        fprintf(stderr, "Could not open file: %s\n", filename); 
-        return;
-   }
-
-   size_t bytes_written = fwrite(content, 1, length, file);
-   if (bytes_written != length) {
-       fprintf(stderr, "Error: Could not write all data to file '%s'\n", filename);
-   }
-   fclose(file);
-}
-
-void normalize_line_endings(char* buf) {
-    char* src = buf;
-    char* dst = buf;
-    while (*src) {
-        if (*src != '\r') {
-            *dst++ = *src;
-        }
-        src++;
-    }
-    *dst = '\0';
-}
-
-void jumpLineUp() {
-    Position pointer = GetPointerPosition();
-    if (pointer.y == 0) {
-        return;
-    }
-    Position nextLine = GetLineByIndex(pointer.y - 1);
-    pointerPosition = nextLine.x + min(nextLine.y, pointer.x);
-}
-
-void jumpLineDown() {
-    Position pointer = GetPointerPosition();
-    size_t max_lines = GetLineCount();
-    if (pointer.y >= max_lines - 1) {
-        return;
-    }
-    Position nextLine = GetLineByIndex(pointer.y + 1);
-    pointerPosition = nextLine.x + min(nextLine.y, pointer.x);
-}
-
-void ResetCommandArgs(CommandArgs* args) {
-    if ((*args).args) {
-        for (size_t i = 0; i < (*args).count; ++i) {
-            free((*args).args[i]);
-        }
-        free((*args).args);
-    }
-    (*args).args = NULL;
-    (*args).count = 0;
-}
-
-char* SkipWhiteSpace(char* input) {
-    char* out = input;
-    while (*out == ' ' || *out == '\t') out++;
-    return out;
-}
-
-size_t CountArgs(char* command, size_t lenght) {
-    char* input = SkipWhiteSpace(command);
-    if (*input == '\0') return 0;
-    
-    char* temp = input;
-    size_t count = 0;
-    bool in_quotes = false;
-    bool in_word = false;
-
-    while (*temp) {
-        if (*temp == '"') {
-            in_quotes = !in_quotes;
-            if (!in_word) {
-                count++;
-                in_word = true;
-            }
-        } else if ((*temp == ' ' || *temp == '\t') && !in_quotes) {
-            in_word = false;
-        } else if (!in_word) {
-            count++;
-            in_word = true;
-        }
-        temp++;
-    }
-
-    return count;
-}
-
-void ParseCommandArgs() {
-    ResetCommandArgs(&command_args);
-    size_t count = CountArgs(commando_content, command_length);
-    char* input = SkipWhiteSpace(commando_content);
-    char* start = input;
-    command_args.args = malloc(count * sizeof(char*));
-    bool in_quotes = false;
-    bool in_word = false;
-    while (*input && command_args.count < count) {
-        if (*input == '"') {
-            if (!in_word) {
-                start = input + 1;
-                in_word = true;
-            }
-            in_quotes = !in_quotes;
-            if (!in_quotes) {
-                size_t len = input - start;
-                command_args.args[command_args.count] = malloc(len + 1);
-                strncpy(command_args.args[command_args.count], start, len);
-                command_args.args[command_args.count][len] = '\0';
-                command_args.count++;
-                in_word = false;
-            }
-        } else if ((*input == ' ' || *input == '\t') && !in_quotes) {
-            if (in_word && !in_quotes) {
-                size_t len = input - start;
-                command_args.args[command_args.count] = malloc(len + 1);
-                strncpy(command_args.args[command_args.count], start, len);
-                command_args.args[command_args.count][len] = '\0';
-                command_args.count++;
-                in_word = false;
-            }
-        } else if (!in_word) {
-            start = input;
-            in_word = true;
-        }
-        input++;
-    }
-
-    if (in_word && !in_quotes) {
-        size_t len = input - start;
-        command_args.args[command_args.count] = malloc(len + 1);
-        strncpy(command_args.args[command_args.count], start, len);
-        command_args.args[command_args.count][len] = '\0';
-        command_args.count++;
-    }
-}
-
-size_t PositionToPointer(Position in) {
-    if (!line_cache.is_valid) {
-        RebuildLineCache();
-    }
-    size_t out = 0;
-
-    for (size_t i = 0; i < in.y; ++i) {
-        Position line = GetLineByIndex(i);
-        out += line.y + 1;
-    }
-
-    out += in.x;
-
-    return out;
-}
-
-void ExecuteCommand() {
-    if (command_args.count < 1) return;
-    if (strcmp(command_args.args[0], "find") == 0) {
-        if (command_args.count != 2) return;
-        size_t line_counter = GetPointerPosition().y + 1;
-        size_t line_count = GetLineCount();
-        size_t search_length = strlen(command_args.args[1]);
-        Position found = {-1, -1};
-        for (size_t i = 0; i < line_count; ++i) {
-            size_t working_line = (line_counter + i) % line_count;
-            char* line = GenerateLine(working_line);
-            size_t line_length = strlen(line);
-            
-            if (line_length < search_length) {
-                continue;
-            }
-
-            for (size_t j = 0; j < line_length - search_length; ++j) {
-                if (strncmp(line + j, command_args.args[1], search_length) == 0) {
-                    found.x = j;
-                    found.y = working_line;
-                    break;
-                }
-            }
-            free(line);
-            if (found.x != -1) {
-                break;
-            }
-        }
-        if (found.x != -1) {
-            pointerPosition = PositionToPointer(found) + search_length;
-            has_selection = true;
-            selection_start = pointerPosition;
-            selection_end = pointerPosition - search_length;
-        }
-                    
-    } else if (strcmp(command_args.args[0], "goto") == 0) {
-        if (command_args.count != 2) return;
-
-        size_t line = atoi(command_args.args[1]) - 1;
-        if (line >= 0 && line < GetLineCount()) {
-            pointerPosition = GetLineByIndex(line).x;
-            is_command_mode = false;
-            command_length = 0;
-            memset(commando_content, 0, MAX_COMMAND_BUFFER);
-            commando_pointer_position = 0;
-        }
-    } else if (strcmp(command_args.args[0], "quit") == 0) {
-        exit_requested = true;
-    }
-}
-
-void ExecuteInsert(size_t position, const char* text, size_t length) {
-    InsertString(position, (char*)text, length);
-    pointerPosition = position + length;
-}
-
-char* GetTextRange(size_t start, size_t end) {
-    size_t length = end - start;
-    char* result = malloc(length + 1);
-    for (size_t i = 0; i < length; i++) {
-        result[i] = GetCharAt(start + i);
-    }
-    result[length] = '\0';
-    return result;
-}
-
-void ExecuteDelete(size_t position, size_t length) {
-    for (size_t i = 0; i < length; ++i) {
-        RemoveCharacter(position + 1);
-    }
-    pointerPosition = position;
-}
-
-void RemoveArea(size_t position, size_t length) {
-    char* deleted_text = GetTextRange(position, position + length);
-    PushCommand(EDIT_DELETE, position, deleted_text, length);
-    ExecuteDelete(position, length);
-}
-
-
-void Undo() {
-    if (undoStack.current == 0) return;
-
-    undoStack.current--;
-    EditEntry* entry = &undoStack.entries[undoStack.current];
-
-    switch (entry->type) 
-    {
-        case EDIT_INSERT:
-            ExecuteDelete(entry->position, entry->length);        
-            break;
-        case EDIT_DELETE:
-            ExecuteInsert(entry->position, entry->text, entry->length);
-            break;
-    }
-
-    pointerPosition = entry->cursor_before;
-    InvalidateLineCache();
-}
-
-void Redo() {
-    if (undoStack.current >= undoStack.count) return;
-    
-    EditEntry* entry = &undoStack.entries[undoStack.current];
-    
-    switch (entry->type) {
-        case EDIT_INSERT: {
-            ExecuteInsert(entry->position, entry->text, entry->length);
-            break;
-        }
-        case EDIT_DELETE: {
-            ExecuteDelete(entry->position, entry->length);
-            break;
-        }
-    }
-    
-    pointerPosition = entry->cursor_after;
-    undoStack.current++;
-    InvalidateLineCache();
-}
-
-void RemoveSelection() {
-    size_t selection_length = abs((int)(selection_end) - (int)(selection_start));
-    RemoveArea(min(selection_start, selection_end), selection_length);
-    has_selection = false;
-}
-
-void Paste() {
-    char* buffer = (char*)GetClipboardText();
-    if (buffer == NULL) {
-        return;
-    }
-
-    if (has_selection) {
-        RemoveSelection();
-    }
-    
-    size_t buffer_length = strlen(buffer);
-    char* normalized_buffer = (char*)malloc(buffer_length + 1);
-    strcpy(normalized_buffer, buffer);
-
-    normalize_line_endings(buffer);
-    InsertStringAtPointer(buffer, buffer_length);
-}
-
-void Copy() {
-    size_t selection_length = abs((int)selection_end - (int)selection_start);
-    char* selection_buffer = GetTextRange(min(selection_start, selection_end), min(selection_start, selection_end) + selection_length);
-
-    SetClipboardText(selection_buffer);
-
-    free(selection_buffer);
-}
-
-void Cut() {
-    Copy();
-    RemoveSelection();
-}
-
-bool IsWordChar(char c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
-}
-
-bool IsPunct(char c) {
-    return c && !IsWordChar(c) && c != ' ' && c != '\t' && c != '\n';
-}
-
-void MoveWordRight() {
-    size_t size = GetTextSize();
-    if (pointerPosition >= size) return;
-    char c = GetCharAt(pointerPosition);
-    
-    if (c == '\n') {
-        pointerPosition++;
-        return;
-    }
-    
-    if (IsWordChar(c)) {
-        while (pointerPosition < size && IsWordChar(GetCharAt(pointerPosition))) pointerPosition++;
-    } else if (IsPunct(c)) {
-        while (pointerPosition < size && IsPunct(GetCharAt(pointerPosition))) pointerPosition++;
-    } else {
-        while (pointerPosition < size && (c = GetCharAt(pointerPosition), c == ' ' || c == '\t')) pointerPosition++;
-        if (pointerPosition < size && GetCharAt(pointerPosition) == '\n') return;
-        while (pointerPosition < size && IsPunct(GetCharAt(pointerPosition))) pointerPosition++;
-    }
-}
-
-void MoveWordLeft() {
-    size_t size = GetTextSize();
-    if (pointerPosition == 0) return;
-    pointerPosition--;
-    
-    char c = GetCharAt(pointerPosition);
-    if (c == '\n') return;
-    
-    while (pointerPosition > 0 && (c = GetCharAt(pointerPosition), c == ' ' || c == '\t')) {
-        if (GetCharAt(pointerPosition - 1) == '\n') return;
-        pointerPosition--;
-    }
-    
-    c = GetCharAt(pointerPosition);
-    if (IsWordChar(c)) {
-        while (pointerPosition > 0 && IsWordChar(GetCharAt(pointerPosition - 1))) pointerPosition--;
-    } else if (IsPunct(c)) {
-        while (pointerPosition > 0 && IsPunct(GetCharAt(pointerPosition - 1))) pointerPosition--;
-    }
-}
-
-void InsurePaddingModal(void* modal) {
-    Modal* self = (Modal*)modal;
-    int screen_width = GetScreenWidth();
-    int screen_height = GetScreenHeight();
-
-    self->size.x = min(screen_width - self->padding.x, self->wanted_size.x);
-    self->size.y = min(screen_height - self->padding.y, self->wanted_size.y);
-}
-
-void CenterModal(void* modal) {
-    Modal* self = (Modal*)modal;
-    int screen_width = GetScreenWidth();
-    int screen_height = GetScreenHeight();
-
-    self->position.x = screen_width / 2.0f - self->size.x / 2.0f;
-    self->position.y = screen_height / 2.0f - self->size.y / 2.0f;
-}
-
-void BeginRenderModal(Modal* modal) {
-    for (int i = 0; i < modal->layout_count; i++) {
-        modal->layouts[i](modal);
-    }
-    BeginScissorMode(modal->position.x, modal->position.y, modal->size.x, modal->size.y);
-    DrawRectangle(modal->position.x, modal->position.y, modal->size.x, modal->size.y, modal->background_color);
-}
-
-void EndRenderModal(Modal* _modal) {
-    EndScissorMode();
-}
-void RenderModal(Modal* modal) {
-    BeginRenderModal(modal);
-    if (modal->render) {
-        modal->render(modal); 
-    }
-    EndRenderModal(modal);
-}
-
-void DebugModal(void* modal) {
-    Modal* self = (Modal*)modal;
-}
-
-int main(int argc, char** argv) {
-        size_t org_buffer_length = 0;
-
-        if (argc >= 2) {
-            struct stat path_stat;
-            if (stat(argv[1], &path_stat) != 0) {
-                fprintf(stderr, "Failed to access path: %s\n", argv[1]);
-                org_buffer = strdup("");
-                org_buffer_length = 0;
-            } else if (S_ISDIR(path_stat.st_mode)) {
-                fprintf(stderr, "Directory detected: %s\n", argv[1]);
-                root_path = argv[1];
-                UpdateFileCache();
-                org_buffer = strdup("");
-                org_buffer_length = 0;
-            } else if (S_ISREG(path_stat.st_mode)) {
-                org_buffer = load_file(argv[1], &org_buffer_length);
-                if (!org_buffer) {
-                    fprintf(stderr, "Failed to load file, using default text.\n");
-                    org_buffer = strdup("");
-                    org_buffer_length = 0;
-                }
-                normalize_line_endings(org_buffer);
-            }
-    } else {
-        org_buffer = strdup("");
-        org_buffer_length = strlen(org_buffer);
-    }
-    InitLineCache();
-    InitUndoStack();
-
-    pieces[0].source = ORIGINAL;
-    pieces[0].start = 0;
-    pieces[0].length = strlen(org_buffer);
-    piece_count = 1;
-
+void SetupWindow() {
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     InitWindow(1200, 700, "Fun Editor");
     MaximizeWindow();
     
-    SetTargetFPS(60); 
+    SetTargetFPS(0); 
     SetExitKey(KEY_NULL);
-    
-    editor_font = LoadFontEx("Input.ttf", fontSize, 0, 250);
+}
 
-    FileBrowserState browser_state = {0};
-    Modal file_browser_modal = {
-        .position = {0, 0},
-        .size = {0, 0},
-        .wanted_size = {800, 1000},
-        .padding = {50, 50},
-        .background_color = {40, 42, 48, 255},
-        .layouts = (Layout[]){InsurePaddingModal, CenterModal},
-        .layout_count = 2,
-        .render = RenderFileBrowser,
-        .input = InputFileBrowser,
-        .state = &browser_state
+int main(int argc, char** argv) {
+    SetupWindow();
+
+    ColorScheme scheme = {
+        .background_color = (Color){32, 35, 41, 255},
+        .mode_color = WHITE,
+        .text_color = WHITE,
+        .command_color = WHITE,
+        .line_number_color = YELLOW
     };
 
-    LogFileTree();
+    EditorSettings settings = {
+        .scheme = scheme,
+        .font_size = 25,
+        .number_padding = 10,
+        .pointer_padding = (Position){3, 3},
+        .mode_padding = (Position){10, 10},
+        .command_padding = (Position){10, 10},
+        .pointer_width = 2,
+        .editor_font = LoadFontEx("Input.ttf", 80, NULL, 0),
+    };
+    SetTextureFilter(settings.editor_font.texture, TEXTURE_FILTER_BILINEAR);
 
-    while (!WindowShouldClose() && !exit_requested) {
-        if (root_path) {
-            UpdateFileCache();
-        }
-
-        size_t screenWidth = GetScreenWidth();
-        size_t screenHeight = GetScreenHeight();
-        if (modal) {
-            if (modal->input) {
-                modal->input(modal);
-            }
-        } else if (!is_command_mode) {
-            bool shift = IsKeyDown(KEY_LEFT_SHIFT);
-            bool control = IsKeyDown(KEY_LEFT_CONTROL);
-            int pointer_position_before = pointerPosition;
-            if (IsKeyPressed(KEY_LEFT) && pointerPosition > 0) {
-                if (control) {
-                    MoveWordLeft();
-                } else {
-                    pointerPosition--;
-                }
-            }
-            if (IsKeyPressed(KEY_RIGHT) && pointerPosition <= GetTextSize()) {
-                if (control) {
-                    MoveWordRight();
-                } else {
-                    pointerPosition++;
-                }
-            }
-            if (IsKeyPressed(KEY_UP)) {
-                if (control) {
-                    for (int i = 0; i < 5; i++) {
-                        jumpLineUp();
-                    }
-                } else {
-                    jumpLineUp();
-                }
-            } 
-            if (IsKeyPressed(KEY_DOWN)) {
-                if (control) {
-                    for (int i = 0; i < 5; i++) {
-                        jumpLineDown();
-                    }
-                } else {
-                    jumpLineDown();
-                }
-            } 
-            if (!shift && has_selection && pointer_position_before != pointerPosition) {
-                has_selection = false;
-            }
-            if (shift && !has_selection && pointer_position_before != pointerPosition) {
-                has_selection = true;
-                selection_start = pointer_position_before;
-            }
-            if (shift) {selection_end = pointerPosition;}
-
-            if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_Y)) {
-                if (IsKeyDown(KEY_LEFT_SHIFT)) {
-                    Redo();
-                } else {
-                    Undo();
-                }
-            }
-
-
-            if (IsKeyPressed(KEY_BACKSPACE)) {
-                if (has_selection) {
-                    RemoveSelection();
-                } else {
-                    RemoveCharacterAtPointer();
-                }
-            }
-
-            if (IsKeyDown(KEY_LEFT_CONTROL)) {
-                if (IsKeyPressed(KEY_S)) {
-                    size_t length;
-                    char* text = GenerateText(&length);
-                    if (argc >= 2) {
-                        save_file(argv[1], text, length);
-                    }
-                    // TODO: Clean up org and add puffer and compress piece table
-                }
-
-                if (IsKeyPressed(KEY_P)) {
-                    is_command_mode = true;
-                }
-                
-                if (IsKeyPressed(KEY_F)) {
-                    is_command_mode = true;
-                    memset(commando_content, 0, MAX_COMMAND_BUFFER);
-                    strcpy(commando_content, "find \"\"");
-                    command_length = strlen("find \"\"");
-                    commando_pointer_position = command_length - 1;
-                }
-                
-                if (IsKeyPressed(KEY_G)) {
-                    is_command_mode = true;
-                    memset(commando_content, 0, MAX_COMMAND_BUFFER);
-                    strcpy(commando_content, "goto ");
-                    command_length = strlen("goto ");
-                    commando_pointer_position = command_length;
-                }
-                
-                if (IsKeyPressed(KEY_Q)) {
-                    is_command_mode = true;
-                    memset(commando_content, 0, MAX_COMMAND_BUFFER);
-                    strcpy(commando_content, "quit");
-                    command_length = strlen("quit");
-                    commando_pointer_position = command_length;
-                }
-
-                if (IsKeyPressed(KEY_V)) {
-                    Paste();
-                }
-
-                if (IsKeyPressed(KEY_C)) {
-                    Copy();
-                }
-
-                if (IsKeyPressed(KEY_X)) {
-                    Cut();
-                }
-
-                if (IsKeyPressed(KEY_SPACE)) {
-                    modal = &file_browser_modal;
-                }
-            } else {
-                int key = GetCharPressed();
-                while (key > 0) {
-                    if (key >= 32 && key <= 126) {
-                        if (has_selection) {
-                            RemoveSelection();
-                        }
-                        InsertCharacterAtPointer(key);
-                    }
-                    key = GetCharPressed();
-                }
-                if (IsKeyPressed(KEY_TAB)) {
-                    if (has_selection) {
-                        RemoveSelection();
-                    }
-                    InsertStringAtPointer("  ", 2);
-                }       
-                if (IsKeyPressed(KEY_ENTER)) {    
-                    if (has_selection) {
-                        RemoveSelection();
-                    }
-                    InsertCharacterAtPointer('\n');
-                }
-            }
-        } else {
-            if (IsKeyDown(KEY_LEFT_CONTROL)) {
-                if (IsKeyPressed(KEY_P)) {
-                    is_command_mode = false;
-                }
-            } else {
-                int key = GetCharPressed();
-                while (key > 0) {
-                    if (key >= 32 && key <= 126) {
-                        memmove(commando_content + commando_pointer_position + 1, commando_content + commando_pointer_position, MAX_COMMAND_BUFFER - commando_pointer_position - 1);
-                        commando_content[commando_pointer_position] = key;
-                        command_length++;
-                        commando_pointer_position++;
-                    }
-                    key = GetCharPressed();
-                }
-
-                if (IsKeyPressed(KEY_BACKSPACE) && commando_pointer_position > 0) {
-                    memmove(commando_content + commando_pointer_position - 1, 
-                        commando_content + commando_pointer_position, 
-                        MAX_COMMAND_BUFFER - commando_pointer_position);
-                    command_length--;
-                    commando_pointer_position--;
-                }
-
-                if (IsKeyPressed(KEY_LEFT) && commando_pointer_position > 0) {
-                    commando_pointer_position--;
-                }
-                if (IsKeyPressed(KEY_RIGHT) && commando_pointer_position < command_length) {
-                    commando_pointer_position++;
-                }
-
-                if (IsKeyPressed(KEY_ENTER)) {
-                    ParseCommandArgs();
-                    ExecuteCommand();
-                }
-
-                if (IsKeyPressed(KEY_ESCAPE)) {
-                    is_command_mode = false;
-                }
-            }
-        }
-
-        BeginDrawing(); 
-        ClearBackground(BackgroundColor);
-        RenderMode();
-        RenderTextField(0, mode_padding * 2 + fontSize, screenWidth - 40, screenHeight - (mode_padding * 2 + fontSize * 2 + command_padding * 2));
-        RenderCommand(command_padding, screenHeight - command_padding - fontSize);
-        
-        if (modal) {
-            RenderModal(modal);
-        }
-        
-        EndDrawing();
+    char* path = NULL;
+    if (argc >= 2) {
+        path = strdup(argv[1]);
     }
 
-    CloseWindow();
-    free(org_buffer);
+    Editor editor = CreateEditor(settings, path);
+    RegisterDefaultCommandBinding(&editor.input_system.command_system);
+
+    if (path) {
+        free(path);
+        path = NULL;
+    }
+
+    while (!WindowShouldClose() && !ShouldEditorClose(&editor)) {
+        TimerStart(&editor.statistic_system, FRAME_TIMER);
+        editor.statistic_system.frame_count++;
+
+        TimerStart(&editor.statistic_system, INPUT_TIMER);
+        EditorHandleInput(&editor);
+        TimerEnd(&editor.statistic_system, INPUT_TIMER);
+
+        TimerStart(&editor.statistic_system, UPDATE_TIMER);
+        EditorHandleUpdate(&editor);
+        TimerEnd(&editor.statistic_system, UPDATE_TIMER);
+
+        BeginDrawing();
+
+        TimerStart(&editor.statistic_system, RENDER_TIMER);
+        EditorRender(&editor);
+        TimerEnd(&editor.statistic_system, RENDER_TIMER);
+
+        EndDrawing();
+        TimerEnd(&editor.statistic_system, FRAME_TIMER);
+    }
+
+    ClearEditor(&editor);
     return 0;
 }
