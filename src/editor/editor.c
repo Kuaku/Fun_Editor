@@ -164,7 +164,7 @@ void MovePointerRight(TextBuffer* buffer) {
 }
 
 void MovePointerUp(TextBuffer* buffer) {
-    Position pointer = GetPointerCodepointPosition(buffer);
+    Position pointer = GetPointerCodePosition(buffer);
     if (pointer.y == 0) {
         return;
     }
@@ -189,7 +189,7 @@ void MovePointerUp(TextBuffer* buffer) {
 }
 
 void MovePointerDown(TextBuffer* buffer) {
-    Position pointer = GetPointerCodepointPosition(buffer);
+    Position pointer = GetPointerCodePosition(buffer);
     size_t max_lines = GetLineCount(buffer);
     if (pointer.y >= max_lines - 1) {
         return;

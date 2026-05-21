@@ -25,6 +25,7 @@ int main(int argc, char** argv) {
         .mode_color = WHITE,
         .text_color = WHITE,
         .command_color = WHITE,
+        .command_background_color = (Color){50, 54, 61, 255},
         .line_number_color = YELLOW
     };
 

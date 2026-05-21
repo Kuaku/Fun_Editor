@@ -14,6 +14,8 @@ void RenderLine(Editor* editor, TextBuffer* buffer, int y_line, Position positio
 void EditorRenderTextBuffer(Editor* editor, Rect render_field);
 void EditorRenderTextField(Editor* editor, Rect render_field);
 void EditorRenderMode(Editor* editor);
+void EditorRenderBar(Editor* editor);
+void EditorRenderStatusBar(Editor* editor);
 void EditorRenderCommand(Editor* editor);
 void EditorRender(Editor* editor);
 

@@ -25,6 +25,7 @@ typedef struct {
     Color text_color;
     Color command_color;
     Color line_number_color;
+    Color command_background_color;
 } ColorScheme;
 
 typedef struct {

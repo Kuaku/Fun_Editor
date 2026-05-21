@@ -118,24 +118,71 @@ void RenderLine(Editor* editor, TextBuffer* buffer, int y_line, Position positio
     }
 }
 
+void EditorRenderBar(Editor* editor) {
+    int screen_height = GetScreenHeight();
+    int screen_width = GetScreenWidth();
+    DrawRectangle(0, screen_height - editor->settings.font_size - 2 * editor->settings.command_padding.y, screen_width,editor->settings.font_size + 2 * editor->settings.command_padding.y, editor->settings.scheme.command_background_color);
+    if (editor->input_system.current_mode == MODE_COMMAND) {
+        EditorRenderCommand(editor);
+    } else {
+        EditorRenderStatusBar(editor);    
+    }
+}
+
+void EditorRenderStatusBar(Editor* editor) {
+    int screen_height = GetScreenHeight();
+    int screen_width = GetScreenWidth();
+    Position offset = (Position){editor->settings.command_padding.x, screen_height - editor->settings.command_padding.y - editor->settings.font_size};
+        
+    
+
+    TextBuffer* buffer = GetActiveBuffer(editor);
+    Position cursor = GetPointerCodePosition(buffer);
+
+    int length = snprintf(NULL, 0, "%d | %d", cursor.x + 1, cursor.y + 1);
+    char* position_str = (char*)malloc(length + 1); 
+    snprintf(position_str, length + 1, "%d | %d", cursor.x + 1, cursor.y + 1);
+
+    Vector2 bounding_position_str = MeasureTextEx(editor->settings.editor_font, position_str, editor->settings.font_size, 1);
+    DrawTextEx(editor->settings.editor_font, position_str, (Vector2){screen_width - editor->settings.command_padding.x - bounding_position_str.x, screen_height - editor->settings.command_padding.y - bounding_position_str.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);
+
+    free(position_str);
+
+    int right_bounding_width = bounding_position_str.x + 2 * editor->settings.command_padding.x;
+
+    DrawRectangle(screen_width - right_bounding_width - 2, screen_height - editor->settings.command_padding.y - editor->settings.font_size, 2, editor->settings.font_size, editor->settings.scheme.command_color);
+
+    right_bounding_width += 2;
+
+    BeginScissorMode(editor->settings.command_padding.x, screen_height - editor->settings.font_size - editor->settings.command_padding.y, screen_width - editor->settings.command_padding.x - right_bounding_width, editor->settings.font_size);
+
+    const char* full_path = buffer->file_path;
+    const char* label = "[untitled]";
+    if (full_path) {
+        label = full_path;
+    }
+
+    Vector2 bounding_file_path = MeasureTextEx(editor->settings.editor_font, label, editor->settings.font_size, 1);
+    DrawTextEx(editor->settings.editor_font, label, (Vector2){editor->settings.command_padding.x, screen_height - editor->settings.font_size - editor->settings.command_padding.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);
+
+    EndScissorMode();
+}
+
 void EditorRenderCommand(Editor* editor) {
     int screen_height = GetScreenHeight();
     Position offset = (Position){editor->settings.command_padding.x, screen_height - editor->settings.command_padding.y - editor->settings.font_size};
     DrawTextEx(editor->settings.editor_font, ":", (Vector2){offset.x, offset.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);
-    Vector2 offset_prefix = MeasureTextEx(editor->settings.editor_font, ":", editor->settings.font_size, 1);
-    if (editor->input_system.current_mode != MODE_COMMAND) {
-        DrawTextEx(editor->settings.editor_font, editor->input_system.command_system.command_buffer, (Vector2){offset.x + offset_prefix.x, offset.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);
-    } else {
-        char* temp;
-        temp = calloc(editor->input_system.command_system.pointer_position + 1, sizeof(char));
-        strncpy(temp, editor->input_system.command_system.command_buffer, editor->input_system.command_system.pointer_position);
-        DrawTextEx(editor->settings.editor_font, temp, (Vector2){offset.x + offset_prefix.x, offset.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);
-        Vector2 offset_first_part = MeasureTextEx(editor->settings.editor_font, temp, editor->settings.font_size, 1);
-        DrawRectangle(offset.x + offset_prefix.x + offset_first_part.x + editor->settings.pointer_padding.x, offset.y + editor->settings.pointer_padding.y, editor->settings.pointer_width, editor->settings.font_size - editor->settings.pointer_padding.y * 2, WHITE);
-        char* last_part = editor->input_system.command_system.command_buffer + editor->input_system.command_system.pointer_position;
-        DrawTextEx(editor->settings.editor_font, last_part, (Vector2){offset.x + offset_prefix.x + offset_first_part.x + editor->settings.pointer_padding.x * 2 + editor->settings.pointer_width, offset.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);
-        free(temp);
-    }
+    Vector2 offset_prefix = MeasureTextEx(editor->settings.editor_font, ": ", editor->settings.font_size, 1);
+    
+    char* temp;
+    temp = calloc(editor->input_system.command_system.pointer_position + 1, sizeof(char));
+    strncpy(temp, editor->input_system.command_system.command_buffer, editor->input_system.command_system.pointer_position);
+    DrawTextEx(editor->settings.editor_font, temp, (Vector2){offset.x + offset_prefix.x, offset.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);
+    Vector2 offset_first_part = MeasureTextEx(editor->settings.editor_font, temp, editor->settings.font_size, 1);
+    DrawRectangle(offset.x + offset_prefix.x + offset_first_part.x + editor->settings.pointer_padding.x, offset.y + editor->settings.pointer_padding.y, editor->settings.pointer_width, editor->settings.font_size - editor->settings.pointer_padding.y * 2, WHITE);
+    char* last_part = editor->input_system.command_system.command_buffer + editor->input_system.command_system.pointer_position;
+    DrawTextEx(editor->settings.editor_font, last_part, (Vector2){offset.x + offset_prefix.x + offset_first_part.x + editor->settings.pointer_padding.x * 2 + editor->settings.pointer_width, offset.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);
+    free(temp);
 }
 
 void EditorRenderTextBuffer(Editor* editor, Rect render_field) {
@@ -228,6 +275,6 @@ void EditorRender(Editor* editor) {
     ClearBackground(editor->settings.scheme.background_color);
     EditorRenderMode(editor);
     EditorRenderTextField(editor, GetEditorTextFieldSize(editor));
-    EditorRenderCommand(editor);
+    EditorRenderBar(editor);
     ModalSystemRender(editor);
 }

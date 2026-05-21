@@ -63,6 +63,7 @@ typedef struct {
     double time_since_last_edit;
 
     Position pointer_position_cache;
+    Position pointer_code_position_cache;
     size_t last_pointer_position_cached;
     bool request_revalidate_pointer_cache;
     bool has_selection;
@@ -111,7 +112,9 @@ Position IndexToPosition(TextBuffer* buffer, size_t index);
 Position IndexToPositionCodepoint(TextBuffer* buffer, size_t index);
 size_t PositionToIndex(TextBuffer* buffer, Position in);
 Position GetPointerPosition(TextBuffer* buffer);
+Position GetPointerCodePosition(TextBuffer* buffer);
 Position GetPointerCodepointPosition(TextBuffer* buffer);
+void RevalidatePointerCache(TextBuffer* buffer);
 
 bool IsWordChar(uint32_t c);
 bool IsPunct(uint32_t c);

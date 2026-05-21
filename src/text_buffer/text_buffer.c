@@ -252,6 +252,7 @@ void InitTextBuffer(TextBuffer* buffer) {
     buffer->offset_x = 0;
     buffer->pointer_position = 0;
     buffer->pointer_position_cache = (Position){0, 0};
+    buffer->pointer_code_position_cache = (Position){0, 0};
     buffer->last_pointer_position_cached = 0;
     buffer->request_revalidate_pointer_cache = false;
     buffer->time_since_last_edit = 0;
@@ -597,13 +598,26 @@ size_t PositionToIndex(TextBuffer* buffer, Position in) {
 }
 
 Position GetPointerPosition(TextBuffer* buffer) {
-    if (!buffer->request_revalidate_pointer_cache && buffer->pointer_position == buffer->last_pointer_position_cached) return buffer->pointer_position_cache;
+    if (buffer->request_revalidate_pointer_cache || buffer->pointer_position != buffer->last_pointer_position_cached) RevalidatePointerCache(buffer);
+    
+    return buffer->pointer_position_cache;
+}
+
+Position GetPointerCodePosition(TextBuffer* buffer) {
+    if (buffer->request_revalidate_pointer_cache || buffer->pointer_position != buffer->last_pointer_position_cached) RevalidatePointerCache(buffer);
+    
+    return buffer->pointer_code_position_cache;
+}
+
+
+void RevalidatePointerCache(TextBuffer* buffer) {
     Position out = IndexToPosition(buffer, buffer->pointer_position);
+    Position codepoint_position = IndexToPositionCodepoint(buffer, buffer->pointer_position);
 
     buffer->request_revalidate_pointer_cache = false;
     buffer->pointer_position_cache = out;
+    buffer->pointer_code_position_cache = codepoint_position;
     buffer->last_pointer_position_cached = buffer->pointer_position;
-    return out;
 }
 
 Position GetPointerCodepointPosition(TextBuffer* buffer) {

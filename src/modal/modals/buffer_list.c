@@ -16,7 +16,6 @@ void BufferListRender(Modal* modal, Rect content) {
     if (state->selected_index >= state->scroll_offset + visible_rows) {
         state->scroll_offset = state->selected_index - visible_rows + 1;
     }
-
     BeginScissorMode(content.position.x, content.position.y,
                      content.size.x, content.size.y);
 
@@ -28,6 +27,7 @@ void BufferListRender(Modal* modal, Rect content) {
 
         const char* full_path = es->text_buffers[i].file_path;
         const char* label = "[untitled]";
+
         if (full_path) {
             const char* slash = strrchr(full_path, '/');
             const char* bslash = strrchr(full_path, '\\');
