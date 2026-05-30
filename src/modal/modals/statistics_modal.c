@@ -125,6 +125,7 @@ void RegisterStatisticsModal(Editor* editor) {
         NULL,
         StatisticsInput,
         StatisticsCleanup,
+        NULL,
         state
     );
 

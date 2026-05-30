@@ -149,6 +149,7 @@ void PushStringInputModal(Editor* editor, const char* title,
         NULL,
         StringInputInput,
         StringInputCleanup,
+        NULL,
         state
     );
     modal->style.draw_title = true;

@@ -50,30 +50,27 @@ size_t GetFreeTextBufferIndex(EditorState* state) {
     return index;
 }
 
-Editor CreateEditor(EditorSettings settings, char* path) {
-    Editor editor;
-    editor.settings = settings;
-    editor.state = InitEditorState(INITIAL_TEXT_BUFFER_CAPACITY);
+void CreateEditor(Editor* editor, EditorSettings settings, char* path) {
+    editor->settings = settings;
+    editor->state = InitEditorState(INITIAL_TEXT_BUFFER_CAPACITY);
 
     FileType root_type = TYPE_ERROR;
     if (path) {
         root_type = GetFileTypeFromPath(path);
     }
 
-    editor.input_system = InitInputSystem();
-    editor.modal_system = InitModalSystem();
-    editor.file_system = InitFileSystem();
-    editor.statistic_system = InitStatisticSystem();
+    editor->input_system = InitInputSystem(settings.key_repeat_delay, settings.key_repeat_interval);
+    editor->modal_system = InitModalSystem();
+    editor->file_system = InitFileSystem();
+    editor->statistic_system = InitStatisticSystem();
 
     if (root_type == TYPE_FILE) {
-        OpenFileFromPath(&editor, path);
+        OpenFileFromPath(editor, path);
     } else if (root_type == TYPE_DIR) {
-        OpenDirectoryFromPath(&editor, path);
+        OpenDirectoryFromPath(editor, path);
     } else {
-        OpenEmptyBuffer(&editor);
+        OpenEmptyBuffer(editor);
     }
-
-    return editor;
 }
 
 void ClearEditor(Editor* editor) {
@@ -490,9 +487,22 @@ void SelectAllAction(Editor* editor) {
 
 void ToggleCommandModeAction(Editor* editor) {
     if (editor->input_system.current_mode == MODE_COMMAND) {
-        editor->input_system.current_mode = MODE_TEXT;
+        SetCommandMode(editor, false);
     } else {
+        SetCommandMode(editor, true);
+    }
+}
+
+void SetCommandMode(Editor* editor, bool is_command_mode) {
+    EditorMode before = editor->input_system.current_mode;
+    if (is_command_mode) {
         editor->input_system.current_mode = MODE_COMMAND;
+    } else {
+        editor->input_system.current_mode = MODE_TEXT;
+    }
+
+    if (before != editor->input_system.current_mode) {
+        InputSystemClearHeld(&editor->input_system);
     }
 }
 
@@ -718,15 +728,23 @@ void EditorHandleUpdate(Editor* editor) {
 
 void EditorHandleInput(Editor* editor) {
     if (ModalSystemHasActive(&editor->modal_system)) {
-        RawInput input = InputSystemPollRawInput();
+        Modal* top = GetTopModal(&editor->modal_system);
+        Modal* after;
+        ModalRepeatableFunc pred = (top && top->is_repeatable) ? top->is_repeatable : DefaultRawKeyIsRepeatable;
+        RawInput input = InputSystemPollRawInput(&editor->input_system, pred);
 
         while (input.key != 0) {
-            Modal* top = GetTopModal(&editor->modal_system);
+            top = GetTopModal(&editor->modal_system);
+            pred = (top && top->is_repeatable) ? top->is_repeatable : DefaultRawKeyIsRepeatable;
             if (top && top->custom_input) {
                 top->custom_input(top, input);
             }
-
-            input = InputSystemPollRawInput();
+            after = GetTopModal(&editor->modal_system);
+            if (top != after) {
+                InputSystemClearHeld(&editor->input_system);
+                pred = (after && after->is_repeatable) ? after->is_repeatable : DefaultRawKeyIsRepeatable;
+            }
+            input = InputSystemPollRawInput(&editor->input_system, pred);
         }
         return;
     }

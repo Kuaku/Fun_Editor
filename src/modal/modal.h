@@ -50,6 +50,7 @@ struct Modal {
     ModalUpdateFunc custom_update;
     ModalInputFunc custom_input;
     ModalCleanupFunc cleanup;
+    ModalRepeatableFunc is_repeatable;
 
     ModalResultCallback on_result;
     void* on_result_user_data;
@@ -87,7 +88,7 @@ void ModalAddLayout(Modal* modal, LayoutFunc layout);
 ModalSystem InitModalSystem(void);
 void ClearModalSystem(ModalSystem* system);
 
-Modal* CreateModal(ModalSystem* system, const char* title, Position wanted_size, ModalRenderFunc render, ModalUpdateFunc update, ModalInputFunc input, ModalCleanupFunc cleanup, void* state);
+Modal* CreateModal(ModalSystem* system, const char* title, Position wanted_size, ModalRenderFunc render, ModalUpdateFunc update, ModalInputFunc input, ModalCleanupFunc cleanup, ModalRepeatableFunc is_repeatable, void* state);
 void ClearModal(Modal* modal);
 
 void PushModal(ModalSystem* system, Modal* modal);

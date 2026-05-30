@@ -104,6 +104,7 @@ void RegisterBufferListModal(Editor* editor) {
         NULL,
         BufferListInput,
         BufferListCleanup,
+        NULL,
         state
     );
     modal->style.draw_title = true;

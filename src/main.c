@@ -37,6 +37,8 @@ int main(int argc, char** argv) {
         .mode_padding = (Position){10, 10},
         .command_padding = (Position){10, 10},
         .pointer_width = 2,
+        .key_repeat_delay = 400,
+        .key_repeat_interval = 30,
     };
     
     int idx = 0;
@@ -57,8 +59,8 @@ int main(int argc, char** argv) {
     if (argc >= 2) {
         path = strdup(argv[1]);
     }
-
-    Editor editor = CreateEditor(settings, path);
+    Editor editor;
+    CreateEditor(&editor, settings, path);
     RegisterBufferListModal(&editor);
     RegisterFileExplorerModal(&editor);
     RegisterStatisticsModal(&editor);

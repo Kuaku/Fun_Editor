@@ -563,6 +563,7 @@ void RegisterFileExplorerModal(Editor* editor) {
         FileExplorerUpdate,
         FileExplorerInput,
         FileExplorerCleanup,
+        NULL,
         state
     );
     modal->style.draw_title = true;

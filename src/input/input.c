@@ -121,7 +121,7 @@ void ClearAction(Action* action) {
     action->length = 0;
 }
 
-InputSystem InitInputSystem() {
+InputSystem InitInputSystem(size_t key_repeat_delay, size_t key_repeat_interval) {
     InputSystem sys = {0};
     sys.current_mode = MODE_TEXT;
 
@@ -134,6 +134,10 @@ InputSystem InitInputSystem() {
     memcpy(sys.bindings[MODE_COMMAND], default_command_bindings, sizeof(default_command_bindings));
 
     sys.command_system = InitCommandSystem();
+    sys.key_repeat_interval = key_repeat_interval;
+    sys.key_repeat_delay = key_repeat_delay;
+    sys.held_action.key = 0;
+    sys.held_raw.key = 0;
     return sys;
 }
 
@@ -200,23 +204,118 @@ Action InputSystemPoll(InputSystem* sys) {
     int key = GetKeyPressed();
     if (key != 0) {
         ActionType found = LookupBinding(sys, key, mods);
+        if (found != ACTION_NONE && ActionIsRepeatable(found)) {
+            sys->held_action.key = key;
+            sys->held_action.mods = mods;
+            sys->held_action.action = found;
+            sys->held_action.next_fire_time = (size_t)(GetTime() * 1000) + sys->key_repeat_delay;
+        } else {
+            sys->held_action.key = 0;
+        }
         action.type = found;
+        return action;
+    }
+
+    if (sys->held_action.key == 0) {
+        return action;
+    }
+
+    if (!IsKeyDown(sys->held_action.key) || sys->held_action.mods != mods) {
+        sys->held_action.key = 0;
+        return action;
+    }
+
+    if ((size_t)(GetTime() * 1000) >= sys->held_action.next_fire_time) {
+        sys->held_action.next_fire_time += sys->key_repeat_interval;
+        action.type = sys->held_action.action;
         return action;
     }
 
     return action;
 }
 
-RawInput InputSystemPollRawInput() {
+RawInput InputSystemPollRawInput(InputSystem* sys, ModalRepeatableFunc is_repeatable) {
     RawInput input = {0};
-    input.is_char = true;
-    input.modifiers = GetCurrentModifiers();
+    ModifierFlags mods = GetCurrentModifiers();
+    
     int ch = GetCharPressed();
     if (ch != 0) {
+        input.is_char = true;
+        input.modifiers = mods;
         input.key = ch;
         return input;
     }
-    input.is_char = false;
-    input.key = GetKeyPressed();
+
+    int key = GetKeyPressed();
+    if (key != 0) {
+        if (is_repeatable && is_repeatable(key)) {
+            sys->held_raw.key = key;
+            sys->held_raw.mods = mods;
+            sys->held_raw.is_char = false;
+            sys->held_raw.next_fire_time = (size_t)(GetTime() * 1000) + sys->key_repeat_delay;
+        } else {
+            sys->held_raw.key = 0;
+        }
+
+        input.is_char = false;
+        input.modifiers = mods;
+        input.key = key;
+        return input;
+    }
+
+
+    if (sys->held_raw.key == 0) return input;
+
+    if (!IsKeyDown(sys->held_raw.key) || sys->held_raw.mods != mods) {
+        sys->held_raw.key = 0;
+        return input;
+    }
+
+    if ((size_t)(GetTime() * 1000) >= sys->held_raw.next_fire_time) {
+        sys->held_raw.next_fire_time += sys->key_repeat_interval;
+        input.is_char = false;
+        input.modifiers = mods;
+        input.key = sys->held_raw.key;
+        return input;
+    }
     return input;
 }
+
+void InputSystemClearHeld(InputSystem* sys) {
+    sys->held_action = (HeldKey){0};
+    sys->held_raw   = (HeldKey){0};
+}
+
+static bool ActionIsRepeatable(ActionType type) {
+    switch (type) {
+        case ACTION_QUIT:
+        case ACTION_CANCEL:
+        case ACTION_SAVE:
+        case ACTION_EXECUTE_COMMAND:
+        case ACTION_OPEN_COMMAND_PALETTE:
+        case ACTION_OPEN_BUFFER_LIST:
+        case ACTION_OPEN_FILE:
+        case ACTION_OPEN_FILE_EXPLORER:
+        case ACTION_OPEN_STATISTICS:
+        case ACTION_GOTO:
+        case ACTION_SEARCH:
+            return false;
+        default:
+            return true;
+    }
+}
+
+bool DefaultRawKeyIsRepeatable(int key) {
+    switch (key) {
+        case KEY_UP:
+        case KEY_DOWN:
+        case KEY_LEFT:
+        case KEY_RIGHT:
+        case KEY_BACKSPACE:
+        case KEY_DELETE:
+            return true;
+        default:
+            return false;
+    }
+}
+

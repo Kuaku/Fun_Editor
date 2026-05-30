@@ -78,19 +78,36 @@ typedef struct {
 } RawInput;
 
 typedef struct {
+    int key;
+    ModifierFlags mods;
+    ActionType action;
+    size_t next_fire_time;
+    bool is_char;
+    int char_value;
+} HeldKey;
+
+typedef struct {
     EditorMode current_mode;
 
     KeyBinding* bindings[MODE_COUNT];
     size_t binding_counts[MODE_COUNT];
 
     CommandSystem command_system;
+
+    size_t key_repeat_delay;
+    size_t key_repeat_interval;
+
+    HeldKey held_action;
+    HeldKey held_raw;
 } InputSystem;
+
+typedef bool (*ModalRepeatableFunc)(int key);
 
 const char* ActionTypeToString(ActionType type);
 bool is_number(const char* str);
 void ClearAction(Action* action);
 
-InputSystem InitInputSystem(void);
+InputSystem InitInputSystem(size_t key_repeat_delay, size_t key_repeat_interval);
 void ClearInputSystem(InputSystem* system);
 
 ModifierFlags GetCurrentModifiers(void);
@@ -98,6 +115,10 @@ bool HasModifiers(ModifierFlags modifiers, ModifierFlags check);
 ActionType LookupBinding(InputSystem* sys, int key, ModifierFlags mods);
 
 Action InputSystemPoll(InputSystem* sys);
-RawInput InputSystemPollRawInput(void);
+RawInput InputSystemPollRawInput(InputSystem* sys, ModalRepeatableFunc is_repeatable);
+void InputSystemClearHeld(InputSystem* sys);
+
+static bool ActionIsRepeatable(ActionType type);
+bool DefaultRawKeyIsRepeatable(int key);
 
 #endif

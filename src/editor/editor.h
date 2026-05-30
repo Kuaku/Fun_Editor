@@ -37,6 +37,11 @@ typedef struct {
     size_t number_padding;
     size_t pointer_width;
     size_t font_size;
+
+    // Only for initial set
+    // TODO: Remember when implementing settings this is only initial
+    size_t key_repeat_delay;
+    size_t key_repeat_interval;
 } EditorSettings;
 
 struct Editor {
@@ -54,7 +59,7 @@ void ClearEditorState(EditorState* state);
 void ResizeTextBuffers(EditorState* state);
 size_t GetFreeTextBufferIndex(EditorState* state);
 
-Editor CreateEditor(EditorSettings settings, char* path);
+void CreateEditor(Editor* editor, EditorSettings settings, char* path);
 void ClearEditor(Editor* editor);
 
 TextBuffer* GetActiveBuffer(Editor* editor);
@@ -92,6 +97,7 @@ void SelectAllAction(Editor* editor);
 void PasteAction(Editor* editor);
 
 void ToggleCommandModeAction(Editor* editor);
+void SetCommandMode(Editor* editor, bool is_command_mode);
 
 bool SaveActiveTextBuffer(Editor* editor);
 void SaveAction(Editor* editor);

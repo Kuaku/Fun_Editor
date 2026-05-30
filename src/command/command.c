@@ -252,8 +252,8 @@ void EnterCommandModeWithCommand(Editor* editor, const char* command, size_t poi
     memset(system->command_buffer, 0, system->command_buffer_capacity);
     memcpy(system->command_buffer, command, command_length);
     system->pointer_position = pointer_position;
-
-    editor->input_system.current_mode = MODE_COMMAND;
+    
+    SetCommandMode(editor, true);
 }
 
 void GotoCommand(Editor* editor, CommandToken* tokens, size_t token_count) {
@@ -265,7 +265,7 @@ void GotoCommand(Editor* editor, CommandToken* tokens, size_t token_count) {
     if (line >= 0 && line < GetLineCount(buffer)) {
         buffer->pointer_position = GetLineByIndex(buffer, line).x;
         ResetCommandBuffer(&editor->input_system.command_system);
-        editor->input_system.current_mode = MODE_TEXT;
+        SetCommandMode(editor, false);
     }
 }
 
@@ -316,7 +316,7 @@ void OpenCommand(Editor* editor, CommandToken* tokens, size_t token_count) {
     }
     OpenFileFromPath(editor, tokens[0].char_value);
     ResetCommandBuffer(&editor->input_system.command_system);
-    editor->input_system.current_mode = MODE_TEXT;
+    SetCommandMode(editor, false);
 }
 
 void QuitCommando(Editor* editor, CommandToken* tokens, size_t token_count) {

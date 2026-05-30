@@ -94,7 +94,7 @@ void RegisterModalToQuickCatch(ModalSystem* system, const char* key, Modal* moda
     system->modal_keys[index] = strdup(key);
 }
 
-Modal* CreateModal(ModalSystem* system, const char* title, Position wanted_size, ModalRenderFunc render, ModalUpdateFunc update, ModalInputFunc input, ModalCleanupFunc cleanup, void* state) {
+Modal* CreateModal(ModalSystem* system, const char* title, Position wanted_size, ModalRenderFunc render, ModalUpdateFunc update, ModalInputFunc input, ModalCleanupFunc cleanup, ModalRepeatableFunc is_repeatable, void* state) {
     Modal* modal = calloc(1, sizeof(Modal));
     modal->title = strdup(title);
     modal->wanted_size = wanted_size;
@@ -104,6 +104,7 @@ Modal* CreateModal(ModalSystem* system, const char* title, Position wanted_size,
     modal->custom_update = update;
     modal->cleanup = cleanup;
     modal->state = state;
+    modal->is_repeatable = is_repeatable;
 
     return modal;
 }
