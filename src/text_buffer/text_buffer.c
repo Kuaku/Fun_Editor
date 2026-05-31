@@ -70,6 +70,7 @@ UndoStack InitUndoStack() {
     stack.capacity = INITIAL_UNDO_STACK_CAPACITY;
     stack.count = 0;
     stack.current = 0;
+    stack.saved_current = 0;
     return stack;
 }
 
@@ -98,6 +99,11 @@ void PushCommand(TextBuffer* buffer, EditType type, size_t position, const char*
         ClearEditEntry(&stack->entries[0]);
         memmove(stack->entries, stack->entries + 1, (stack->capacity - 1) * sizeof(EditEntry));
         stack->count--;
+        if (stack->saved_current == 0) {
+            stack->saved_current = SIZE_MAX;
+        } else {
+            stack->saved_current--;
+        }
     }
 
     EditEntry* entry = &stack->entries[stack->count];
@@ -640,4 +646,8 @@ bool IsWordChar(uint32_t c) {
 
 bool IsPunct(uint32_t c) {
     return c && !IsWordChar(c) && c != ' ' && c != '\t' && c != '\n';
+}
+
+bool IsBufferDirty(TextBuffer* buffer) {
+    return buffer->undo_stack.current != buffer->undo_stack.saved_current;
 }

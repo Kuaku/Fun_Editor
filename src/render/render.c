@@ -132,40 +132,55 @@ void EditorRenderBar(Editor* editor) {
 void EditorRenderStatusBar(Editor* editor) {
     int screen_height = GetScreenHeight();
     int screen_width = GetScreenWidth();
-    Position offset = (Position){editor->settings.command_padding.x, screen_height - editor->settings.command_padding.y - editor->settings.font_size};
-        
-    
 
     TextBuffer* buffer = GetActiveBuffer(editor);
     Position cursor = GetPointerCodePosition(buffer);
-
     int length = snprintf(NULL, 0, "%d | %d", cursor.x + 1, cursor.y + 1);
-    char* position_str = (char*)malloc(length + 1); 
+    char* position_str = (char*)malloc(length + 1);
     snprintf(position_str, length + 1, "%d | %d", cursor.x + 1, cursor.y + 1);
-
     Vector2 bounding_position_str = MeasureTextEx(editor->settings.editor_font, position_str, editor->settings.font_size, 1);
     DrawTextEx(editor->settings.editor_font, position_str, (Vector2){screen_width - editor->settings.command_padding.x - bounding_position_str.x, screen_height - editor->settings.command_padding.y - bounding_position_str.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);
-
     free(position_str);
 
     int right_bounding_width = bounding_position_str.x + 2 * editor->settings.command_padding.x;
-
     DrawRectangle(screen_width - right_bounding_width - 2, screen_height - editor->settings.command_padding.y - editor->settings.font_size, 2, editor->settings.font_size, editor->settings.scheme.command_color);
-
     right_bounding_width += 2;
 
-    BeginScissorMode(editor->settings.command_padding.x, screen_height - editor->settings.font_size - editor->settings.command_padding.y, screen_width - editor->settings.command_padding.x - right_bounding_width, editor->settings.font_size);
+    int text_x = editor->settings.command_padding.x;
+    int text_y = screen_height - editor->settings.font_size - editor->settings.command_padding.y;
+
+    int avail = (screen_width - right_bounding_width) - text_x;
 
     const char* full_path = buffer->file_path;
-    const char* label = "[untitled]";
-    if (full_path) {
-        label = full_path;
+    const char* label = full_path ? full_path : "[untitled]";
+    Vector2 label_bounding = MeasureTextEx(editor->settings.editor_font, label, editor->settings.font_size, 1);
+
+    int path_avail = avail;
+    Vector2 marker_size = {0};
+    bool dirty = IsBufferDirty(buffer);
+    if (dirty) {
+        marker_size = MeasureTextEx(editor->settings.editor_font, "\u25CF", editor->settings.font_size, 1);
+        path_avail -= (int)marker_size.x + editor->settings.command_padding.x;
+    }
+    if (path_avail < 0) path_avail = 0;
+
+    int scissor_w = min((int)label_bounding.x, path_avail);
+
+    int label_x = text_x;
+    if (label_bounding.x > scissor_w) {
+        label_x = text_x - ((int)label_bounding.x - scissor_w);
     }
 
-    Vector2 bounding_file_path = MeasureTextEx(editor->settings.editor_font, label, editor->settings.font_size, 1);
-    DrawTextEx(editor->settings.editor_font, label, (Vector2){editor->settings.command_padding.x, screen_height - editor->settings.font_size - editor->settings.command_padding.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);
-
+    BeginScissorMode(text_x, text_y, scissor_w, editor->settings.font_size);
+    DrawTextEx(editor->settings.editor_font, label, (Vector2){label_x, text_y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);
     EndScissorMode();
+
+    if (dirty) {
+        int marker_x = text_x + scissor_w + editor->settings.command_padding.x;
+        DrawTextEx(editor->settings.editor_font, "\u25CF",
+                   (Vector2){marker_x, text_y},
+                   editor->settings.font_size, 1, editor->settings.scheme.command_color);
+    }
 }
 
 void EditorRenderCommand(Editor* editor) {

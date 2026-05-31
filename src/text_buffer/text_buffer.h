@@ -35,6 +35,7 @@ typedef struct {
     size_t count;
     size_t capacity;
     size_t current;
+    size_t saved_current;
 } UndoStack;
 
 typedef struct {
@@ -118,5 +119,6 @@ void RevalidatePointerCache(TextBuffer* buffer);
 
 bool IsWordChar(uint32_t c);
 bool IsPunct(uint32_t c);
+bool IsBufferDirty(TextBuffer* buffer);
 
 #endif

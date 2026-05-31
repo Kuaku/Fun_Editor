@@ -544,6 +544,8 @@ bool SaveActiveTextBuffer(Editor* editor) {
             return false;
         }
     #endif
+
+    active_buffer->undo_stack.saved_current = active_buffer->undo_stack.current;
     return true;
 }
 
