@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -I./include -I./src -Wall -std=c99
+CFLAGS = -I./include -I./src -Wall -std=c99 -MMD -MP
 BUILDDIR = build
 
 SRC = src/main.c \
@@ -16,9 +16,14 @@ SRC = src/main.c \
       src/modal/modals/file_explorer.c \
       src/editor/editor.c \
       src/render/render.c \
+      src/render/render_queue.c \
+      src/render/render_system.c \
+      src/render/tree.c \
+      src/render/raylib_wrapper.c \
       src/utils/utf8.c
 
 OBJ = $(patsubst src/%.c,$(BUILDDIR)/%.o,$(SRC))
+DEP = $(OBJ:.o=.d)
 
 ifeq ($(OS),Windows_NT)
     OUT = main.exe
@@ -40,6 +45,8 @@ $(OUT): $(OBJ)
 $(BUILDDIR)/%.o: src/%.c
 	$(call MKDIR,$(dir $@))
 	$(CC) $(CFLAGS) -c $< -o $@
+
+-include $(DEP)
 
 clean:
 	$(RM)

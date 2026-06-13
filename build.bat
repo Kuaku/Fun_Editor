@@ -19,6 +19,10 @@ set SRC=^
  src\modal\modals\file_explorer.c^
  src\editor\editor.c^
  src\render\render.c^
+ src\render\render_queue.c^
+ src\render\render_system.c^
+ src\render\tree.c^
+ src\render\raylib_wrapper.c^
  src\utils\utf8.c
 
 %CC% %CFLAGS% %SRC% libraylib.a -o main.exe %LDFLAGS%

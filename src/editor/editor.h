@@ -7,6 +7,7 @@
 #include "../modal/modal.h"
 #include "../filesystem/filesystem.h"
 #include "../statistics/statistics.h"
+#include "../render/render_system.h"
 
 typedef struct {
     char* root_dir;
@@ -20,12 +21,14 @@ typedef struct {
 } EditorState;
 
 typedef struct {
-    Color background_color;
-    Color mode_color;
+    RenderColor background_color;
+    RenderColor mode_color;
     Color text_color;
     Color command_color;
     Color line_number_color;
     Color command_background_color;
+    RenderColor selection_background_color;
+    RenderColor selection_foreground_color;
 } ColorScheme;
 
 typedef struct {
@@ -37,6 +40,8 @@ typedef struct {
     size_t number_padding;
     size_t pointer_width;
     size_t font_size;
+    char* font_path;
+    int font_loading_size;
 
     // Only for initial set
     // TODO: Remember when implementing settings this is only initial
@@ -51,6 +56,7 @@ struct Editor {
     ModalSystem modal_system;
     FileSystem file_system;
     StatisticSystem statistic_system;
+    RenderSystem render_system;
 };
 
 EditorState InitEditorState(size_t capacity);

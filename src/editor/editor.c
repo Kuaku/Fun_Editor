@@ -3,6 +3,7 @@
 #include "./modal/modals/buffer_list.h"
 #include "./modal/modals/file_explorer.h"
 #include "./modal/modals/statistics_modal.h"
+#include "../render/raylib_wrapper.h"
 
 EditorState InitEditorState(size_t capacity) {
     EditorState state = {0};
@@ -59,6 +60,9 @@ void CreateEditor(Editor* editor, EditorSettings settings, char* path) {
         root_type = GetFileTypeFromPath(path);
     }
 
+    RenderWrapper raylib_wrapper = CreateRaylibRenderWrapper(settings.font_path, settings.font_loading_size);
+
+    editor->render_system = InitRenderSystem(raylib_wrapper);
     editor->input_system = InitInputSystem(settings.key_repeat_delay, settings.key_repeat_interval);
     editor->modal_system = InitModalSystem();
     editor->file_system = InitFileSystem();
@@ -78,6 +82,7 @@ void ClearEditor(Editor* editor) {
 
     ClearEditorState(&editor->state);
     ClearEditorSettings(&editor->settings);
+    ClearRenderSystem(&editor->render_system);
     ClearInputSystem(&editor->input_system);
     ClearModalSystem(&editor->modal_system);
     ClearFileSystem(&editor->file_system);

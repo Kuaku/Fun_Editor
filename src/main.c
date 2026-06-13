@@ -21,17 +21,19 @@ int main(int argc, char** argv) {
     SetupWindow();
 
     ColorScheme scheme = {
-        .background_color = (Color){32, 35, 41, 255},
-        .mode_color = WHITE,
+        .background_color = (RenderColor){32, 35, 41, 255},
+        .mode_color = (RenderColor){255, 255, 255, 255},
         .text_color = WHITE,
         .command_color = WHITE,
         .command_background_color = (Color){50, 54, 61, 255},
-        .line_number_color = YELLOW
+        .line_number_color = YELLOW,
+        .selection_background_color = (RenderColor){255, 255, 255, 255},
+        .selection_foreground_color = (RenderColor){32, 35, 41, 255}
     };
 
     EditorSettings settings = {
         .scheme = scheme,
-        .font_size = 25,
+        .font_size = 30,
         .number_padding = 10,
         .pointer_padding = (Position){3, 3},
         .mode_padding = (Position){10, 10},
@@ -39,6 +41,8 @@ int main(int argc, char** argv) {
         .pointer_width = 2,
         .key_repeat_delay = 400,
         .key_repeat_interval = 30,
+        .font_loading_size = 30,
+        .font_path = "NotoSansJP-Regular.ttf"
     };
     
     int idx = 0;
