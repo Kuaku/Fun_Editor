@@ -94,7 +94,7 @@ void RegisterModalToQuickCatch(ModalSystem* system, const char* key, Modal* moda
     system->modal_keys[index] = strdup(key);
 }
 
-Modal* CreateModal(ModalSystem* system, const char* title, Position wanted_size, ModalRenderFunc render, ModalUpdateFunc update, ModalInputFunc input, ModalCleanupFunc cleanup, ModalRepeatableFunc is_repeatable, void* state) {
+Modal* CreateModal(ModalSystem* system, const char* title, Position wanted_size, RenderFunc render, ModalUpdateFunc update, ModalInputFunc input, ModalCleanupFunc cleanup, ModalRepeatableFunc is_repeatable, void* state) {
     Modal* modal = calloc(1, sizeof(Modal));
     modal->title = strdup(title);
     modal->wanted_size = wanted_size;
@@ -179,38 +179,44 @@ void ClearModalSystem(ModalSystem* system) {
     free(system->modal_keys);
 }
 
-void ModalSystemRender(Editor* editor) {
-    ModalSystem* system = &editor->modal_system;
-    if (system->stack_count == 0) return;
-    int sw = GetScreenWidth();
-    int sh = GetScreenHeight();
-
-    DrawRectangle(0, 0, sw, sh, (Color){0, 0, 0, 120});
-
-    Modal* active_modal = GetTopModal(system);
-
-    for (size_t i = 0; i < active_modal->layout_count; i++) {
-        active_modal->layouts[i](active_modal);
+void ModalResolveBounds(Modal* modal) {
+    for (size_t i = 0; i < modal->layout_count; i++) {
+        modal->layouts[i](modal);
     }
+}
 
-    Rect bounding = active_modal->bounds;
+void ModalRenderBackdrop(Editor* editor, RenderNode* self) {
+    PushRect(&editor->render_system.render_queue, self->inner_bounds, (RenderColor){0, 0, 0, 120});
+}
 
-    BeginScissorMode(BREAK_DOWN_RECT(bounding));
-
-    DrawRectangle(BREAK_DOWN_RECT(bounding), active_modal->style.background);
-
+void ModalGeneralRender(Editor* editor, RenderNode* self) {
+    Modal* active_modal = (Modal*)self->user_data;
+    PushScissor(&editor->render_system.render_queue, self->inner_bounds);
+    PushRect(&editor->render_system.render_queue, self->inner_bounds, (RenderColor){active_modal->style.background.r, active_modal->style.background.g, active_modal->style.background.b, active_modal->style.background.a});
+    
     if (active_modal->style.draw_title) {
         int title_height = active_modal->style.title_height + active_modal->style.title_padding.y * 2;
 
-        DrawTextEx(editor->settings.editor_font, active_modal->title, (Vector2){bounding.position.x + active_modal->style.title_padding.x, bounding.position.y + active_modal->style.title_padding.y}, active_modal->style.title_height, 1, active_modal->style.text);
-
-        bounding.position.y += title_height;
-        bounding.size.y -= title_height;
+        PushText(&editor->render_system.render_queue, active_modal->title, (Position){self->inner_bounds.position.x + active_modal->style.title_padding.x, self->inner_bounds.position.y + active_modal->style.title_padding.y}, active_modal->style.title_height, 1, (RenderColor){active_modal->style.text.r, active_modal->style.text.g, active_modal->style.text.b, active_modal->style.text.a});
+        self->inner_bounds.position.y += title_height;
+        self->inner_bounds.size.y -= title_height;
     }
 
     if (active_modal->custom_render) {
-        active_modal->custom_render(active_modal, bounding);
+        active_modal->custom_render(editor, self);
     }
+    PushScissorPop(&editor->render_system.render_queue);
+}
 
-    EndScissorMode();
+void ModalSystemAddNodes(Editor* editor) {
+    ModalSystem* system = &editor->modal_system;
+    if (system->stack_count == 0) return;
+
+    NodeHandle backdrop = VNODE(&editor->render_system, .horizontal_axis_type = AXIS_FIXED, .vertical_axis_type = AXIS_FIXED, .position_type = POSITION_FIXED, .fixed_size = (Position){editor->render_system.render_wrapper.get_screen_width(&editor->render_system.render_wrapper), editor->render_system.render_wrapper.get_screen_height(&editor->render_system.render_wrapper)}, .fixed_position = {0, 0}, .custom_render = ModalRenderBackdrop, .z_index = 5);
+
+    Modal* active_modal = GetTopModal(system);
+    ModalResolveBounds(active_modal);
+    NodeHandle active_modal_node = NODE(&editor->render_system, .horizontal_axis_type = AXIS_FIXED, .vertical_axis_type = AXIS_FIXED, .position_type = POSITION_FIXED, .fixed_size = active_modal->bounds.size, .fixed_position = active_modal->bounds.position, .custom_render = ModalGeneralRender, .user_data = active_modal);
+
+    AppendChild(&editor->render_system.tree_holder, backdrop, active_modal_node);
 }

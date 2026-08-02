@@ -97,13 +97,6 @@ bool ShouldEditorClose(Editor* editor) {
     return editor->state.exit_requested;
 }
 
-Rect GetEditorTextFieldSize(Editor* editor) {
-    return (Rect){
-        .position = (Position){0, editor->settings.mode_padding.x * 2 + editor->settings.font_size},
-        .size = (Position){GetScreenWidth() - 40, GetScreenHeight() - (editor->settings.mode_padding.y * 2 + editor->settings.font_size * 2 + editor->settings.command_padding.y * 2)}
-    };
-}
-
 void OpenEmptyBuffer(Editor* editor) {
     EditorState* state = &editor->state;
     size_t index = GetFreeTextBufferIndex(state);

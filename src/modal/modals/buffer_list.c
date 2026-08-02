@@ -1,14 +1,15 @@
 #include "buffer_list.h"
 #include "../../editor/editor.h"
 
-void BufferListRender(Modal* modal, Rect content) {
+void BufferListRender(Editor* editor, RenderNode* self) {
+    Modal* modal = (Modal*)self->user_data;
+    Rect content = self->inner_bounds;
     BufferListState* state = (BufferListState*)modal->state;
-    Editor* editor = state->editor;
     EditorState* es = &editor->state;
     Font font = editor->settings.editor_font;
     int font_size = editor->settings.font_size;
     int row_height = font_size + modal->style.widget_spacing;
-    size_t visible_rows = content.size.y / row_height;
+    size_t visible_rows = self->inner_bounds.size.y / row_height;
 
     if (state->selected_index < state->scroll_offset) {
         state->scroll_offset = state->selected_index;
@@ -16,14 +17,14 @@ void BufferListRender(Modal* modal, Rect content) {
     if (state->selected_index >= state->scroll_offset + visible_rows) {
         state->scroll_offset = state->selected_index - visible_rows + 1;
     }
-    BeginScissorMode(content.position.x, content.position.y,
-                     content.size.x, content.size.y);
+
+    PushScissor(&editor->render_system.render_queue, self->inner_bounds);
 
     for (size_t i = state->scroll_offset; i < es->text_buffers_count; i++) {
         size_t display_i = i - state->scroll_offset;
         if (display_i >= visible_rows) break;
 
-        int y = content.position.y + display_i * row_height;
+        int y = self->inner_bounds.position.y + display_i * row_height;
 
         const char* full_path = es->text_buffers[i].file_path;
         const char* label = "[untitled]";
@@ -40,14 +41,9 @@ void BufferListRender(Modal* modal, Rect content) {
         if ((int)i == es->open_text_buffer_index) {
             text_color = modal->style.focused_border;
         }
-
-        DrawTextEx(font, TextFormat("%s%s", prefix, label),
-                   (Vector2){content.position.x + 4,
-                             y + modal->style.widget_spacing / 2},
-                   font_size, 1, text_color);
+        PushText(&editor->render_system.render_queue, TextFormat("%s%s", prefix, label), (Position){self->inner_bounds.position.x + 4, y + modal->style.widget_spacing / 2}, font_size, 1, (RenderColor){text_color.r, text_color.g, text_color.b, text_color.a});
     }
-
-    EndScissorMode();
+    PushScissorPop(&editor->render_system.render_queue);
 }
 
 void BufferListInput(Modal* modal, RawInput input) {

@@ -12,7 +12,7 @@ typedef struct {
     size_t codepoint_count;
 } StringInputState;
 
-void StringInputRender(Modal* modal, Rect content);
+void StringInputRender(Editor* editor, RenderNode* self);
 void StringInputInput(Modal* modal, RawInput input);
 void StringInputCleanup(void* raw_state);
 

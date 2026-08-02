@@ -82,7 +82,28 @@ void PushRect(RenderQueue* queue, Rect rect, RenderColor color) {
     RenderCommand command = {
         .type = RENDER_RECT,
         .as.rect.color = color,
-        .as.rect.rect = rect
+        .as.rect.rect = rect,
+    };
+    AppendRenderCommand(queue, command);
+}
+
+void PushRectLines(RenderQueue* queue, Rect rect, RenderColor color, int thickness) {
+    RenderCommand command = {
+        .type = RENDER_RECT_LINES,
+        .as.rect_lines.color = color,
+        .as.rect_lines.rect = rect,
+        .as.rect_lines.thickness = thickness
+    };
+    AppendRenderCommand(queue, command);
+}
+
+void PushLine(RenderQueue* queue, Position start, Position end, int thickness, RenderColor color) {
+    RenderCommand command = {
+        .type = RENDER_LINE,
+        .as.line.start = start,
+        .as.line.end = end,
+        .as.line.thickness = thickness,
+        .as.line.color = color
     };
     AppendRenderCommand(queue, command);
 }

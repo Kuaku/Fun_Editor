@@ -2,38 +2,29 @@
 #include "../../editor/editor.h"
 #include "../../utils/utf8.h"
 
-void StringInputRender(Modal* modal, Rect content) {
+void StringInputRender(Editor* editor, RenderNode* self) {
+    Modal* modal = (Modal*)self->user_data;
     StringInputState* state = (StringInputState*)modal->state;
-    Editor* editor = state->editor;
     Font font = editor->settings.editor_font;
     int font_size = editor->settings.font_size;
     int pad = modal->style.content_padding.x;
 
-    BeginScissorMode(content.position.x, content.position.y,
-                     content.size.x, content.size.y);
+    PushScissor(&editor->render_system.render_queue, self->inner_bounds);
 
     int input_height = font_size + 12;
-    int input_y = content.position.y + (content.size.y - input_height) / 2;
-    int input_x = content.position.x + pad;
-    int input_w = content.size.x - pad * 2;
+    int input_y = self->inner_bounds.position.y + (self->inner_bounds.size.y - input_height) / 2;
+    int input_x = self->inner_bounds.position.x + pad;
+    int input_w = self->inner_bounds.size.x - pad * 2;
 
-    DrawRectangle(input_x, input_y, input_w, input_height,
-                  modal->style.input_background);
-    DrawRectangleLinesEx(
-        (Rectangle){input_x, input_y, input_w, input_height},
-        modal->style.border_width,
-        modal->style.focused_border
-    );
+    PushRect(&editor->render_system.render_queue, (Rect){{input_x, input_y}, {input_w, input_height}}, (RenderColor){modal->style.input_background.r, modal->style.input_background.g, modal->style.input_background.b, modal->style.input_background.a});
+    PushRectLines(&editor->render_system.render_queue, (Rect){{input_x, input_y}, {input_w, input_height}}, (RenderColor){modal->style.focused_border.r, modal->style.focused_border.g, modal->style.focused_border.b, modal->style.focused_border.a}, modal->style.border_width);
 
     int text_x = input_x + 6;
     int text_y = input_y + 6;
 
-    // Prefix: drawn muted, not editable, just shifts where the buffer starts.
     if (state->prefix) {
-        Vector2 prefix_size = MeasureTextEx(font, state->prefix, font_size, 1);
-        DrawTextEx(font, state->prefix,
-                   (Vector2){text_x, text_y},
-                   font_size, 1, modal->style.text_muted);
+        Position prefix_size = editor->render_system.render_wrapper.measure_text(&editor->render_system.render_wrapper, state->prefix, font_size, 1);
+        PushText(&editor->render_system.render_queue, state->prefix, (Position){text_x, text_y}, font_size, 1, (RenderColor){modal->style.text_muted.r, modal->style.text_muted.g, modal->style.text_muted.b, modal->style.text_muted.a});
         text_x += (int)prefix_size.x;
     }
 
@@ -41,15 +32,12 @@ void StringInputRender(Modal* modal, Rect content) {
     size_t cursor_byte = utf8_codepoint_to_offset(state->buffer, state->cursor);
     strncpy(before_cursor, state->buffer, cursor_byte);
     before_cursor[cursor_byte] = '\0';
-    Vector2 before_size = MeasureTextEx(font, before_cursor, font_size, 1);
+    Position before_size = editor->render_system.render_wrapper.measure_text(&editor->render_system.render_wrapper, before_cursor, font_size, 1);
 
-    DrawTextEx(font, state->buffer,
-               (Vector2){text_x, text_y},
-               font_size, 1, modal->style.text);
-    DrawRectangle(text_x + (int)before_size.x, text_y,
-                  2, font_size, modal->style.text);
+    PushText(&editor->render_system.render_queue, state->buffer, (Position){text_x, text_y}, font_size, 1, (RenderColor){modal->style.text.r, modal->style.text.g, modal->style.text.b, modal->style.text.a});
+    PushRect(&editor->render_system.render_queue, (Rect){{text_x + (int)before_size.x, text_y}, {2, font_size}}, (RenderColor){modal->style.text.r, modal->style.text.g, modal->style.text.b, modal->style.text.a});
 
-    EndScissorMode();
+    PushScissorPop(&editor->render_system.render_queue);
 }
 
 void StringInputInput(Modal* modal, RawInput input) {

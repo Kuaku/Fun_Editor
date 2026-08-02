@@ -19,6 +19,8 @@ typedef struct {
 typedef enum {
     RENDER_TEXT,
     RENDER_RECT,
+    RENDER_RECT_LINES,
+    RENDER_LINE,
     RENDER_CUT_PUSH,
     RENDER_CUT_POP
 } RenderCommandType;
@@ -38,14 +40,29 @@ typedef struct {
 
 typedef struct {
     Rect rect;
+    RenderColor color;
+    int thickness;
+} RectLinesCommand;
+
+typedef struct {
+    Rect rect;
 } ScissorPushCommand;
+
+typedef struct {
+    Position start;
+    Position end;
+    int thickness;
+    RenderColor color;
+} LineCommand;
 
 typedef struct {
     RenderCommandType type;
     union {
         TextCommand text;
         RectCommand rect;
+        RectLinesCommand rect_lines;
         ScissorPushCommand scissor_push;
+        LineCommand line;
     } as;
 } RenderCommand;
 
@@ -69,6 +86,8 @@ void ResetRenderQueue(RenderQueue* queue);
 
 void PushText(RenderQueue* queue, const char* s, Position pos, float font_size, float spacing, RenderColor color);
 void PushRect(RenderQueue* queue, Rect rect, RenderColor color);
+void PushRectLines(RenderQueue* queue, Rect rect, RenderColor color, int thickness);
+void PushLine(RenderQueue* queue, Position start, Position end, int thickness, RenderColor color);
 void PushScissor(RenderQueue* queue, Rect rect);
 void PushScissorPop(RenderQueue* queue);
 

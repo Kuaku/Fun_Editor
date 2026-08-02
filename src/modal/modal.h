@@ -3,11 +3,11 @@
 
 #include "../common.h"
 #include "../input/input.h"
+#include "../render/tree.h"
 
 typedef struct Modal Modal;
 
 typedef void (*LayoutFunc)(Modal* modal);
-typedef void (*ModalRenderFunc)(Modal* modal, Rect content_bounds);
 typedef void (*ModalInputFunc)(Modal* modal, RawInput input);
 typedef void (*ModalCleanupFunc)(void* state);
 typedef void (*ModalResultCallback)(Modal* modal, bool confirmed, void* result, void* user_data);
@@ -46,7 +46,7 @@ struct Modal {
 
     bool is_cached;
 
-    ModalRenderFunc custom_render;
+    RenderFunc custom_render;
     ModalUpdateFunc custom_update;
     ModalInputFunc custom_input;
     ModalCleanupFunc cleanup;
@@ -88,7 +88,7 @@ void ModalAddLayout(Modal* modal, LayoutFunc layout);
 ModalSystem InitModalSystem(void);
 void ClearModalSystem(ModalSystem* system);
 
-Modal* CreateModal(ModalSystem* system, const char* title, Position wanted_size, ModalRenderFunc render, ModalUpdateFunc update, ModalInputFunc input, ModalCleanupFunc cleanup, ModalRepeatableFunc is_repeatable, void* state);
+Modal* CreateModal(ModalSystem* system, const char* title, Position wanted_size, RenderFunc render, ModalUpdateFunc update, ModalInputFunc input, ModalCleanupFunc cleanup, ModalRepeatableFunc is_repeatable, void* state);
 void ClearModal(Modal* modal);
 
 void PushModal(ModalSystem* system, Modal* modal);
@@ -99,6 +99,6 @@ void PushModalFromCache(ModalSystem* system, const char* key);
 void RegisterModalToQuickCatch(ModalSystem* system, const char* key, Modal* modal);
 
 bool ModalSystemHasActive(ModalSystem* system);
-void ModalSystemRender(Editor* editor);
+void ModalSystemAddNodes(Editor* editor);
 
 #endif

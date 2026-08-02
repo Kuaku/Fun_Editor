@@ -1,224 +1,98 @@
-# Editor TODO
+# Editor — TODO
+
+Status legend: ✅ done · 🟡 partial · ⬜ not started
 
 ---
 
 ## Bug Fixes
 
-**B.1. Fix MovePointerRight off-by-one**
-Pointer can move one past end of buffer.
-Dependencies: -
-
-**B.2. Fix GotoCommand size_t underflow**
-`goto 0` wraps to SIZE_MAX due to unsigned arithmetic.
-Dependencies: -
-
-**B.3. Fix FindCommand off-by-one and underflow**
-Last match position never checked, potential size_t underflow when `line_length < search_length`.
-Dependencies: -
-
-**B.4. Implement missing bound actions**
-`ACTION_SELECT_ALL` and `ACTION_DELETE_FORWARD` are bound but never dispatched in `DispatchInputTextMode`.
-Dependencies: -
-
-**B.5. Fix PushModalFromCache missing break**
-Duplicate key pushes the same modal multiple times onto the stack.
-Dependencies: -
+| ID  | Status | Item | Notes | Deps |
+|-----|--------|------|-------|------|
+| B.1 | ✅ | `MovePointerRight` off-by-one | Now guards `pointer_position < text_buffer_size` before advancing. | — |
+| B.2 | ✅ | `GotoCommand` `size_t` underflow | `goto 0` returns early via the `numb_value == 0` check. | — |
+| B.3 | ✅ | `FindCommand` off-by-one & underflow | Loop bound is now inclusive (`j <= line_length - search_length`) and `line_length < search_length` is guarded. | — |
+| B.4 | ✅ | Missing bound actions dispatched | `ACTION_SELECT_ALL` and `ACTION_DELETE_FORWARD` are now handled in `DispatchInputTextMode`. | — |
+| B.5 | ✅ | `PushModalFromCache` missing break | Returns after the first matching key; no duplicate pushes. | — |
 
 ---
 
 ## Performance
 
-**P.1. Bulk delete in piece table**
-`ExecuteDelete` is O(n²) — calls malloc+memcpy per character. Needs a single split operation for range deletes.
-Dependencies: -
-
-**P.2. Wire line cache into IndexToPosition and GenerateLine**
-Both have TODO comments and iterate all pieces on every call. Every rendered frame pays this cost.
-Dependencies: -
-
-**P.3. Cache GetTextSize**
-Called in tight loops, walks all pieces every time. Should be a maintained counter updated on insert/delete.
-Dependencies: -
-
-**P.4. Fix UndoStack ring buffer**
-Current eviction uses memmove which is O(n). Should be a proper circular buffer with head/tail indices. Also `stack->current` is not adjusted after eviction.
-Dependencies: -
+| ID  | Status | Item | Notes | Deps |
+|-----|--------|------|-------|------|
+| P.1 | ⬜ | Bulk delete in piece table | `ExecuteDelete` still does a per-range rebuild; range deletes should be a single split. | — |
+| P.2 | ⬜ | Wire line cache into `IndexToPosition` / `GenerateLine` | Both still iterate all pieces on every call; cost is paid every rendered frame. | — |
+| P.3 | ⬜ | Cache `GetTextSize` | Walks all pieces every call; should be a maintained counter updated on insert/delete. | — |
+| P.4 | ⬜ | Fix `UndoStack` ring buffer | Eviction uses O(n) `memmove`; needs a real circular buffer with head/tail, and `stack->current` must be adjusted on eviction. | — |
 
 ---
 
 ## Features
 
-**F.1. External hotkey mapping**
-It is possible to define hotkeys and their bound actions outside of the editor in a config file.
-Dependencies: -
-
-**F.2. Hot reloading hotkey mapping**
-It is possible to reload the externally defined hotkeys without restarting the editor.
-Dependencies: F.1
-
-**F.3. Action auto repeat on hold**
-When an action key is held it repeats with a configurable attack delay and repeat interval. Characters already repeat at the OS level but movement and delete keys do not.
-Dependencies: -
-
-**F.4. Saving** ✅ (partial)
-`ACTION_SAVE` (Ctrl+S) writes the active buffer to disk. `ACTION_SAVE_AS` (Ctrl+Shift+S) prompts for a path if none is set. Uses atomic write (temp file + rename) to avoid corruption on crash.
-`ACTION_SAVE` with atomic write implemented. `ACTION_SAVE_AS` not yet added.
-Dependencies: -
-
-**F.5. Syntax highlighting**
-Tokens of program files are rendered in distinct colors based on their type. Requires integration of an external tokenizer library such as Tree-sitter.
-Dependencies: Tree-sitter or equivalent tokenizer library
-
-**F.6. LSP infrastructure**
-Process management and JSON-RPC transport layer that error highlighting, autocompletion, hover docs and go-to-definition can build on. Separate from any specific LSP feature.
-Dependencies: -
-
-**F.7. LSP error highlighting**
-Errors and warnings reported by a connected LSP are underlined or highlighted in the editor.
-Dependencies: F.6
-
-**F.8. Autocompletion**
-While typing, a popup shows completion candidates that can be confirmed with a key. Driven by LSP or a simple word-index fallback.
-Dependencies: F.6
-
-**F.9. Simple settings**
-A settings modal for at minimum color scheme selection and hotkey display.
-Dependencies: -
-
-**F.10. Plugin system**
-A defined API that allows external code to hook into editor events and extend behaviour without modifying the core.
-Dependencies: -
-
-**F.11. Find and replace**
-Extend the existing find command with a replace operation, including replace-all.
-Dependencies: -
-
-**F.12. Split view**
-Show two buffers side by side or stacked top/bottom.
-Dependencies: -
-
-**F.13. Auto indent**
-When inserting a newline, match the indentation level of the previous line.
-Dependencies: -
-
-**F.14. Bracket and quote matching**
-Highlight the matching bracket/paren/brace when the cursor is adjacent to one. Auto-close on insert.
-Dependencies: -
-
-**F.15. Status bar**
-A persistent bottom bar showing file path, cursor position (line:col), dirty indicator, file encoding and current mode.
-Dependencies: F.4 (dirty flag)
-
-**F.16. Recent files list**
-Track recently opened files, accessible from the command palette or a dedicated modal.
-Dependencies: -
-
-**F.17. Word wrap**
-Optionally wrap long lines at the viewport edge instead of scrolling horizontally.
-Dependencies: P.2
-
-**F.18. Configurable tab width and indent style**
-Tab width and spaces-vs-tabs behaviour are currently hardcoded to 2 spaces.
-Dependencies: F.9
-
-**F.19. UTF-8 support**
-The editor currently treats text as raw bytes. Multibyte characters are not handled correctly for cursor movement, rendering or line length calculations.
-Dependencies: -
-
-**F.20. Line ending preservation**
-CRLF line endings are stripped on load and always saved as LF. The original line ending style should be detected and preserved on save.
-Dependencies: F.4
-
-**F.21. Large file handling**
-Loading a very large file into a single `org_buffer` is slow and memory heavy. A lazy or chunked read strategy is needed.
-Dependencies: P.1, P.2
-
-**F.22. Scrollbar**
-A visual scroll indicator for vertical position and, where applicable, horizontal scroll.
-Dependencies: -
-
-**F.23. Bookmarks and jump list**
-Mark positions in files and jump back and forward through the edit position history.
-Dependencies: -
-
-**F.24. LSP hover documentation**
-Show a type signature or documentation popup for the symbol under the cursor, via keybind.
-Dependencies: F.6
-
-**F.25. LSP go to definition and references**
-Jump to the definition of a symbol or list all its references.
-Dependencies: F.6
-
-**F.26. Git gutter indicators**
-Show a colored bar in the line number margin indicating lines that are added (green), modified (yellow) or deleted (red) compared to the last commit.
-Dependencies: -
-
-**F.27. Current branch display**
-Show the active branch name in the status bar alongside cursor position and file info.
-Dependencies: F.15
-
-**F.28. File status in file explorer**
-Color or annotate filenames in the file explorer based on their git status — untracked, modified, staged, ignored.
-Dependencies: -
-
-**F.29. Stage and unstage file**
-Stage or unstage the entire current file via a keybind.
-Dependencies: -
-
-**F.30. Commit modal**
-A modal to stage/unstage individual changed files from a list, write a commit message and confirm the commit. Shows all modified, staged and untracked files so you have a full picture before committing.
-Dependencies: F.29
-
-**F.31. Commit history modal**
-A modal listing recent commits on the current branch with message, author and date. Selecting a commit shows its full diff in a nested view.
-Dependencies: -
-
-**F.32. Branch switcher**
-A modal to list local branches and switch between them.
-Dependencies: -
-
-**F.33. Create and delete branch**
-Create a new branch or delete an existing one from within the editor.
-Dependencies: F.32
-
-**F.34. Push and pull**
-Push or pull the current branch via a keybind, with stdout/stderr output shown in a result modal.
-Dependencies: -
+| ID   | Status | Item | Notes | Deps |
+|------|--------|------|-------|------|
+| F.1  | ⬜ | External hotkey mapping | Define hotkeys + bound actions in a config file. | — |
+| F.2  | ⬜ | Hot reload hotkey mapping | Reload external hotkeys without restarting. | F.1 |
+| F.3  | ✅ | Action auto-repeat on hold | Held action keys repeat with a configurable attack delay and interval (`held_action` in `InputSystemPoll`). | — |
+| F.4  | 🟡 | Saving | `ACTION_SAVE` (Ctrl+S) writes the active buffer with atomic temp-file + rename. `ACTION_SAVE_AS` (Ctrl+Shift+S, prompt for path) not yet added. | — |
+| F.5  | ⬜ | Syntax highlighting | Color tokens by type; needs an external tokenizer (Tree-sitter or equivalent). | Tokenizer lib |
+| F.6  | ⬜ | LSP infrastructure | Process management + JSON-RPC transport, independent of any specific LSP feature. | — |
+| F.7  | ⬜ | LSP error highlighting | Underline/highlight diagnostics from a connected LSP. | F.6 |
+| F.8  | ⬜ | Autocompletion | Completion popup confirmed with a key; LSP-driven or word-index fallback. | F.6 |
+| F.9  | ⬜ | Simple settings | Settings modal for color scheme and hotkey display. | — |
+| F.10 | ⬜ | Plugin system | Public API for hooking editor events without touching core. | — |
+| F.11 | ⬜ | Find and replace | Extend `find` with replace and replace-all. | — |
+| F.12 | ⬜ | Split view | Two buffers side-by-side or stacked. | — |
+| F.13 | ⬜ | Auto indent | Match previous line's indentation on newline. | — |
+| F.14 | ⬜ | Bracket & quote matching | Highlight the matching bracket near the cursor; auto-close on insert. | — |
+| F.15 | 🟡 | Status bar | A bottom bar already shows file path + cursor position (line:col) and mode. Still missing: dirty indicator and file encoding. | F.4 (dirty flag) |
+| F.16 | ⬜ | Recent files list | Track recent files, reachable from palette or a modal. | — |
+| F.17 | ⬜ | Word wrap | Wrap long lines at the viewport edge. | P.2 |
+| F.18 | ⬜ | Configurable tab width / indent style | Currently hardcoded to 2 spaces. | F.9 |
+| F.19 | 🟡 | UTF-8 support | UTF-8 cursor movement, continuation handling, and codepoint-aware positions are implemented across `text_buffer`, `command`, and the modals via `utf8.*`. Verify rendering and line-length edge cases before calling this fully done. | — |
+| F.20 | ⬜ | Line ending preservation | CRLF is stripped on load and always saved as LF; detect and preserve original style. | F.4 |
+| F.21 | ⬜ | Large file handling | Lazy/chunked read instead of one big `org_buffer`. | P.1, P.2 |
+| F.22 | ⬜ | Scrollbar | Visual vertical (and where relevant horizontal) scroll indicator. | — |
+| F.23 | ⬜ | Bookmarks & jump list | Mark positions and jump back/forward through edit history. | — |
+| F.24 | ⬜ | LSP hover documentation | Type/doc popup for the symbol under the cursor. | F.6 |
+| F.25 | ⬜ | LSP go-to-definition & references | Jump to definition or list references. | F.6 |
+| F.26 | ⬜ | Git gutter indicators | Added/modified/deleted bars in the line-number margin. | — |
+| F.27 | ⬜ | Current branch display | Show active branch in the status bar. | F.15 |
+| F.28 | ⬜ | File status in file explorer | Annotate filenames by git status. | — |
+| F.29 | ⬜ | Stage / unstage file | Stage or unstage the current file via keybind. | — |
+| F.30 | ⬜ | Commit modal | Stage/unstage from a list, write a message, confirm the commit. | F.29 |
+| F.31 | ⬜ | Commit history modal | List recent commits; select to view full diff. | — |
+| F.32 | ⬜ | Branch switcher | List and switch local branches. | — |
+| F.33 | ⬜ | Create / delete branch | Manage branches from the editor. | F.32 |
+| F.34 | ⬜ | Push / pull | Push/pull current branch with output in a result modal. | — |
 
 ---
 
 ## Robustness
 
-**R.1. Protect against opening the same file in two buffers**
-`OpenFileFromPath` does not call `FindBufferByPath`. Opening the same file twice creates two diverging buffers.
-Dependencies: -
-
-**R.2. Dirty buffer warning on quit**
-Prompt before closing if there are unsaved changes in any open buffer.
-Dependencies: F.4
-
-**R.3. File changed on disk detection**
-Warn the user or offer to reload when an open file is modified externally. The polling infrastructure already tracks mtimes so the detection is close to free.
-Dependencies: F.4
+| ID  | Status | Item | Notes | Deps |
+|-----|--------|------|-------|------|
+| R.1 | 🟡 | Prevent opening the same file twice | `OpenOrSwitchToFile` (used by the file explorer) now de-dupes via `FindBufferByPath`. The `open` command still calls `OpenFileFromPath` directly — route it through `OpenOrSwitchToFile` to finish. | — |
+| R.2 | ⬜ | Dirty-buffer warning on quit | Prompt before closing if any buffer has unsaved changes. | F.4 |
+| R.3 | ⬜ | File-changed-on-disk detection | Warn/offer reload on external edits; polling already tracks mtimes, so detection is nearly free. | F.4 |
 
 ---
 
 ## Non-functional
 
-**Nf.1. Restructure project** ✅
-Split the single `main.c` into the planned module structure:
-`common.h`, `platform`, `statistics`, `filesystem`, `text_buffer`, `input`, `command`, `modal`, `editor`, `render`, and a `modals/` subfolder.
-Dependencies: -
+| ID   | Status | Item | Notes | Deps |
+|------|--------|------|-------|------|
+| Nf.1 | ✅ | Restructure project | Single `main.c` split into modules: `common.h`, `platform`, `statistics`, `filesystem`, `text_buffer`, `input`, `command`, `modal`, `editor`, `render`, plus a `modals/` subfolder. | — |
+| Nf.2 | 🟡 | Build system | `build.bat` (Windows) and `Makefile` (Linux) updated for the new structure. Debug/release targets not yet added. | Nf.1 |
+| Nf.3 | ⬜ | Basic test harness | Headless unit tests for piece table, line cache, command tokenizer, and undo stack (no Raylib dependency). | Nf.1 |
+| Nf.4 | ⬜ | Separate `Position` uses | `Position` doubles as screen coordinates and `{start_offset, length}` in the line cache; introduce a `LineInfo` struct to remove the ambiguity. | Nf.1 |
 
-**Nf.2. Build system** ✅ (partial)
-A proper `CMakeLists.txt` or `Makefile` with debug/release targets and cross-platform handling.
-`build.bat` (Windows) and `Makefile` (Linux) updated for new structure. Debug/release targets not yet added.
-Dependencies: Nf.1
+---
 
-**Nf.3. Basic test harness**
-Unit tests for the piece table operations, line cache, command tokenizer and undo stack. These are pure logic with no Raylib dependency and can run headless.
-Dependencies: Nf.1
+## Summary
 
-**Nf.4. Separate Position struct uses**
-`Position` is used as both screen coordinates and `{start_offset, length}` in the line cache. Introduce a dedicated `LineInfo` struct to remove the ambiguity.
-Dependencies: Nf.1
+- **Bug fixes:** all 5 resolved (B.1–B.5).
+- **Performance:** none started (P.1–P.4).
+- **Features:** F.3 done; F.4, F.15, F.19 partial; rest open.
+- **Robustness:** R.1 partial; R.2, R.3 open.
+- **Non-functional:** Nf.1 done; Nf.2 partial; Nf.3, Nf.4 open.

@@ -13,5 +13,6 @@ RenderWrapper CreateRaylibRenderWrapper(char* font_path, int load_size);
 
 Color RenderColorToColor(RenderColor in);
 Vector2 PositionToVector2(Position in);
+Rectangle RectToRectangle(Rect in);
 
 #endif

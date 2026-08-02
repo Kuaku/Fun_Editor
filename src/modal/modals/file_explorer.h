@@ -71,7 +71,7 @@ void FileExplorerSearchInsertChar(FileExplorerState* state, uint32_t codepoint);
 void FileExplorerSearchBackspace(FileExplorerState* state);
 void FileExplorerSearchClear(FileExplorerState* state);
 
-void FileExplorerRender(Modal* modal, Rect content);
+void FileExplorerRender(Editor* editor, RenderNode* self);
 void FileExplorerInput(Modal* modal, RawInput input);
 void FileExplorerUpdate(Modal* modal);
 void FileExplorerCleanup(void* raw_state);

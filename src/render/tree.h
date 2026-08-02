@@ -53,6 +53,8 @@ typedef struct RenderNode {
     RenderFunc custom_render;
     MeasureFunc custom_measure_x;
     MeasureFunc custom_measure_y;
+
+    void* user_data;
 } RenderNode;
 
 typedef struct {

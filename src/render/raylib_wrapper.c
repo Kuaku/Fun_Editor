@@ -32,9 +32,17 @@ static void RaylibRenderQueue(RenderWrapper* wrapper, RenderQueue* queue) {
             RectCommand* rect_command = (RectCommand*)&command->as;
             DrawRectangle(rect_command->rect.position.x, rect_command->rect.position.y, rect_command->rect.size.x, rect_command->rect.size.y, RenderColorToColor(rect_command->color));
             break;
+        case RENDER_RECT_LINES:
+            RectLinesCommand* rect_lines_command = (RectLinesCommand*)&command->as;
+            DrawRectangleLinesEx(RectToRectangle(rect_lines_command->rect), rect_lines_command->thickness, RenderColorToColor(rect_lines_command->color));
+            break;
         case RENDER_TEXT:
             TextCommand* text_command = (TextCommand*)&command->as;
             DrawTextEx(state->font, OffsetToPointer(&queue->string_arena, text_command->text), PositionToVector2(text_command->pos), text_command->font_size, text_command->spacing, RenderColorToColor(text_command->color));
+            break;
+        case RENDER_LINE:
+            LineCommand* line_command = (LineCommand*)&command->as;
+            DrawLineEx(PositionToVector2(line_command->start), PositionToVector2(line_command->end), line_command->thickness, RenderColorToColor(line_command->color));
             break;
         case RENDER_CUT_PUSH:
             // TODO: introduce real scissor stack
@@ -45,7 +53,7 @@ static void RaylibRenderQueue(RenderWrapper* wrapper, RenderQueue* queue) {
             EndScissorMode();
             break;
         default:
-            printf("RaylibRenderQueue: Type %d is not implemented for raylib renderer", command->type);
+            printf("RaylibRenderQueue: Type %d is not implemented for raylib renderer\n", command->type);
         }
     }
 }
@@ -80,4 +88,8 @@ Color RenderColorToColor(RenderColor in) {
 
 Vector2 PositionToVector2(Position in) {
     return (Vector2){in.x, in.y};
+}
+
+Rectangle RectToRectangle(Rect in) {
+    return (Rectangle){in.position.x, in.position.y, in.size.x, in.size.y};
 }

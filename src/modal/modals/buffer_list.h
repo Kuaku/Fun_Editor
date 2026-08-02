@@ -9,7 +9,7 @@ typedef struct {
     size_t scroll_offset;
 } BufferListState;
 
-void BufferListRender(Modal* modal, Rect content);
+void BufferListRender(Editor* editor, RenderNode* self);
 void BufferListInput(Modal* modal, RawInput input);
 void BufferListResult(Modal* modal, bool confirmed, void* result, void* user_data);
 void BufferListCleanup(void* state);

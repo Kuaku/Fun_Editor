@@ -8,7 +8,7 @@ typedef struct {
     size_t scroll_offset;
 } StatisticsState;
 
-void StatisticsRender(Modal* modal, Rect content);
+void StatisticsRender(Editor* editor, RenderNode* self);
 void StatisticsInput(Modal* modal, RawInput input);
 void StatisticsCleanup(void* raw_state);
 

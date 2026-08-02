@@ -70,7 +70,6 @@ void ClearEditor(Editor* editor);
 
 TextBuffer* GetActiveBuffer(Editor* editor);
 bool ShouldEditorClose(Editor* editor);
-Rect GetEditorTextFieldSize(Editor* editor);
 
 void OpenEmptyBuffer(Editor* editor);
 void OpenFileFromPath(Editor* editor, const char* path);

@@ -303,6 +303,8 @@ void EditorBuildRenderTree(Editor* editor) {
 void EditorRender(Editor* editor) {
     TreeReset(&editor->render_system.tree_holder);
     EditorBuildRenderTree(editor);
+    ModalSystemAddNodes(editor);
+    
     CalculateSizingModel(editor, &editor->render_system);
     GenerateRenderList(&editor->render_system);
 
@@ -315,12 +317,6 @@ void EditorRender(Editor* editor) {
         }
     }
     editor->render_system.render_wrapper.render_queue(&editor->render_system.render_wrapper, &editor->render_system.render_queue);
-
-    //ClearBackground(editor->settings.scheme.background_color);
-    //EditorRenderMode(editor);
-    //EditorRenderTextField(editor, GetEditorTextFieldSize(editor));
-    //EditorRenderBar(editor);
-    ModalSystemRender(editor);
 }
 
 
