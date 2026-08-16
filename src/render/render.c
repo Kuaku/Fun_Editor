@@ -2,10 +2,6 @@
 
 void ClearEditorSettings(EditorSettings* settings) {
     if (!settings) return;
-
-    if (settings->editor_font.texture.id > 0) {
-        UnloadFont(settings->editor_font);
-    }
 }
 
 size_t GetPointerOffsetFromLeft(Editor* editor, TextBuffer* buffer, Position pointer) {
@@ -15,7 +11,7 @@ size_t GetPointerOffsetFromLeft(Editor* editor, TextBuffer* buffer, Position poi
     temp = calloc(line_length+1, sizeof(char));
 
     strncpy(temp, line, pointer.x);
-    Vector2 draw_length = MeasureTextEx(editor->settings.editor_font, temp, editor->settings.font_size, 1);
+    Position draw_length = editor->render_system.render_wrapper.measure_text(&editor->render_system.render_wrapper, temp, editor->settings.font_size, 1);
 
     free(temp);
     free(line);
@@ -79,7 +75,7 @@ void EditorRenderGutter(Editor* editor, RenderNode* self) {
         snprintf(number_str, digits + 1, "%zu", i + 1);
         measured_text = editor->render_system.render_wrapper.measure_text(&editor->render_system.render_wrapper, number_str, editor->settings.font_size, 1);
         local_offset = measured_text.x;
-        PushText(&editor->render_system.render_queue, number_str, (Position){self->inner_bounds.position.x + self->inner_bounds.size.x - local_offset, self->inner_bounds.position.y + line_y * editor->settings.font_size}, editor->settings.font_size, 1, (RenderColor){editor->settings.scheme.line_number_color.r, editor->settings.scheme.line_number_color.g, editor->settings.scheme.line_number_color.b, editor->settings.scheme.line_number_color.a});
+        PushText(&editor->render_system.render_queue, number_str, (Position){self->inner_bounds.position.x + self->inner_bounds.size.x - local_offset, self->inner_bounds.position.y + line_y * editor->settings.font_size}, editor->settings.font_size, 1, editor->settings.scheme.line_number_color);
         line_y++;
     }
     free(number_str);
@@ -125,8 +121,7 @@ void EditorRenderTextFieldNew(Editor* editor, RenderNode* self) {
     TextBuffer* buffer = GetActiveBuffer(editor);
     Rect field = self->inner_bounds;
 
-    Color tc = editor->settings.scheme.text_color;
-    RenderColor text_color = (RenderColor){tc.r, tc.g, tc.b, tc.a};
+    RenderColor text_color = editor->settings.scheme.text_color;
 
     size_t font_size = editor->settings.font_size;
     size_t line_count = GetLineCount(buffer);
@@ -207,17 +202,17 @@ int EditorMeasurePointerBarSize(Editor* editor, Rect parent) {
 
 void RenderCommandBarNew(Editor* editor, RenderNode* self) {
     PushScissor(&editor->render_system.render_queue, self->inner_bounds);
-    PushText(&editor->render_system.render_queue, ":", self->inner_bounds.position, editor->settings.font_size, 1, (RenderColor){editor->settings.scheme.command_color.r, editor->settings.scheme.command_color.g, editor->settings.scheme.command_color.b, editor->settings.scheme.command_color.a});
+    PushText(&editor->render_system.render_queue, ":", self->inner_bounds.position, editor->settings.font_size, 1, editor->settings.scheme.command_color);
     Position offset_prefix = editor->render_system.render_wrapper.measure_text(&editor->render_system.render_wrapper, ": ", editor->settings.font_size, 1);
     
     char* temp;
     temp = calloc(editor->input_system.command_system.pointer_position + 1, sizeof(char));
     strncpy(temp, editor->input_system.command_system.command_buffer, editor->input_system.command_system.pointer_position);
-    PushText(&editor->render_system.render_queue, temp, (Position){self->inner_bounds.position.x + offset_prefix.x, self->inner_bounds.position.y}, editor->settings.font_size, 1, (RenderColor){editor->settings.scheme.command_color.r, editor->settings.scheme.command_color.g, editor->settings.scheme.command_color.b, editor->settings.scheme.command_color.a});
+    PushText(&editor->render_system.render_queue, temp, (Position){self->inner_bounds.position.x + offset_prefix.x, self->inner_bounds.position.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);
     Position offset_first_part = editor->render_system.render_wrapper.measure_text(&editor->render_system.render_wrapper, temp, editor->settings.font_size, 1);
-    PushRect(&editor->render_system.render_queue, (Rect){{self->inner_bounds.position.x + offset_prefix.x + offset_first_part.x + editor->settings.pointer_padding.x, self->inner_bounds.position.y}, {editor->settings.pointer_width, editor->settings.font_size}}, (RenderColor){editor->settings.scheme.command_color.r, editor->settings.scheme.command_color.g, editor->settings.scheme.command_color.b, editor->settings.scheme.command_color.a});
+    PushRect(&editor->render_system.render_queue, (Rect){{self->inner_bounds.position.x + offset_prefix.x + offset_first_part.x + editor->settings.pointer_padding.x, self->inner_bounds.position.y}, {editor->settings.pointer_width, editor->settings.font_size}}, editor->settings.scheme.command_color);
     char* last_part = editor->input_system.command_system.command_buffer + editor->input_system.command_system.pointer_position;
-    PushText(&editor->render_system.render_queue, last_part, (Position){self->inner_bounds.position.x + offset_prefix.x + offset_first_part.x + editor->settings.pointer_padding.x * 2 + editor->settings.pointer_width, self->inner_bounds.position.y}, editor->settings.font_size, 1, (RenderColor){editor->settings.scheme.command_color.r, editor->settings.scheme.command_color.g, editor->settings.scheme.command_color.b, editor->settings.scheme.command_color.a});
+    PushText(&editor->render_system.render_queue, last_part, (Position){self->inner_bounds.position.x + offset_prefix.x + offset_first_part.x + editor->settings.pointer_padding.x * 2 + editor->settings.pointer_width, self->inner_bounds.position.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);
     free(temp);
 
     PushScissorPop(&editor->render_system.render_queue);
@@ -230,12 +225,12 @@ void EditorRenderPointerBar(Editor* editor, RenderNode* self) {
     char* position_str = (char*)malloc(length + 1);
     snprintf(position_str, length + 1, "%d | %d", cursor.x + 1, cursor.y + 1);
     Position bounding_position_str = editor->render_system.render_wrapper.measure_text(&editor->render_system.render_wrapper, position_str, editor->settings.font_loading_size, 1);
-    PushText(&editor->render_system.render_queue, position_str, self->inner_bounds.position, editor->settings.font_size, 1, (RenderColor){editor->settings.scheme.command_color.r, editor->settings.scheme.command_color.g, editor->settings.scheme.command_color.b, editor->settings.scheme.command_color.a});
+    PushText(&editor->render_system.render_queue, position_str, self->inner_bounds.position, editor->settings.font_size, 1, editor->settings.scheme.command_color);
     free(position_str);
 }
 
 void EditorRenderSeperater(Editor* editor, RenderNode* self) {
-    PushRect(&editor->render_system.render_queue, self->inner_bounds, (RenderColor){editor->settings.scheme.command_color.r, editor->settings.scheme.command_color.g, editor->settings.scheme.command_color.b, editor->settings.scheme.command_color.a});
+    PushRect(&editor->render_system.render_queue, self->inner_bounds, editor->settings.scheme.command_color);
 }
 
 void EditorRenderFileBar(Editor* editor, RenderNode* self) {
@@ -254,12 +249,12 @@ void EditorRenderFileBar(Editor* editor, RenderNode* self) {
 
     int scissor_w = min((int)label_size.x, path_avail);
     PushScissor(&editor->render_system.render_queue, (Rect){self->inner_bounds.position, {scissor_w, self->inner_bounds.size.y}});
-    PushText(&editor->render_system.render_queue, label, (Position){self->inner_bounds.position.x - (label_size.x - scissor_w), self->inner_bounds.position.y}, editor->settings.font_size, 1, (RenderColor){editor->settings.scheme.command_color.r, editor->settings.scheme.command_color.g, editor->settings.scheme.command_color.b, editor->settings.scheme.command_color.a});
+    PushText(&editor->render_system.render_queue, label, (Position){self->inner_bounds.position.x - (label_size.x - scissor_w), self->inner_bounds.position.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);
     PushScissorPop(&editor->render_system.render_queue);
 
     if (dirty) {
         int marker_x = self->inner_bounds.position.x + scissor_w + editor->settings.command_padding.x;
-        PushText(&editor->render_system.render_queue, "\u25CF", (Position){marker_x, self->inner_bounds.position.y}, editor->settings.font_size, 1, (RenderColor){editor->settings.scheme.command_color.r, editor->settings.scheme.command_color.g, editor->settings.scheme.command_color.b, editor->settings.scheme.command_color.a});
+        PushText(&editor->render_system.render_queue, "\u25CF", (Position){marker_x, self->inner_bounds.position.y}, editor->settings.font_size, 1, editor->settings.scheme.command_color);
     }
 }
 

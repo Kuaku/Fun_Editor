@@ -23,10 +23,10 @@ int main(int argc, char** argv) {
     ColorScheme scheme = {
         .background_color = (RenderColor){32, 35, 41, 255},
         .mode_color = (RenderColor){255, 255, 255, 255},
-        .text_color = WHITE,
-        .command_color = WHITE,
-        .command_background_color = (Color){50, 54, 61, 255},
-        .line_number_color = YELLOW,
+        .text_color = (RenderColor){255, 255, 255, 255},
+        .command_color = (RenderColor){255, 255, 255, 255},
+        .command_background_color = (RenderColor){50, 54, 61, 255},
+        .line_number_color = (RenderColor){ 253, 249, 0, 255 },
         .selection_background_color = (RenderColor){255, 255, 255, 255},
         .selection_foreground_color = (RenderColor){32, 35, 41, 255}
     };
@@ -45,20 +45,6 @@ int main(int argc, char** argv) {
         .font_path = "NotoSansJP-Regular.ttf"
     };
     
-    int idx = 0;
-    int count = 992 + 96; // ASCII/Latin + Geometric Shapes
-    int* codepoints = malloc(count * sizeof(int));
-
-    // ASCII + Latin (32-1023)
-    for (int i = 32; i <= 1023; i++) codepoints[idx++] = i;
-    // Geometric Shapes (0x25A0-0x25FF)
-    for (int i = 0x25A0; i <= 0x25FF; i++) codepoints[idx++] = i;
-
-    settings.editor_font = LoadFontEx("NotoSansJP-Regular.ttf", 60, codepoints, idx);
-    free(codepoints);
-
-    SetTextureFilter(settings.editor_font.texture, TEXTURE_FILTER_BILINEAR);
-
     char* path = NULL;
     if (argc >= 2) {
         path = strdup(argv[1]);

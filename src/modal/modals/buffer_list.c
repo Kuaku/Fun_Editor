@@ -6,7 +6,6 @@ void BufferListRender(Editor* editor, RenderNode* self) {
     Rect content = self->inner_bounds;
     BufferListState* state = (BufferListState*)modal->state;
     EditorState* es = &editor->state;
-    Font font = editor->settings.editor_font;
     int font_size = editor->settings.font_size;
     int row_height = font_size + modal->style.widget_spacing;
     size_t visible_rows = self->inner_bounds.size.y / row_height;
@@ -37,11 +36,11 @@ void BufferListRender(Editor* editor, RenderNode* self) {
         }
 
         const char* prefix = (i == state->selected_index) ? "> " : "  ";
-        Color text_color = modal->style.text;
+        RenderColor text_color = modal->style.text;
         if ((int)i == es->open_text_buffer_index) {
             text_color = modal->style.focused_border;
         }
-        PushText(&editor->render_system.render_queue, TextFormat("%s%s", prefix, label), (Position){self->inner_bounds.position.x + 4, y + modal->style.widget_spacing / 2}, font_size, 1, (RenderColor){text_color.r, text_color.g, text_color.b, text_color.a});
+        PushText(&editor->render_system.render_queue, TextFormat("%s%s", prefix, label), (Position){self->inner_bounds.position.x + 4, y + modal->style.widget_spacing / 2}, font_size, 1, text_color);
     }
     PushScissorPop(&editor->render_system.render_queue);
 }

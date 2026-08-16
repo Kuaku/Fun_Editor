@@ -278,7 +278,6 @@ void FileExplorerRender(Editor* editor, RenderNode* self) {
     Modal* modal = (Modal*)self->user_data;
     FileExplorerState* state = (FileExplorerState*)modal->state;
     FileSystem* system = &editor->file_system;
-    Font font = editor->settings.editor_font;
     int font_size = editor->settings.font_size;
     int row_height = font_size + modal->style.widget_spacing;
     int pad = modal->style.content_padding.x;
@@ -287,13 +286,13 @@ void FileExplorerRender(Editor* editor, RenderNode* self) {
     PushScissor(&editor->render_system.render_queue, self->inner_bounds);
 
     int search_y = self->inner_bounds.position.y + pad;
-    PushRect(&editor->render_system.render_queue, (Rect){{self->inner_bounds.position.x + pad, search_y}, {self->inner_bounds.size.x - pad * 2, search_bar_height}}, (RenderColor){modal->style.input_background.r, modal->style.input_background.g, modal->style.input_background.b, modal->style.input_background.a});
+    PushRect(&editor->render_system.render_queue, (Rect){{self->inner_bounds.position.x + pad, search_y}, {self->inner_bounds.size.x - pad * 2, search_bar_height}}, modal->style.input_background);
 
     const char* search_prefix = "Search: ";
-    PushText(&editor->render_system.render_queue, search_prefix, (Position){self->inner_bounds.position.x + pad + 4, search_y + 6}, font_size * 0.8, 1, (RenderColor){modal->style.text.r, modal->style.text.g, modal->style.text.b, modal->style.text.a});
+    PushText(&editor->render_system.render_queue, search_prefix, (Position){self->inner_bounds.position.x + pad + 4, search_y + 6}, font_size * 0.8, 1, modal->style.text);
 
     Position prefix_size = editor->render_system.render_wrapper.measure_text(&editor->render_system.render_wrapper, search_prefix, font_size * 0.8, 1);
-    PushText(&editor->render_system.render_queue, state->search.buffer, (Position){self->inner_bounds.position.x + pad + 4 + prefix_size.x, search_y + 6}, font_size * 0.8, 1, (RenderColor){modal->style.text.r, modal->style.text.g, modal->style.text.b, modal->style.text.a});
+    PushText(&editor->render_system.render_queue, state->search.buffer, (Position){self->inner_bounds.position.x + pad + 4 + prefix_size.x, search_y + 6}, font_size * 0.8, 1, modal->style.text);
 
     int list_y = search_y + search_bar_height + pad;
     int list_height = self->inner_bounds.size.y - (list_y - self->inner_bounds.position.y) - pad;
@@ -317,7 +316,7 @@ void FileExplorerRender(Editor* editor, RenderNode* self) {
         int y = list_y + display_i * row_height;
 
         if (i == state->selected_index) {
-            PushRect(&editor->render_system.render_queue, (Rect){{self->inner_bounds.position.x + pad, y - 2}, {self->inner_bounds.size.x - pad * 2, row_height}}, (RenderColor){modal->style.selection.r, modal->style.selection.g, modal->style.selection.b, modal->style.selection.a});
+            PushRect(&editor->render_system.render_queue, (Rect){{self->inner_bounds.position.x + pad, y - 2}, {self->inner_bounds.size.x - pad * 2, row_height}}, modal->style.selection);
         }
 
         int indent = entry->depth * 16;
@@ -326,12 +325,12 @@ void FileExplorerRender(Editor* editor, RenderNode* self) {
             (OpenPathSetContains(&state->open_dirs, file_entry->rel_path) ? "▼ " : "▶ ") :
             "  ";
 
-        Color text_color = entry->is_dir ? modal->style.focused_border : modal->style.text;
+        RenderColor text_color = entry->is_dir ? modal->style.focused_border : modal->style.text;
 
         char display_text[NAME_MAX_LEN + 4];
         snprintf(display_text, sizeof(display_text), "%s%s", icon, file_entry->name);
 
-        PushText(&editor->render_system.render_queue, display_text, (Position){self->inner_bounds.position.x + pad + indent, y + modal->style.widget_spacing / 2}, font_size, 1, (RenderColor){text_color.r, text_color.g, text_color.b, text_color.a});
+        PushText(&editor->render_system.render_queue, display_text, (Position){self->inner_bounds.position.x + pad + indent, y + modal->style.widget_spacing / 2}, font_size, 1, text_color);
     }
 
     PushScissorPop(&editor->render_system.render_queue);

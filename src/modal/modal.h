@@ -4,6 +4,7 @@
 #include "../common.h"
 #include "../input/input.h"
 #include "../render/tree.h"
+#include "../render/render_queue.h"
 
 typedef struct Modal Modal;
 
@@ -14,13 +15,13 @@ typedef void (*ModalResultCallback)(Modal* modal, bool confirmed, void* result, 
 typedef void (*ModalUpdateFunc)(Modal* modal);
 
 typedef struct {
-    Color background;
-    Color border;
-    Color text;
-    Color text_muted;
-    Color selection;
-    Color input_background;
-    Color focused_border;
+    RenderColor background;
+    RenderColor border;
+    RenderColor text;
+    RenderColor text_muted;
+    RenderColor selection;
+    RenderColor input_background;
+    RenderColor focused_border;
     int border_width;
     Position content_padding;
     int widget_spacing;
@@ -71,7 +72,6 @@ typedef struct {
 
     ModalStyle default_style;
 
-    Font font;
     int font_size;
 
     int screen_width;

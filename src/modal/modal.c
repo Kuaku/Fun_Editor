@@ -67,13 +67,13 @@ ModalSystem InitModalSystem() {
     system.cache_count = 0;
 
     system.default_style = (ModalStyle){
-        .background    = (Color){45, 48, 55, 240},
-        .border        = (Color){80, 85, 95, 255},
-        .text          = WHITE,
-        .text_muted    = (Color){150, 150, 150, 255},
-        .selection     = (Color){60, 100, 180, 255},
-        .input_background = (Color){30, 32, 38, 255},
-        .focused_border   = (Color){100, 140, 220, 255},
+        .background    = (RenderColor){45, 48, 55, 240},
+        .border        = (RenderColor){80, 85, 95, 255},
+        .text          = (RenderColor){255, 255, 255, 255},
+        .text_muted    = (RenderColor){150, 150, 150, 255},
+        .selection     = (RenderColor){60, 100, 180, 255},
+        .input_background = (RenderColor){30, 32, 38, 255},
+        .focused_border   = (RenderColor){100, 140, 220, 255},
         .border_width     = 2,
         .content_padding  = (Position){12, 12},
         .widget_spacing   = 4,
@@ -192,12 +192,12 @@ void ModalRenderBackdrop(Editor* editor, RenderNode* self) {
 void ModalGeneralRender(Editor* editor, RenderNode* self) {
     Modal* active_modal = (Modal*)self->user_data;
     PushScissor(&editor->render_system.render_queue, self->inner_bounds);
-    PushRect(&editor->render_system.render_queue, self->inner_bounds, (RenderColor){active_modal->style.background.r, active_modal->style.background.g, active_modal->style.background.b, active_modal->style.background.a});
+    PushRect(&editor->render_system.render_queue, self->inner_bounds, active_modal->style.background);
     
     if (active_modal->style.draw_title) {
         int title_height = active_modal->style.title_height + active_modal->style.title_padding.y * 2;
 
-        PushText(&editor->render_system.render_queue, active_modal->title, (Position){self->inner_bounds.position.x + active_modal->style.title_padding.x, self->inner_bounds.position.y + active_modal->style.title_padding.y}, active_modal->style.title_height, 1, (RenderColor){active_modal->style.text.r, active_modal->style.text.g, active_modal->style.text.b, active_modal->style.text.a});
+        PushText(&editor->render_system.render_queue, active_modal->title, (Position){self->inner_bounds.position.x + active_modal->style.title_padding.x, self->inner_bounds.position.y + active_modal->style.title_padding.y}, active_modal->style.title_height, 1, active_modal->style.text);
         self->inner_bounds.position.y += title_height;
         self->inner_bounds.size.y -= title_height;
     }

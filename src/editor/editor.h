@@ -23,17 +23,16 @@ typedef struct {
 typedef struct {
     RenderColor background_color;
     RenderColor mode_color;
-    Color text_color;
-    Color command_color;
-    Color line_number_color;
-    Color command_background_color;
+    RenderColor text_color;
+    RenderColor command_color;
+    RenderColor line_number_color;
+    RenderColor command_background_color;
     RenderColor selection_background_color;
     RenderColor selection_foreground_color;
 } ColorScheme;
 
 typedef struct {
     ColorScheme scheme;
-    Font editor_font;
     Position pointer_padding;
     Position mode_padding;
     Position command_padding;

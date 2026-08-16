@@ -5,7 +5,6 @@
 void StringInputRender(Editor* editor, RenderNode* self) {
     Modal* modal = (Modal*)self->user_data;
     StringInputState* state = (StringInputState*)modal->state;
-    Font font = editor->settings.editor_font;
     int font_size = editor->settings.font_size;
     int pad = modal->style.content_padding.x;
 
@@ -16,15 +15,15 @@ void StringInputRender(Editor* editor, RenderNode* self) {
     int input_x = self->inner_bounds.position.x + pad;
     int input_w = self->inner_bounds.size.x - pad * 2;
 
-    PushRect(&editor->render_system.render_queue, (Rect){{input_x, input_y}, {input_w, input_height}}, (RenderColor){modal->style.input_background.r, modal->style.input_background.g, modal->style.input_background.b, modal->style.input_background.a});
-    PushRectLines(&editor->render_system.render_queue, (Rect){{input_x, input_y}, {input_w, input_height}}, (RenderColor){modal->style.focused_border.r, modal->style.focused_border.g, modal->style.focused_border.b, modal->style.focused_border.a}, modal->style.border_width);
+    PushRect(&editor->render_system.render_queue, (Rect){{input_x, input_y}, {input_w, input_height}}, modal->style.input_background);
+    PushRectLines(&editor->render_system.render_queue, (Rect){{input_x, input_y}, {input_w, input_height}}, modal->style.focused_border, modal->style.border_width);
 
     int text_x = input_x + 6;
     int text_y = input_y + 6;
 
     if (state->prefix) {
         Position prefix_size = editor->render_system.render_wrapper.measure_text(&editor->render_system.render_wrapper, state->prefix, font_size, 1);
-        PushText(&editor->render_system.render_queue, state->prefix, (Position){text_x, text_y}, font_size, 1, (RenderColor){modal->style.text_muted.r, modal->style.text_muted.g, modal->style.text_muted.b, modal->style.text_muted.a});
+        PushText(&editor->render_system.render_queue, state->prefix, (Position){text_x, text_y}, font_size, 1, modal->style.text_muted);
         text_x += (int)prefix_size.x;
     }
 
@@ -34,8 +33,8 @@ void StringInputRender(Editor* editor, RenderNode* self) {
     before_cursor[cursor_byte] = '\0';
     Position before_size = editor->render_system.render_wrapper.measure_text(&editor->render_system.render_wrapper, before_cursor, font_size, 1);
 
-    PushText(&editor->render_system.render_queue, state->buffer, (Position){text_x, text_y}, font_size, 1, (RenderColor){modal->style.text.r, modal->style.text.g, modal->style.text.b, modal->style.text.a});
-    PushRect(&editor->render_system.render_queue, (Rect){{text_x + (int)before_size.x, text_y}, {2, font_size}}, (RenderColor){modal->style.text.r, modal->style.text.g, modal->style.text.b, modal->style.text.a});
+    PushText(&editor->render_system.render_queue, state->buffer, (Position){text_x, text_y}, font_size, 1, modal->style.text);
+    PushRect(&editor->render_system.render_queue, (Rect){{text_x + (int)before_size.x, text_y}, {2, font_size}}, modal->style.text);
 
     PushScissorPop(&editor->render_system.render_queue);
 }
